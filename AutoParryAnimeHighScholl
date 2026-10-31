@@ -89,6 +89,26 @@
 	  UI     : cuma tombol bulat kecil (geser = pindah, tap = buka/tutup panel).
 ]]
 
+--[[
+	v7.0 (= v6 + dibikin dari dump CombatHandler asli game)
+	  Hasil baca CombatHandler:
+		- Server nolak Block ON kalau lu lagi Busy (abis nyerang). HoldToSwing di game ngayun lagi di frame
+		  PERTAMA setelah busy abis -> Block ON script selalu kalah balapan -> hit lolos pas lu lagi fight.
+		- Block ON juga wajib InCombat (stance T nyala). Flag InCombat nggak bisa di-skip.
+		- Stun abis kena hit dibikin selesai 0.2s SEBELUM hit combo berikutnya mendarat -> masih ada celah buat
+		  parry hit ke-2 kalau Block ON dikirim persis pas stun abis.
+		- M1 Basic windup cuma 0.2s: di ping > ~150ms hit pertama emang nggak mungkin di-react (cuma bisa ditebak).
+	  Yang baru:
+		PRIORITAS : TrySwing game ditahan di jendela sebelum block dikirim -> block nggak kalah balapan sama
+					auto-swing. Swing manual pas nggak ada hit nunggu = block script dilepas dulu (mobile juga).
+		BLOCK     : Block/OFF dikirim lewat SetLocalBlocking asli game (state lokal, animasi, walkspeed ikut bener,
+					cek stun/busy/cooldown pakai state game sendiri). Kalau nggak bisa -> remote langsung.
+		PREDIKSI  : swing M1 berikutnya dalam combo ditebak dari spec style (windup+endlag) dan dijadwalin dari
+					sekarang -> hit yang lead-nya kurang dari ping tetap bisa di-parry. Dicek ulang sebelum dikirim.
+		RETRY     : block yang kekunci (stun abis kena hit / busy / cooldown) dicoba lagi begitu kunci kebuka,
+					asal paketnya masih sempat nyampe sebelum hit mendarat.
+]]
+
 local genv = (getgenv and getgenv()) or _G
 if genv.__NyxAutoParry then
 	pcall(genv.__NyxAutoParry.Stop)
@@ -198,7 +218,7 @@ local CFG = {
 	ImmediateFire = true, -- jadwal yang udah waktunya langsung dijalanin, nggak nunggu Heartbeat berikutnya
 	RunMargin = 0.12, -- stud tambahan ke range ancaman per (stud/detik) kecepatan lari lu
 	RunMarginMax = 3, -- batas margin dari kecepatan lari
-	IgnoreMyCombatFlag = true, -- InCombat lu false tapi attacker InCombat true -> tetap diproses (hit pertama di awal fight)
+	IgnoreMyCombatFlag = false, -- v7: server nolak Block kalau InCombat lu false (dari dump), jadi default false
 	BlockResync = true, -- samain status block lokal sama atribut Blocking dari server
 	CrowdGuard = true, -- abis parry, block ditahan kalau ada attacker lain yang baru ngayun di deket lu
 	CrowdRadius = 16, -- stud
@@ -206,6 +226,15 @@ local CFG = {
 	RetryMinGap = 0.15, -- jeda minimal antar retry block abis ditolak
 	RetryMax = 4, -- maksimal retry per 1 detik
 	ButtonSize = 38, -- diameter tombol bulat (px)
+
+	-- ===== v7 =====
+	UseGameBlock = true, -- Block ON/OFF lewat SetLocalBlocking asli game (kalau nggak bisa di-require -> remote langsung)
+	GuardPriority = true, -- tahan swing (TrySwing) di jendela sebelum block dikirim; swing manual pas nggak ada hit = lepas block dulu
+	SwingBusyEst = 0.65, -- perkiraan lama busy 1 swing lu (windup+endlag Basic = 0.65)
+	PredictCombo = true, -- tebak swing M1 berikutnya dalam combo (buat hit yang lead-nya kurang dari ping)
+	PredictBelow = 0.12, -- cuma nebak kalau (windup berikutnya - rtt - frame) < segini; di atas itu react biasa udah cukup
+	PredictMaxDist = 14, -- stud: attacker harus sedeket ini buat ditebak
+	RetryAfterUnlock = true, -- block kekunci tapi masih sempat -> coba lagi begitu kunci kebuka
 }
 
 ----------------------------------------------------------------------
@@ -307,6 +336,9 @@ local counters = {
 	dodgeplanned = 0,
 	dodgesent = 0,
 	dodgemiss = 0,
+	swingheld = 0,
+	predicted = 0,
+	retried = 0,
 }
 local skips = {}
 local lastSkip = { reason = "-", at = -math.huge }
@@ -500,7 +532,8 @@ end
 local Game = { handler = nil }
 
 local function getHandler()
-	if Game.handler ~= nil then
+	-- v7: kalau require gagal (modul belum siap pas script jalan), coba lagi tiap 3 detik, jangan nyerah selamanya
+	if Game.handler ~= nil and (Game.handler or os.clock() - (Game.failAt or 0) < 3) then
 		return Game.handler or nil
 	end
 	local ok, mod = pcall(function()
@@ -513,6 +546,7 @@ local function getHandler()
 		Game.handler = mod
 	else
 		Game.handler = false
+		Game.failAt = os.clock()
 	end
 	return Game.handler or nil
 end
@@ -714,11 +748,29 @@ end
 ----------------------------------------------------------------------
 -- BLOCK
 ----------------------------------------------------------------------
+-- v7: lewat SetLocalBlocking asli game (Local.Blocking, animasi, walkspeed, BlockReadyAt lokal ikut bener; game juga
+-- ngecek stun/busy/cooldown/InCombat pakai state-nya sendiri). Return false kalau game nolak ON secara lokal.
 local function sendBlock(on)
 	if not on then
 		lastOwnOff = os.clock()
 	end
+	if CFG.UseGameBlock then
+		local h = getHandler()
+		local L = h and h.Local
+		if type(L) == "table" and type(h.SetLocalBlocking) == "function" then
+			if pcall(h.SetLocalBlocking, h, on) then
+				if on then
+					local L2 = h.Local
+					if type(L2) ~= "table" or L2.Blocking ~= true then
+						return false
+					end
+				end
+				return true
+			end
+		end
+	end
 	Combat:FireServer({ Info = "Block", On = on })
+	return true
 end
 
 local function scheduleRelease(at)
@@ -764,8 +816,13 @@ local function pressBlock(hold)
 	if CFG.Trace then trace(("BLOCK ON dikirim (hold %.3f)"):format(hold)) end
 	blockHeld = true
 	blockOnAt = now
+	if sendBlock(true) == false then
+		blockHeld = false
+		if CFG.Trace then trace("block ditolak cek lokal game (stun/busy/cooldown/InCombat)") end
+		skip("local-refuse")
+		return false
+	end
 	counters.fired += 1
-	sendBlock(true)
 	scheduleRelease(now + hold)
 	return true
 end
@@ -794,6 +851,13 @@ end
 local function dropLocalBlock()
 	cancel(releaseHandle)
 	blockHeld = false
+	-- v7: Local.Blocking game jangan nyangkut true (ON berikutnya jadi no-op, nggak ngirim apa-apa)
+	if CFG.UseGameBlock then
+		local h = getHandler()
+		if h and type(h.Local) == "table" and h.Local.Blocking == true and type(h.DropLocalGuard) == "function" then
+			pcall(h.DropLocalGuard, h, workspace:GetServerTimeNow())
+		end
+	end
 end
 
 -- v6: samain status block lokal sama server (atribut Blocking). Server bisa ngelepas block kita (stun dll)
@@ -811,6 +875,94 @@ local function syncBlock(now, char)
 		dropLocalBlock()
 		readyAt = math.max(readyAt, now)
 	end
+end
+
+----------------------------------------------------------------------
+-- v7: PRIORITAS BLOCK vs SWING
+-- Server nolak Block ON selama BusyUntil (lu lagi nyerang) dan HoldToSwing game ngayun lagi di frame pertama
+-- setelah busy abis. Jadi pas ada hit yang lagi ditunggu, TrySwing game ditahan di jendela
+-- [waktu kirim block - lama swing, hit mendarat + ResultPad].
+----------------------------------------------------------------------
+local swingGuards = {}
+local origTrySwing = nil
+local hookedHandler = nil
+
+local function guardSwing(atk, sendAt, hitAt)
+	if not CFG.GuardPriority then
+		return
+	end
+	local now = os.clock()
+	for i = #swingGuards, 1, -1 do
+		if swingGuards[i].to < now then
+			table.remove(swingGuards, i)
+		end
+	end
+	if #swingGuards >= 12 then
+		table.remove(swingGuards, 1)
+	end
+	swingGuards[#swingGuards + 1] = { atk = atk, from = sendAt - CFG.SwingBusyEst - 0.02, to = hitAt + CFG.ResultPad }
+end
+
+local function clearGuards(atk)
+	for i = #swingGuards, 1, -1 do
+		if swingGuards[i].atk == atk then
+			table.remove(swingGuards, i)
+		end
+	end
+end
+
+local function swingBlocked(now)
+	for i = 1, #swingGuards do
+		local g = swingGuards[i]
+		if now >= g.from and now <= g.to then
+			return true
+		end
+	end
+	return false
+end
+
+local function installSwingHook()
+	if origTrySwing then
+		return true
+	end
+	local h = getHandler()
+	if not (h and type(h.Local) == "table" and type(h.TrySwing) == "function") then
+		return false
+	end
+	local orig = h.TrySwing
+	pcall(function()
+		if setreadonly then
+			pcall(setreadonly, h, false)
+		end
+		h.TrySwing = function(self, ...)
+			if alive and CFG.Enabled and CFG.GuardPriority then
+				local now = os.clock()
+				if swingBlocked(now) then
+					counters.swingheld += 1
+					return
+				end
+				if blockHeld then
+					-- lu mau nyerang dan nggak ada hit yang ditunggu: lepas block script dulu (OFF nyampe duluan)
+					releaseBefore(now)
+				end
+			end
+			return orig(self, ...)
+		end
+	end)
+	if h.TrySwing == orig then
+		return false
+	end
+	origTrySwing, hookedHandler = orig, h
+	return true
+end
+
+local function uninstallSwingHook()
+	if origTrySwing and hookedHandler then
+		pcall(function()
+			hookedHandler.TrySwing = origTrySwing
+		end)
+	end
+	origTrySwing, hookedHandler = nil, nil
 end
 
 ----------------------------------------------------------------------
@@ -1301,6 +1453,7 @@ local function planDodge(attacker, plan, lead, now, rtt, fl, tag, why)
 	dodgePlannedUntil = now + sendIn + d.Cooldown - 0.05
 	dodgeBlockUntil = math.max(dodgeBlockUntil, now + sendIn + d.Duration)
 	noteExpected(attacker, hitAt, now, "DODGE")
+	guardSwing(attacker, now + sendIn, hitAt)
 	if CFG.Trace then trace(
 		("%s dari %s: DODGE (%s) lead %.3f rtt %.3f -> kirim %.3fs lagi (umur iframe %.3f)"):format(
 			tag, attacker.Name, tostring(why), lead, rtt, sendIn, age
@@ -1362,6 +1515,7 @@ local function guardExtend(attacker, plan, tag, lead, now, rtt, fl, ha, note)
 	end
 	pending[#pending + 1] = { kind = plan.kind, hit = now + lead, done = false }
 	noteExpected(attacker, now + lead, now, plan.kind)
+	guardSwing(attacker, now, now + lead + CFG.ResultPad)
 	local coverTo = math.max(now + lead - rtt - fl + ha, now + lead + CFG.ResultPad)
 	if extendHoldTo(coverTo) then
 		counters.chained += 1
@@ -1369,6 +1523,45 @@ local function guardExtend(attacker, plan, tag, lead, now, rtt, fl, ha, note)
 	else
 		if CFG.Trace then trace(("%s dari %s: block udah lepas, nggak bisa ditahan lagi (%s)"):format(tag, attacker.Name, note)) end
 	end
+end
+
+-- v7: rencana yang diprediksi (swing berikutnya belum kelihatan) dicek ulang sebelum block dikirim
+local function predictedStillValid(attacker, plan, hitAt)
+	if not attacker.Parent then
+		return false
+	end
+	local ahum = attacker:FindFirstChildOfClass("Humanoid")
+	if ahum and ahum.Health <= 0 then
+		return false
+	end
+	local c, h = myState()
+	if not (c and h) then
+		return false
+	end
+	return (threatens(attacker, h, plan, math.max(hitAt - os.clock(), 0)))
+end
+
+-- v7: Block ON gagal gara-gara kekunci (stun abis kena hit / busy / cooldown) tapi masih sempat nyampe
+-- sebelum hit mendarat -> coba lagi begitu kunci kebuka
+local function retryAfterUnlock(attacker, tok, hitAt, rtt, fl, ha, mode)
+	if not CFG.RetryAfterUnlock or blockHeld then
+		return
+	end
+	local t = os.clock()
+	local gl = gameLock()
+	local unlock = math.max(readyAt - 0.005, lockedUntil, dodgeBlockUntil, gl and (gl - 0.01) or -math.huge)
+	if unlock <= t or unlock + 0.012 > hitAt - rtt - fl + CFG.LateTolerance then
+		return
+	end
+	counters.retried += 1
+	schedule(unlock + 0.012 + frame.avg * CFG.FireEarly, function()
+		if not alive or not CFG.Enabled or blockHeld or planToken[attacker] ~= tok then
+			return
+		end
+		if pressBlock(math.max(hitAt - os.clock(), 0) + CFG.ResultPad + ha) then
+			pressMode = mode
+		end
+	end)
 end
 
 -- Block ON baru dijadwalin. mode "parry" = ngincer window parry, "plain" = cukup block nyala pas hit
@@ -1406,6 +1599,7 @@ local function scheduleBlock(attacker, plan, tag, lead, sendIn, age, ha, rtt, fl
 	) end
 	local rec = { kind = plan.kind, hit = hitAt, done = false }
 	pending[#pending + 1] = rec
+	guardSwing(attacker, now + sendIn, hitAt)
 	-- v6: kalau waktunya ditentuin kunci (cooldown block / busy / stun), jangan kirim lebih awal dari kunci kebuka.
 	-- Dulu FireEarly bikin paket keluar setengah frame sebelum kunci kebuka -> ditolak pengecekan sendiri -> hit lolos.
 	rec.handle = schedule(now + sendIn + (bound and frame.avg * CFG.FireEarly or 0), function()
@@ -1417,11 +1611,18 @@ local function scheduleBlock(attacker, plan, tag, lead, sendIn, age, ha, rtt, fl
 			counters.cancelled += 1
 			return
 		end
+		if plan.predicted and not predictedStillValid(attacker, plan, hitAt) then
+			counters.cancelled += 1
+			skip("predict-recheck")
+			return
+		end
 		if pressBlock(hold) then
 			pressMode = mode
 		elseif plan.kind == "M1" and CFG.ChainGuard and extendHoldTo(coverTo) then
 			-- block udah nyala (rencana sebelumnya / chain): M1 cukup ditutup pakai perpanjangan hold
 			counters.chained += 1
+		else
+			retryAfterUnlock(attacker, tok, hitAt, rtt, fl, ha, mode)
 		end
 	end)
 end
@@ -1482,11 +1683,16 @@ local function react(attacker, plan, tag)
 	local corr = corrFor(attacker, plan)
 	local unparry = (plan.spec and plan.spec.Unparryable) and true or false
 
-	local isThreat, dist, sure = threatens(attacker, hrp, plan, plan.lead + corr)
+	-- v7: plan prediksi leadnya jauh (~0.9s) -> cek ancaman pakai horizon pendek, posisi 0.9s ke depan nggak bisa ditebak
+	local isThreat, dist, sure =
+		threatens(attacker, hrp, plan, plan.predicted and math.min(plan.lead + corr, 0.35) or (plan.lead + corr))
 	if not isThreat then
 		return skip("range")
 	end
 	reactSure = sure
+	if plan.predicted and not sure then
+		return skip("predict-unsure") -- cuma nebak kalau attacker beneran ngincer lu
+	end
 
 	local lead
 	if plan.kind == "M1" then
@@ -1622,6 +1828,55 @@ end
 ----------------------------------------------------------------------
 -- COMBAT EVENTS
 ----------------------------------------------------------------------
+-- v7: tebak swing M1 berikutnya dalam combo. Server: swing ke-(i+1) mulai (Windup_i + Endlag_i) setelah swing ke-i
+-- (HoldToSwing = persis pas busy abis), hit-nya Windup_(i+1) setelahnya. Jadi hit berikutnya = sekarang +
+-- (W_i + E_i) * k + W_(i+1) * k, dihitung dari Sound swing sekarang -> block bisa dikirim jauh sebelum Sound berikutnya
+-- nyampe (yang lead-nya sering < ping). Dicek ulang pas mau dikirim; kalau swing aslinya nongol, di-dedupe.
+local function predictFollowUp(attacker, plan, now)
+	if not (alive and CFG.Enabled and CFG.PredictCombo and CFG.BlockFallback) then
+		return
+	end
+	local spec, idx = plan.spec, plan.idx
+	if type(spec) ~= "table" or type(idx) ~= "number" then
+		return
+	end
+	local style = styleOf(attacker)
+	local swings = style and style.M1 and style.M1.Swings
+	if type(swings) ~= "table" or idx >= #swings then
+		return -- swing terakhir: abis ini ada ChainCooldown, nggak ditebak
+	end
+	local nxt = swings[idx + 1]
+	if type(nxt) ~= "table" then
+		return
+	end
+	local char, hrp = myState()
+	local ahrp = attacker:FindFirstChild("HumanoidRootPart")
+	if not (char and hrp and ahrp) or (ahrp.Position - hrp.Position).Magnitude > CFG.PredictMaxDist then
+		return
+	end
+	local k1 = timeScale(attacker, style, spec)
+	local k2 = timeScale(attacker, style, nxt)
+	local key = attacker.Name .. ":" .. (idx + 1)
+	local w2 = (nxt.Windup or CFG.DefaultM1Lead) * k2 + (leadCorr[key] or 0)
+	-- swing berikutnya masih cukup lead buat di-react biasa -> nggak usah nebak
+	if w2 - net.rtt - frameLag() >= CFG.PredictBelow then
+		return
+	end
+	local lead2 = ((spec.Windup or CFG.DefaultM1Lead) + (spec.Endlag or 0.45)) * k1 + (nxt.Windup or CFG.DefaultM1Lead) * k2
+	counters.predicted += 1
+	react(attacker, {
+		kind = "M1",
+		lead = lead2,
+		reach = reachOf(attacker, style),
+		spec = nxt,
+		height = nxt.Height or style.M1.Height,
+		idx = idx + 1,
+		key = key,
+		learn = false,
+		predicted = true,
+	}, "M1*")
+end
+
 local function resyncCombo(attacker, obs)
 	local style = styleOf(attacker)
 	local m1 = style and style.M1
@@ -1730,6 +1985,7 @@ local function onHit(data)
 		streak[kind].dir = 0
 		if typeof(attacker) == "Instance" then
 			combo[attacker] = nil -- attacker kena stun -> combo reset di server
+			clearGuards(attacker) -- v7: abis parry lu bebas nyerang balik
 			planToken[attacker] = (planToken[attacker] or 0) + 1
 		end
 		-- v4: abis parry, lepas block biar cooldown-nya (0.75s) cepet beres buat parry berikutnya,
@@ -1906,6 +2162,7 @@ local function onCombat(data)
 			swingAt[a] = { t = now, lead = plan.lead, kind = "M1", key = plan.key, learn = plan.learn }
 			lastSwingSeen[a] = now
 			react(a, plan, "M1")
+			predictFollowUp(a, plan, now)
 		elseif CFG.Trace and not seenKind[tostring(kind)] then
 			seenKind[tostring(kind)] = true
 			trace("sound lain (nggak dianggap swing):", tostring(kind))
@@ -1926,6 +2183,7 @@ local function onCombat(data)
 		local a = data.Character
 		if typeof(a) == "Instance" then
 			planToken[a] = (planToken[a] or 0) + 1
+			clearGuards(a)
 			swingAt[a] = nil
 		end
 	elseif info == "Hit" then
@@ -1963,6 +2221,15 @@ local function report()
 	print("[AutoParry] hitung :", table.concat(c, " "))
 	print("[AutoParry] skip   :", #s > 0 and table.concat(s, " ") or "-")
 	print(("[AutoParry] parry rate %.0f%% dari %d hit yang nyampe ke lu"):format(rate, tot))
+	local hh = getHandler()
+	print(
+		("[AutoParry] game: handler %s | Local %s | hook swing %s | block via game %s"):format(
+			hh and "ya" or "nggak",
+			(hh and type(hh.Local) == "table") and "ya" or "nggak",
+			origTrySwing and "ya" or "nggak",
+			(CFG.UseGameBlock and hh and type(hh.SetLocalBlocking) == "function") and "ya" or "nggak"
+		)
+	)
 	local dd = dashOf()
 	print(
 		("[AutoParry] dodge : siap dalam %.1fs | iframe %.2fs cd %.2fs | lewat %s"):format(
@@ -2127,6 +2394,13 @@ local function make(class, props, parent)
 	return o
 end
 
+local function skipText()
+	if os.clock() - lastSkip.at < 3 then
+		return " · skip:" .. lastSkip.reason
+	end
+	return ""
+end
+
 local function statsText()
 	local c = counters
 	local tot = c.parried + c.blocked + c.guardbroken + c.hit
@@ -2135,7 +2409,7 @@ local function statsText()
 	return string.format(
 		"Parry %d · Block %d · Dodge %d\nKena %d · GB %d · Aman %d%%\n%dms · %d fps\n%s",
 		c.parried, c.blocked, c.dodged, c.hit, c.guardbroken, safeRate,
-		math.floor(net.rtt * 1000 + 0.5), math.floor(frame.fps + 0.5), lastEvent
+		math.floor(net.rtt * 1000 + 0.5), math.floor(frame.fps + 0.5), lastEvent .. skipText()
 	)
 end
 
@@ -2199,6 +2473,8 @@ local function buildUI()
 		{ "Dodge", "DodgeEnabled" },
 		{ "Pintar", "SmartMode" },
 		{ "M2 dodge", "DodgeFirstM2" },
+		{ "Prio block", "GuardPriority" },
+		{ "Prediksi", "PredictCombo" },
 	}
 	local rows = math.ceil(#defs / 2)
 	local statsY = 8 + rows * 28 + 2
@@ -2403,6 +2679,7 @@ genv.__NyxAutoParry = {
 	UI = UI,
 	Stop = function()
 		alive = false
+		pcall(uninstallSwingHook)
 		if blockHeld then
 			pcall(sendBlock, false)
 			blockHeld = false
@@ -2425,6 +2702,14 @@ genv.__NyxAutoParry = {
 }
 
 task.spawn(loadSpecs)
+task.spawn(function()
+	for _ = 1, 60 do
+		if not alive or installSwingHook() then
+			return
+		end
+		task.wait(0.5)
+	end
+end)
 
 if CFG.UI then
 	task.spawn(function()
@@ -2435,5 +2720,5 @@ if CFG.UI then
 	end)
 end
 
-notify("v6.0 loaded - tekan " .. CFG.ToggleKey.Name .. " buat toggle")
-log("loaded v6.0. toggle:", CFG.ToggleKey.Name, "| panel:", CFG.UIKey.Name, "| getgenv().__NyxAutoParry.Report() buat ringkasan")
+notify("v7.0 loaded - tekan " .. CFG.ToggleKey.Name .. " buat toggle")
+log("loaded v7.0. toggle:", CFG.ToggleKey.Name, "| panel:", CFG.UIKey.Name, "| getgenv().__NyxAutoParry.Report() buat ringkasan")
