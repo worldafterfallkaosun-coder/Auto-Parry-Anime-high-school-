@@ -74,6 +74,21 @@
       UI     : panel kecil bisa digeser (header), "-" minimize, RightShift sembunyiin.
 ]]
 
+--[[
+	v6.0 (= v5 + fire instan + fix block kekunci + range lari + UI tombol bulat)
+	  LAG    : antrean dicek 2x per frame (PreRender + Heartbeat), jadwal yang udah waktunya langsung jalan
+			   (nggak nunggu frame berikutnya), trace/log nggak lagi nge-format string pas mati, UI cuma
+			   update pas panel kebuka, swing jauh (>60 stud) diabaikan, posisi cuma dicatat pas script ON.
+	  BLOCK  : FIX: rencana yang kekunci (cooldown block / busy abis nyerang / stun) dulu bisa kekirim setengah
+			   frame KECEPETAN lalu ditolak pengecekan sendiri -> hit lolos. Sekarang jadwalnya digeser.
+			   Status block lokal disamain sama atribut Blocking server (block yang dimatiin server nggak
+			   lagi dianggap masih nyala). Retry setelah ditolak dibatasin (nggak spam remote).
+			   Abis parry, block ditahan kalau ada attacker LAIN yang baru ngayun di deket lu.
+	  LARI   : range ancaman ikut kecepatan lari lu, 5 horizon rewind (bukan 3), margin depan/samping/belakang
+			   dilebarin, flag InCombat lu sendiri nggak lagi ngeblok kalau attacker-nya aktif.
+	  UI     : cuma tombol bulat kecil (geser = pindah, tap = buka/tutup panel).
+]]
+
 local genv = (getgenv and getgenv()) or _G
 if genv.__NyxAutoParry then
 	pcall(genv.__NyxAutoParry.Stop)
@@ -98,10 +113,10 @@ local CFG = {
 
 	-- cek ancaman (hitbox asli + margin buat gerakan & lag)
 	UseVolume = true,
-	RangeMargin = 2.0, -- stud tambahan di depan
-	WidthMargin = 1.5, -- stud tambahan di samping
-	ConeSlack = 0.30, -- lebar tambahan per stud ke depan (attacker bisa nge-aim ulang pas windup)
-	BackMargin = 3, -- toleransi di belakang attacker
+	RangeMargin = 2.5, -- stud tambahan di depan
+	WidthMargin = 2.0, -- stud tambahan di samping
+	ConeSlack = 0.35, -- lebar tambahan per stud ke depan (attacker bisa nge-aim ulang pas windup)
+	BackMargin = 4, -- toleransi di belakang attacker
 	AttackerLag = 0.15, -- kira-kira berapa detik ke belakang server nge-rewind posisi lu
 	LagSpread = 0.10, -- horizon rewind yang dicoba: h-spread, h, h+spread
 	PingMargin = 8, -- stud tambahan per detik RTT (RTT 0.15 -> +1.2 stud)
@@ -113,7 +128,7 @@ local CFG = {
 	TargetAgeM1 = 0.135, -- umur block pas M1 mendarat; window 0..0.25. Agak ke awal: ke-Block M1 = 0 damage, telat = kena
 	TargetAgeM2 = 0.125, -- M2: tengah window (telat = kena, kecepetan = GuardBroken)
 	HoldAfterHit = 0.05, -- dasar hold setelah hit; ditambah 2x variasi ping + p90 frame time
-	LateTolerance = 0.02, -- paket yang diperkirakan telat sampai segini masih dikirim (jitter bisa nyelametin)
+	LateTolerance = 0.03, -- paket yang diperkirakan telat sampai segini masih dikirim (jitter bisa nyelametin)
 	Jitter = 0.005,
 	DedupeWindow = 0.12, -- dua hit yang selisihnya segini = satu block cukup
 	ConflictWindow = 0.95, -- hit yang selisihnya kurang dari ini nggak bisa diparry dua-duanya (cooldown parry + block)
@@ -135,8 +150,8 @@ local CFG = {
 
 	-- kalau ke-Block doang (bukan parry), atau ada M1 lain dalam masa cooldown parry, tahan block
 	ChainGuard = true,
-	ChainHold = 0.7,
-	MaxHold = 2.0, -- batas tahan block nyambung (v3.1: 1.3)
+	ChainHold = 0.85,
+	MaxHold = 2.5, -- batas tahan block nyambung (v3.1: 1.3)
 
 	ReleaseBeforeHeavy = true, -- lepas block sebelum M2 yang nggak bisa diparry (hindari GuardBroken)
 	UseGameState = true, -- v5: baca CombatHandler.Local (busy/cooldown block/stun) biar tau kapan Block ON PASTI diterima. Kalau block malah kerasa telat, set false
@@ -173,11 +188,24 @@ local CFG = {
 	SmartMode = true, -- pilih parry vs dodge pakai peluang sukses + geser target umur block sesuai noise
 	DodgeMinConf = 0.55, -- dodge dipilih duluan kalau peluangnya >= ini DAN lebih tinggi dari parry (selisih DodgeSwitchGap)
 	DodgeSwitchGap = 0.12,
-	CloseAlways = 8, -- stud: attacker sedeket ini tetap dianggap ancaman buat BLOCK/PARRY (dodge tetap butuh ancaman pasti)
+	CloseAlways = 11, -- stud: attacker sedeket ini tetap dianggap ancaman buat BLOCK/PARRY (dodge tetap butuh ancaman pasti)
 	AttackerVelPredict = true, -- ikut hitung gerak attacker selama windup (maju / lunge)
-	MaxTrackDist = 90, -- swing dari attacker lebih jauh dari ini diabaikan (hemat CPU)
+	MaxTrackDist = 60, -- swing dari attacker lebih jauh dari ini diabaikan (hemat CPU)
 	ReleaseOnManualAttack = true, -- klik kiri = lepas block buatan script (kalau nggak ada hit yang lagi ditunggu)
 	GuardRetryOnRefuse = true, -- block ditolak server -> coba lagi begitu kunci kebuka kalau masih ada M1 dateng
+
+	-- ===== v6 =====
+	ImmediateFire = true, -- jadwal yang udah waktunya langsung dijalanin, nggak nunggu Heartbeat berikutnya
+	RunMargin = 0.12, -- stud tambahan ke range ancaman per (stud/detik) kecepatan lari lu
+	RunMarginMax = 3, -- batas margin dari kecepatan lari
+	IgnoreMyCombatFlag = true, -- InCombat lu false tapi attacker InCombat true -> tetap diproses (hit pertama di awal fight)
+	BlockResync = true, -- samain status block lokal sama atribut Blocking dari server
+	CrowdGuard = true, -- abis parry, block ditahan kalau ada attacker lain yang baru ngayun di deket lu
+	CrowdRadius = 16, -- stud
+	CrowdWindow = 1.2, -- detik sejak swing terakhir attacker lain
+	RetryMinGap = 0.15, -- jeda minimal antar retry block abis ditolak
+	RetryMax = 4, -- maksimal retry per 1 detik
+	ButtonSize = 38, -- diameter tombol bulat (px)
 }
 
 ----------------------------------------------------------------------
@@ -224,6 +252,8 @@ local readyAt = 0 -- Block ON baru diterima server setelah ini
 local lockedUntil = 0 -- BlockRefused / stun / guard break
 local parriedAt = -math.huge
 local lastRefusedAt = -math.huge
+local lastSync = -math.huge -- v6: terakhir kali status block lokal disamain sama server
+local blockAttrSeen = false -- v6: atribut Blocking terbukti nyala pas block script nyala (baru boleh dipercaya)
 local pending = {} -- rencana block yang belum dikirim
 
 -- v4
@@ -257,6 +287,7 @@ local swingAt = setmetatable({}, weak) -- [attacker] = { t, lead, kind, key, lea
 local combo = setmetatable({}, weak) -- [attacker] = { idx, at }
 local planToken = setmetatable({}, weak)
 local heavySeen = setmetatable({}, weak)
+local lastSwingSeen = setmetatable({}, weak) -- v6: [attacker] = os.clock() swing terakhir yang kebaca
 local m2Miss = setmetatable({}, weak) -- [attacker] = berapa kali parry M2 dia miss berturut-turut
 
 local counters = {
@@ -317,6 +348,7 @@ end
 -- SCHEDULER (Heartbeat) + FPS TRACKER
 ----------------------------------------------------------------------
 local queue = {}
+local frame = { avg = 1 / 60, p90 = 1 / 60, fps = 60, dev = 0.002 }
 
 local function runHandle(h)
 	if h.dead or h.ran then
@@ -331,6 +363,11 @@ end
 
 local function schedule(at, fn)
 	local h = { at = at, fn = fn, dead = false, ran = false }
+	-- v6: udah waktunya (atau kurang dari FireEarly frame lagi) -> jalan sekarang, jangan nunggu frame berikutnya
+	if CFG.ImmediateFire and at - frame.avg * CFG.FireEarly <= os.clock() then
+		runHandle(h)
+		return h
+	end
 	queue[#queue + 1] = h
 	return h
 end
@@ -342,8 +379,6 @@ local function cancel(h)
 end
 
 -- v5: tanpa alokasi. p90 ~= rata-rata + 1.6 * rata-rata simpangan (aproksimasi, nggak perlu sort lagi)
-local frame = { avg = 1 / 60, p90 = 1 / 60, fps = 60, dev = 0.002 }
-
 local function trackFrame(dt)
 	dt = math.clamp(dt, 1 / 240, 0.25)
 	local d = dt - frame.avg
@@ -598,7 +633,7 @@ local function loadSpecs()
 			end
 		end
 	end
-	log(("spec kebaca: %d style | parryWindow %.2f | blockCooldown %.2f"):format(Specs.count, SR.ParryWindow, SR.BlockCooldown))
+	if CFG.Debug then log(("spec kebaca: %d style | parryWindow %.2f | blockCooldown %.2f"):format(Specs.count, SR.ParryWindow, SR.BlockCooldown)) end
 end
 
 local function styleOf(char)
@@ -626,9 +661,12 @@ local function myState()
 end
 
 -- Server NGGAK nolak Block pas stamina abis, jadi StaminaExhausted sengaja nggak dicek.
-local function cannotAct(char)
+local function cannotAct(char, attacker)
 	if char:GetAttribute("InCombat") == false then
-		return "notincombat"
+		-- v6: flag InCombat lu bisa telat nyala di awal fight; kalau attacker-nya aktif, tetap proses
+		if not (CFG.IgnoreMyCombatFlag and typeof(attacker) == "Instance" and attacker:GetAttribute("InCombat") == true) then
+			return "notincombat"
+		end
 	end
 	if char:GetAttribute("Knocked") or char:GetAttribute("Ragdolled") or char:GetAttribute("Grappled") then
 		return "ko"
@@ -704,16 +742,16 @@ local function pressBlock(hold)
 		return false
 	end
 	if now < readyAt - 0.005 then
-		trace(("block gagal: cooldown block (sisa %.2fs)"):format(readyAt - now))
+		if CFG.Trace then trace(("block gagal: cooldown block (sisa %.2fs)"):format(readyAt - now)) end
 		return false
 	end
 	if now < lockedUntil then
-		trace(("block gagal: lagi kekunci stun/refuse (sisa %.2fs)"):format(lockedUntil - now))
+		if CFG.Trace then trace(("block gagal: lagi kekunci stun/refuse (sisa %.2fs)"):format(lockedUntil - now)) end
 		return false
 	end
 	local gl = gameLock()
 	if gl and now < gl - 0.01 then
-		trace(("block gagal: state game bilang belum boleh (sisa %.2fs)"):format(gl - now))
+		if CFG.Trace then trace(("block gagal: state game bilang belum boleh (sisa %.2fs)"):format(gl - now)) end
 		return false
 	end
 	-- lu lagi nahan block manual -> jangan diganggu (OFF kita bakal ngelepas block lu)
@@ -723,7 +761,7 @@ local function pressBlock(hold)
 		trace("block gagal: lu lagi nahan block manual")
 		return false
 	end
-	trace(("BLOCK ON dikirim (hold %.3f)"):format(hold))
+	if CFG.Trace then trace(("BLOCK ON dikirim (hold %.3f)"):format(hold)) end
 	blockHeld = true
 	blockOnAt = now
 	counters.fired += 1
@@ -756,6 +794,23 @@ end
 local function dropLocalBlock()
 	cancel(releaseHandle)
 	blockHeld = false
+end
+
+-- v6: samain status block lokal sama server (atribut Blocking). Server bisa ngelepas block kita (stun dll)
+-- tanpa script tau -> blockHeld nyangkut true -> semua rencana berikutnya dikira "udah nyala" padahal nggak.
+local function syncBlock(now, char)
+	if not (CFG.BlockResync and blockHeld and char) then
+		return
+	end
+	if char:GetAttribute("Blocking") == true then
+		blockAttrSeen = true
+		return
+	end
+	if blockAttrSeen and (now - blockOnAt) > net.rtt * 1.5 + 0.25 then
+		trace("resync: server nggak lagi nge-block, status lokal direset")
+		dropLocalBlock()
+		readyAt = math.max(readyAt, now)
+	end
 end
 
 ----------------------------------------------------------------------
@@ -990,7 +1045,7 @@ local function inVolume(ahrp, pos, plan, boost, apos)
 	return lat <= half
 end
 
-local OFFS = { 0, -1, 1 }
+local OFFS = { 0, -1, 1, -2, 2 }
 
 -- hasil: ancaman?, jarak datar, pasti? (pasti = masuk volume hitbox; false = cuma "deket banget")
 local function threatens(attacker, myHrp, plan, lead)
@@ -1001,6 +1056,9 @@ local function threatens(attacker, myHrp, plan, lead)
 	local d = myHrp.Position - ahrp.Position
 	local dist = Vector3.new(d.X, 0, d.Z).Magnitude
 	local boost = math.clamp(net.rtt * CFG.PingMargin, 0, CFG.MaxPingMargin)
+	-- v6: lagi lari -> posisi lu di server bisa jauh beda dari yang kerasa di client, range ikut melebar
+	local mv = myHrp.AssemblyLinearVelocity
+	boost += math.min(math.sqrt(mv.X * mv.X + mv.Z * mv.Z) * CFG.RunMargin, CFG.RunMarginMax)
 
 	if inVolume(ahrp, myHrp.Position, plan, boost) then
 		return true, dist, true
@@ -1103,6 +1161,8 @@ local function dodgeLocal()
 	return nil
 end
 
+local DODGE_KEYS = { "DodgeReadyAt", "BusyUntil", "StunnedUntil" } -- v6: nggak alokasi tabel tiap panggil
+
 -- berapa detik lagi dodge baru bisa dikirim (0 = siap). forPlan = ikut hitung dodge yang udah dijadwalin
 local function dodgeWait(now, forPlan)
 	local w = math.max(dodgeReadyAt - now, dodgeBusyUntil - now, stunUntil - now, 0)
@@ -1114,7 +1174,7 @@ local function dodgeWait(now, forPlan)
 		local ok, res = pcall(function()
 			local sn = workspace:GetServerTimeNow()
 			local m = 0
-			for _, k in ipairs({ "DodgeReadyAt", "BusyUntil", "StunnedUntil" }) do
+			for _, k in ipairs(DODGE_KEYS) do
 				local v = L[k]
 				if type(v) == "number" and v > sn then
 					m = math.max(m, v - sn)
@@ -1219,11 +1279,11 @@ local function planDodge(attacker, plan, lead, now, rtt, fl, tag, why)
 	end
 	local ok, sendIn, age, wait, d = dodgeProbe(lead, now, rtt, fl)
 	if not ok then
-		trace(
+		if CFG.Trace then trace(
 			("%s: dodge nggak mungkin (%s) age %.3f iframe %.2f tunggu %.2fs"):format(
 				tag, tostring(why), age, d.IFrames, wait
 			)
-		)
+		) end
 		skip(age < CFG.DodgeMinAge and "dodge-late" or "dodge-early")
 		return false
 	end
@@ -1241,11 +1301,11 @@ local function planDodge(attacker, plan, lead, now, rtt, fl, tag, why)
 	dodgePlannedUntil = now + sendIn + d.Cooldown - 0.05
 	dodgeBlockUntil = math.max(dodgeBlockUntil, now + sendIn + d.Duration)
 	noteExpected(attacker, hitAt, now, "DODGE")
-	trace(
+	if CFG.Trace then trace(
 		("%s dari %s: DODGE (%s) lead %.3f rtt %.3f -> kirim %.3fs lagi (umur iframe %.3f)"):format(
 			tag, attacker.Name, tostring(why), lead, rtt, sendIn, age
 		)
-	)
+	) end
 	local rec = { kind = "DODGE", hit = hitAt, done = false }
 	pending[#pending + 1] = rec
 	rec.handle = schedule(now + sendIn, function()
@@ -1305,14 +1365,14 @@ local function guardExtend(attacker, plan, tag, lead, now, rtt, fl, ha, note)
 	local coverTo = math.max(now + lead - rtt - fl + ha, now + lead + CFG.ResultPad)
 	if extendHoldTo(coverTo) then
 		counters.chained += 1
-		trace(("%s dari %s: block ditahan terus (%s), cover sampai +%.3fs"):format(tag, attacker.Name, note, coverTo - now))
+		if CFG.Trace then trace(("%s dari %s: block ditahan terus (%s), cover sampai +%.3fs"):format(tag, attacker.Name, note, coverTo - now)) end
 	else
-		trace(("%s dari %s: block udah lepas, nggak bisa ditahan lagi (%s)"):format(tag, attacker.Name, note))
+		if CFG.Trace then trace(("%s dari %s: block udah lepas, nggak bisa ditahan lagi (%s)"):format(tag, attacker.Name, note)) end
 	end
 end
 
 -- Block ON baru dijadwalin. mode "parry" = ngincer window parry, "plain" = cukup block nyala pas hit
-local function scheduleBlock(attacker, plan, tag, lead, sendIn, age, ha, rtt, fl, now, mode)
+local function scheduleBlock(attacker, plan, tag, lead, sendIn, age, ha, rtt, fl, now, mode, bound)
 	local hitAt = now + lead
 	local verdict = arbitrate(plan.kind, hitAt, now)
 	if verdict ~= "ok" then
@@ -1332,21 +1392,23 @@ local function scheduleBlock(attacker, plan, tag, lead, sendIn, age, ha, rtt, fl
 	counters.planned += 1
 	noteExpected(attacker, hitAt, now, plan.kind)
 	if CFG.DebugPlan then
-		log(
+		if CFG.Debug then log(
 			("%s plan[%s]: lead %.3f rtt %.3f±%.3f fps %.0f sendIn %.3f age %.3f hold %.3f tune %+.3f"):format(
 				tag, mode, lead, rtt, net.var, frame.fps, sendIn, age, hold, tune[plan.kind]
 			)
-		)
+		) end
 	end
 
-	trace(
+	if CFG.Trace then trace(
 		("%s dari %s [%s]: lead %.3f rtt %.3f fps %.0f -> kirim %.3fs lagi (umur block %.3f)"):format(
 			tag, attacker.Name, mode, lead, rtt, frame.fps, sendIn, age
 		)
-	)
+	) end
 	local rec = { kind = plan.kind, hit = hitAt, done = false }
 	pending[#pending + 1] = rec
-	rec.handle = schedule(now + sendIn, function()
+	-- v6: kalau waktunya ditentuin kunci (cooldown block / busy / stun), jangan kirim lebih awal dari kunci kebuka.
+	-- Dulu FireEarly bikin paket keluar setengah frame sebelum kunci kebuka -> ditolak pengecekan sendiri -> hit lolos.
+	rec.handle = schedule(now + sendIn + (bound and frame.avg * CFG.FireEarly or 0), function()
 		rec.done = true
 		if not alive or not CFG.Enabled then
 			return
@@ -1369,11 +1431,11 @@ local function lateFallback(plan, tag, lead, rtt, fl, bound, wait)
 	if bound then
 		counters.locked += 1
 		skip("locked")
-		log(("%s kekunci cooldown block (sisa %.2fs, lead %.3f)"):format(tag, wait, lead))
+		if CFG.Debug then log(("%s kekunci cooldown block (sisa %.2fs, lead %.3f)"):format(tag, wait, lead)) end
 	else
 		counters.late += 1
 		skip("late")
-		log(("%s terlalu cepat buat di-react (lead %.3f <= rtt %.3f + frame %.3f)"):format(tag, lead, rtt, fl))
+		if CFG.Debug then log(("%s terlalu cepat buat di-react (lead %.3f <= rtt %.3f + frame %.3f)"):format(tag, lead, rtt, fl)) end
 	end
 	local mode = plan.kind == "M2" and CFG.LateModeM2 or CFG.LateModeM1
 	if mode == "block" then
@@ -1402,7 +1464,7 @@ local function react(attacker, plan, tag)
 	if not char or attacker == char then
 		return
 	end
-	local why = cannotAct(char)
+	local why = cannotAct(char, attacker)
 	if why then
 		return skip(why)
 	end
@@ -1413,6 +1475,7 @@ local function react(attacker, plan, tag)
 
 	local now = os.clock()
 	sampleNet(now)
+	syncBlock(now, char)
 	local rtt = net.rtt
 	local fl = frameLag()
 	local sigma = sigmaNow()
@@ -1524,7 +1587,7 @@ local function react(attacker, plan, tag)
 		if mode == "held" then
 			return guardExtend(attacker, plan, tag, lead, now, rtt, fl, ha, "masih di window parry")
 		end
-		return scheduleBlock(attacker, plan, tag, lead, sendIn, age, ha, rtt, fl, now, "parry")
+		return scheduleBlock(attacker, plan, tag, lead, sendIn, age, ha, rtt, fl, now, "parry", bound)
 	end
 
 	------------------------------------------------------------------
@@ -1534,7 +1597,7 @@ local function react(attacker, plan, tag)
 		if mode == "held" then
 			return guardExtend(attacker, plan, tag, lead, now, rtt, fl, ha, "masih di window parry")
 		end
-		return scheduleBlock(attacker, plan, tag, lead, sendIn, age, ha, rtt, fl, now, "parry")
+		return scheduleBlock(attacker, plan, tag, lead, sendIn, age, ha, rtt, fl, now, "parry", bound)
 	end
 
 	if blockHeld and CFG.ChainGuard then
@@ -1544,8 +1607,8 @@ local function react(attacker, plan, tag)
 	if CFG.BlockFallback and not blockHeld then
 		local s2, a2, b2 = calc(CFG.BlockOnlyAge, 0)
 		if a2 >= -CFG.LateTolerance then
-			trace(("%s dari %s: parry nggak mungkin (%s) -> block biasa"):format(tag, attacker.Name, tostring(reason)))
-			return scheduleBlock(attacker, plan, tag, lead, s2, a2, ha, rtt, fl, now, "plain")
+			if CFG.Trace then trace(("%s dari %s: parry nggak mungkin (%s) -> block biasa"):format(tag, attacker.Name, tostring(reason))) end
+			return scheduleBlock(attacker, plan, tag, lead, s2, a2, ha, rtt, fl, now, "plain", b2)
 		end
 		bound = b2
 	end
@@ -1679,6 +1742,21 @@ local function onHit(data)
 					lastAt = math.max(lastAt, e.at)
 				end
 			end
+			-- v6: attacker LAIN yang baru ngayun di deket lu -> tahan block sampai parry cooldown lewat
+			if not keep and CFG.CrowdGuard then
+				local _, myHrp = myState()
+				if myHrp then
+					for a, t in pairs(lastSwingSeen) do
+						if a ~= attacker and now - t < CFG.CrowdWindow and a.Parent then
+							local ah = a:FindFirstChild("HumanoidRootPart")
+							if ah and (ah.Position - myHrp.Position).Magnitude <= CFG.CrowdRadius then
+								keep = true
+								lastAt = math.max(lastAt, now + SR.ParryCooldown - 0.05)
+							end
+						end
+					end
+				end
+			end
 			if not keep then
 				releaseBefore(now)
 			else
@@ -1686,7 +1764,7 @@ local function onHit(data)
 				extendHoldTo(lastAt + CFG.ResultPad + holdAfter())
 			end
 		end
-		log(("PARRY  (%d parry / %d block / %d gb / %d hit)"):format(counters.parried, counters.blocked, counters.guardbroken, counters.hit))
+		if CFG.Debug then log(("PARRY  (%d parry / %d block / %d gb / %d hit)"):format(counters.parried, counters.blocked, counters.guardbroken, counters.hit)) end
 	elseif res == "Blocked" then
 		counters.blocked += 1
 		lastEvent = "block " .. kind .. " · " .. nameOf(attacker)
@@ -1697,7 +1775,7 @@ local function onHit(data)
 		if CFG.ChainGuard and kind == "M1" then
 			extendHoldTo(now + CFG.ChainHold)
 		end
-		log(("block  %s (tune M1 %+.3f M2 %+.3f%s)"):format(kind, tune.M1, tune.M2, inParryCd and ", parry cooldown" or ""))
+		if CFG.Debug then log(("block  %s (tune M1 %+.3f M2 %+.3f%s)"):format(kind, tune.M1, tune.M2, inParryCd and ", parry cooldown" or "")) end
 	elseif res == "GuardBroken" then
 		counters.guardbroken += 1
 		lastEvent = "GUARD BREAK " .. kind .. " · " .. nameOf(attacker)
@@ -1706,13 +1784,13 @@ local function onHit(data)
 		if sent and not inParryCd then
 			tuneBy(kind, 1)
 		end
-		log(("GUARD BREAK %s (tune M1 %+.3f M2 %+.3f%s)"):format(kind, tune.M1, tune.M2, inParryCd and ", parry cooldown" or ""))
+		if CFG.Debug then log(("GUARD BREAK %s (tune M1 %+.3f M2 %+.3f%s)"):format(kind, tune.M1, tune.M2, inParryCd and ", parry cooldown" or "")) end
 	elseif res == "Hit" then
 		counters.hit += 1
 		lastEvent = "KENA " .. kind .. " · " .. nameOf(attacker)
 		if (now - dodgeSentAt) < 0.9 then
 			counters.dodgemiss += 1
-			trace(("dodge nggak nutup hit ini (dodge dikirim %.2fs lalu)"):format(now - dodgeSentAt))
+			if CFG.Trace then trace(("dodge nggak nutup hit ini (dodge dikirim %.2fs lalu)"):format(now - dodgeSentAt)) end
 		end
 		if type(data.Stun) == "number" then
 			lockedUntil = math.max(lockedUntil, now + data.Stun - net.rtt / 2)
@@ -1723,15 +1801,15 @@ local function onHit(data)
 			tuneBy(kind, -1)
 		end
 		local reason = (now - lastSkip.at) < 1.2 and lastSkip.reason or (sent and "block telat" or "nggak ada rencana")
-		log(
+		if CFG.Debug then log(
 			("kena   %s (tune M1 %+.3f M2 %+.3f, rtt %.3f±%.3f, fps %.0f, alasan: %s)"):format(
 				kind, tune.M1, tune.M2, net.rtt, net.var, frame.fps, reason
 			)
-		)
+		) end
 	elseif res == "Dodged" then
 		counters.dodged += 1
 		lastEvent = "DODGE " .. kind .. " · " .. nameOf(attacker)
-		log(("DODGE sukses %s (%d dodge)"):format(kind, counters.dodged))
+		if CFG.Debug then log(("DODGE sukses %s (%d dodge)"):format(kind, counters.dodged)) end
 	end
 end
 
@@ -1747,6 +1825,7 @@ end
 
 -- v5: block ditolak server (lagi busy/cooldown) tapi masih ada M1 yang bakal dateng -> coba lagi begitu kunci kebuka
 local retryHandle = nil
+local lastRetryAt, retryWindowAt, retryCount = -math.huge, -math.huge, 0
 local function retryGuard()
 	if not (alive and CFG.Enabled and CFG.BlockFallback) then
 		return
@@ -1761,7 +1840,19 @@ local function retryGuard()
 	if not target then
 		return
 	end
-	local at = math.max(lockedUntil, readyAt, now) + 0.01
+	-- v6: batasin retry (server nolak terus -> dulu bisa spam remote tiap 10ms)
+	if now - lastRetryAt < CFG.RetryMinGap then
+		return
+	end
+	if now - retryWindowAt > 1.0 then
+		retryWindowAt, retryCount = now, 0
+	end
+	if retryCount >= CFG.RetryMax then
+		return
+	end
+	retryCount += 1
+	lastRetryAt = now
+	local at = math.max(lockedUntil, readyAt, now) + 0.01 + frame.avg * CFG.FireEarly
 	if at >= target then
 		return
 	end
@@ -1786,6 +1877,9 @@ local function onCombat(data)
 		return
 	end
 	local info, kind = data.Info, data.Kind
+	if not CFG.Enabled and (info == "Sound" or info == "Flash") then
+		return
+	end
 
 	if info == "Sound" then
 		local a = data.Character
@@ -1802,6 +1896,7 @@ local function onCombat(data)
 				heavySeen[a] = now
 				local plan = m2Plan(a, nil)
 				swingAt[a] = { t = now, lead = plan.lead, kind = "M2", key = plan.key, learn = plan.learn }
+				lastSwingSeen[a] = now
 				react(a, plan, "M2")
 			end
 		elseif Specs.swingSound[kind] then
@@ -1809,6 +1904,7 @@ local function onCombat(data)
 			trace("swing M1 kebaca dari", a.Name, "sound:", tostring(kind))
 			local plan = m1Plan(a, now)
 			swingAt[a] = { t = now, lead = plan.lead, kind = "M1", key = plan.key, learn = plan.learn }
+			lastSwingSeen[a] = now
 			react(a, plan, "M1")
 		elseif CFG.Trace and not seenKind[tostring(kind)] then
 			seenKind[tostring(kind)] = true
@@ -1822,6 +1918,7 @@ local function onCombat(data)
 			heavySeen[a] = now
 			local plan = m2Plan(a, hold)
 			swingAt[a] = { t = now, lead = plan.lead, kind = "M2", key = plan.key, learn = plan.learn }
+			lastSwingSeen[a] = now
 			react(a, plan, "M2")
 		end
 	elseif info == "EndFlash" then
@@ -1841,7 +1938,7 @@ local function onCombat(data)
 		lastRefusedAt = os.clock()
 		counters.refused += 1
 		dropLocalBlock()
-		log(("block ditolak server (sisa %.2fs)"):format(math.max(0, lockedUntil - os.clock())))
+		if CFG.Debug then log(("block ditolak server (sisa %.2fs)"):format(math.max(0, lockedUntil - os.clock()))) end
 		if CFG.GuardRetryOnRefuse then
 			retryGuard()
 		end
@@ -1884,23 +1981,57 @@ end
 ----------------------------------------------------------------------
 local frameErrShown = false -- v5: error per-frame cuma di-print sekali (biar console nggak banjir)
 -- v5: dipanggil tiap frame lewat pcall(frameTick, ...) -> nggak bikin closure baru tiap frame
+local lastPush = -math.huge
 local function frameTick(dt, now)
 	trackFrame(dt)
 	sampleNet(now)
+	if not CFG.Enabled then
+		return
+	end
 
-	-- riwayat posisi
+	-- riwayat posisi (dicatat cuma pas script ON, max ~125x per detik)
 	local char = LocalPlayer.Character
 	local hrp = char and char:FindFirstChild("HumanoidRootPart")
 	if hrp ~= histOwner then
 		histOwner = hrp
 		hCount = 0
 	end
-	if hrp then
+	if hrp and now - lastPush >= 0.008 then
+		if now - lastPush > 0.5 then
+			hCount = 0 -- riwayat lama (script baru nyala lagi) jangan dipakai
+		end
+		lastPush = now
 		pushPos(now, hrp.Position)
+	end
+
+	-- v6: samain status block lokal sama server (10x per detik, cuma kalau block lagi nyala)
+	if blockHeld and now - lastSync >= 0.1 then
+		lastSync = now
+		syncBlock(now, char)
 	end
 end
 
 table.insert(connections, Combat.OnClientEvent:Connect(onCombat))
+
+-- v6: antrean dicek 2x per frame (PreRender + Heartbeat) -> kuantisasi timing separuh
+local function pumpQueue(now)
+	if #queue == 0 then
+		return
+	end
+	local early = frame.avg * CFG.FireEarly
+	local i = 1
+	while i <= #queue do
+		local q = queue[i]
+		if q.dead or q.ran then
+			table.remove(queue, i)
+		elseif q.at - early <= now then
+			table.remove(queue, i)
+			runHandle(q)
+		else
+			i += 1
+		end
+	end
+end
 
 table.insert(
 	connections,
@@ -1913,20 +2044,7 @@ table.insert(
 			print("[AutoParry] error frame:", errFrame)
 		end
 
-		-- jalanin antrean: kirim di frame yang paling dekat sama waktu target
-		local early = frame.avg * CFG.FireEarly
-		local i = 1
-		while i <= #queue do
-			local q = queue[i]
-			if q.dead or q.ran then
-				table.remove(queue, i)
-			elseif q.at - early <= now then
-				table.remove(queue, i)
-				runHandle(q)
-			else
-				i += 1
-			end
-		end
+		pumpQueue(now)
 
 		-- watchdog: block nyangkut nyala kelamaan -> paksa lepas biar nggak macet selamanya
 		if blockHeld and now > releaseAt + 0.6 then
@@ -1937,6 +2055,21 @@ table.insert(
 		end
 	end)
 )
+
+do
+	local okPre, preStep = pcall(function()
+		return RunService.PreRender
+	end)
+	if not okPre or not preStep then
+		preStep = RunService.RenderStepped
+	end
+	table.insert(
+		connections,
+		preStep:Connect(function()
+			pumpQueue(os.clock())
+		end)
+	)
+end
 
 local UI = { gui = nil, refresh = nil, setVisible = nil, dragConn = nil }
 
@@ -1983,7 +2116,7 @@ local function resetStats()
 end
 
 ----------------------------------------------------------------------
--- UI (v5): panel kecil. Header = geser, "-" = minimize, tombol = toggle
+-- UI (v6): cuma tombol bulat kecil. Geser = pindahin, tap = buka/tutup panel. Warna: hijau ON / merah OFF
 ----------------------------------------------------------------------
 local function make(class, props, parent)
 	local o = Instance.new(class)
@@ -1997,12 +2130,11 @@ end
 local function statsText()
 	local c = counters
 	local tot = c.parried + c.blocked + c.guardbroken + c.hit
-	local parryRate = tot > 0 and math.floor(c.parried / tot * 100 + 0.5) or 0
 	local safeTot = tot + c.dodged
 	local safeRate = safeTot > 0 and math.floor((c.parried + c.blocked + c.dodged) / safeTot * 100 + 0.5) or 0
 	return string.format(
-		"Parry <b>%d</b> · Block <b>%d</b> · Dodge <b>%d</b>\nKena <b>%d</b> · GuardBreak <b>%d</b>\nParry rate <b>%d%%</b> · Aman <b>%d%%</b>\n%dms · %d fps\n<i>%s</i>",
-		c.parried, c.blocked, c.dodged, c.hit, c.guardbroken, parryRate, safeRate,
+		"Parry %d · Block %d · Dodge %d\nKena %d · GB %d · Aman %d%%\n%dms · %d fps\n%s",
+		c.parried, c.blocked, c.dodged, c.hit, c.guardbroken, safeRate,
 		math.floor(net.rtt * 1000 + 0.5), math.floor(frame.fps + 0.5), lastEvent
 	)
 end
@@ -2012,7 +2144,7 @@ local function buildUI()
 		return
 	end
 	local GREEN, RED = Color3.fromRGB(46, 160, 100), Color3.fromRGB(200, 70, 70)
-	local DARK, HEAD, MID = Color3.fromRGB(18, 18, 24), Color3.fromRGB(28, 28, 38), Color3.fromRGB(46, 46, 58)
+	local DARK, MID = Color3.fromRGB(18, 18, 24), Color3.fromRGB(46, 46, 58)
 	local WHITE, GREY = Color3.fromRGB(240, 240, 245), Color3.fromRGB(170, 172, 185)
 
 	local gui = Instance.new("ScreenGui")
@@ -2060,108 +2192,85 @@ local function buildUI()
 	end
 	UI.gui = gui
 
+	local SIZE, PW = CFG.ButtonSize, 196
+	local defs = {
+		{ "Parry", "Enabled" },
+		{ "Block", "BlockFallback" },
+		{ "Dodge", "DodgeEnabled" },
+		{ "Pintar", "SmartMode" },
+		{ "M2 dodge", "DodgeFirstM2" },
+	}
+	local rows = math.ceil(#defs / 2)
+	local statsY = 8 + rows * 28 + 2
+	local btnY = statsY + 56
+	local PH = btnY + 24 + 8
+	local CHIP_W = (PW - 16 - 4) / 2
+
 	local root = make("Frame", {
 		Name = "Root",
-		Size = UDim2.new(0, 214, 0, 0),
-		AutomaticSize = Enum.AutomaticSize.Y,
-		Position = UDim2.new(0, 16, 0.3, 0),
+		Size = UDim2.fromOffset(SIZE, SIZE),
+		Position = UDim2.new(0, 14, 0.35, 0),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+	}, gui)
+
+	local btn = make("TextButton", {
+		Name = "Toggle",
+		Size = UDim2.fromScale(1, 1),
+		BackgroundColor3 = GREEN,
+		BackgroundTransparency = 0.1,
+		BorderSizePixel = 0,
+		AutoButtonColor = false,
+		Text = "AP",
+		Font = Enum.Font.GothamBold,
+		TextSize = 12,
+		TextColor3 = WHITE,
+	}, root)
+	make("UICorner", { CornerRadius = UDim.new(1, 0) }, btn)
+	make("UIStroke", { Color = WHITE, Thickness = 1.5, Transparency = 0.55 }, btn)
+
+	local panel = make("Frame", {
+		Name = "Panel",
+		Size = UDim2.fromOffset(PW, PH),
+		Position = UDim2.fromOffset(0, SIZE + 6),
 		BackgroundColor3 = DARK,
 		BackgroundTransparency = 0.06,
 		BorderSizePixel = 0,
-	}, gui)
-	make("UICorner", { CornerRadius = UDim.new(0, 10) }, root)
-	make("UIStroke", { Color = Color3.fromRGB(70, 70, 90), Thickness = 1 }, root)
-	make("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }, root)
-
-	-- header (geser di sini)
-	local header = make("Frame", {
-		Size = UDim2.new(1, 0, 0, 32),
-		BackgroundColor3 = HEAD,
-		BorderSizePixel = 0,
-		LayoutOrder = 1,
+		Visible = false,
 	}, root)
-	make("UICorner", { CornerRadius = UDim.new(0, 10) }, header)
-	local dot = make("Frame", {
-		Size = UDim2.fromOffset(10, 10),
-		Position = UDim2.new(0, 11, 0.5, -5),
-		BackgroundColor3 = GREEN,
-		BorderSizePixel = 0,
-	}, header)
-	make("UICorner", { CornerRadius = UDim.new(1, 0) }, dot)
-	make("TextLabel", {
-		Text = "AutoParry v5",
-		Font = Enum.Font.GothamBold,
-		TextSize = 13,
-		TextColor3 = WHITE,
-		BackgroundTransparency = 1,
-		Position = UDim2.fromOffset(29, 0),
-		Size = UDim2.new(1, -70, 1, 0),
-		TextXAlignment = Enum.TextXAlignment.Left,
-	}, header)
-	local minBtn = make("TextButton", {
-		Text = "–",
-		Font = Enum.Font.GothamBold,
-		TextSize = 18,
-		TextColor3 = WHITE,
-		BackgroundTransparency = 1,
-		Size = UDim2.fromOffset(34, 32),
-		Position = UDim2.new(1, -36, 0, 0),
-	}, header)
-
-	local body = make("Frame", {
-		Size = UDim2.new(1, 0, 0, 0),
-		AutomaticSize = Enum.AutomaticSize.Y,
-		BackgroundTransparency = 1,
-		LayoutOrder = 2,
-	}, root)
-	make("UIPadding", {
-		PaddingLeft = UDim.new(0, 8),
-		PaddingRight = UDim.new(0, 8),
-		PaddingBottom = UDim.new(0, 8),
-	}, body)
-	make("UIListLayout", { Padding = UDim.new(0, 5), SortOrder = Enum.SortOrder.LayoutOrder }, body)
+	make("UICorner", { CornerRadius = UDim.new(0, 10) }, panel)
+	make("UIStroke", { Color = Color3.fromRGB(70, 70, 90), Thickness = 1 }, panel)
 
 	local paints = {}
-	local order = 0
-	local function toggle(label, key)
-		order += 1
-		local btn = make("TextButton", {
-			Size = UDim2.new(1, 0, 0, 26),
+	for i, d in ipairs(defs) do
+		local label, key = d[1], d[2]
+		local col, row = (i - 1) % 2, math.floor((i - 1) / 2)
+		local b = make("TextButton", {
+			Position = UDim2.fromOffset(8 + col * (CHIP_W + 4), 8 + row * 28),
+			Size = UDim2.fromOffset(CHIP_W, 24),
 			Font = Enum.Font.GothamMedium,
-			TextSize = 12,
+			TextSize = 11,
 			TextColor3 = WHITE,
 			BorderSizePixel = 0,
 			AutoButtonColor = true,
-			LayoutOrder = order,
-		}, body)
-		make("UICorner", { CornerRadius = UDim.new(0, 7) }, btn)
+		}, panel)
+		make("UICorner", { CornerRadius = UDim.new(0, 7) }, b)
 		local function paint()
 			local on = CFG[key] and true or false
-			btn.Text = label .. "  ·  " .. (on and "ON" or "OFF")
-			btn.BackgroundColor3 = on and GREEN or MID
+			b.Text = label .. (on and "  ON" or "  OFF")
+			b.BackgroundColor3 = on and GREEN or MID
 		end
-		btn.Activated:Connect(function()
+		b.Activated:Connect(function()
 			CFG[key] = not CFG[key]
-			if UI.refresh then
-				UI.refresh()
-			else
-				paint()
-			end
+			UI.refresh()
 		end)
 		paints[#paints + 1] = paint
 		paint()
 	end
 
-	toggle("Auto Parry", "Enabled")
-	toggle("Block cadangan", "BlockFallback")
-	toggle("Auto Dodge", "DodgeEnabled")
-	toggle("Mode pintar", "SmartMode")
-	toggle("Dodge M2 duluan", "DodgeFirstM2")
-
-	order += 1
 	local stats = make("TextLabel", {
-		Size = UDim2.new(1, 0, 0, 0),
-		AutomaticSize = Enum.AutomaticSize.Y,
+		Position = UDim2.fromOffset(8, statsY),
+		Size = UDim2.fromOffset(PW - 16, 52),
 		BackgroundTransparency = 1,
 		Font = Enum.Font.Gotham,
 		TextSize = 11,
@@ -2169,111 +2278,116 @@ local function buildUI()
 		TextXAlignment = Enum.TextXAlignment.Left,
 		TextYAlignment = Enum.TextYAlignment.Top,
 		TextWrapped = true,
-		RichText = true,
+		TextTruncate = Enum.TextTruncate.AtEnd,
 		Text = "",
-		LayoutOrder = order,
-	}, body)
+	}, panel)
 
-	order += 1
-	local row = make("Frame", {
-		Size = UDim2.new(1, 0, 0, 26),
-		BackgroundTransparency = 1,
-		LayoutOrder = order,
-	}, body)
-	local function smallBtn(text, x, cb)
+	local function smallBtn(text, col, cb)
 		local b = make("TextButton", {
 			Text = text,
 			Font = Enum.Font.GothamMedium,
-			TextSize = 12,
+			TextSize = 11,
 			TextColor3 = WHITE,
 			BackgroundColor3 = MID,
 			BorderSizePixel = 0,
-			Size = UDim2.new(0.5, -3, 1, 0),
-			Position = UDim2.new(x, x == 0 and 0 or 3, 0, 0),
-		}, row)
+			Position = UDim2.fromOffset(8 + col * (CHIP_W + 4), btnY),
+			Size = UDim2.fromOffset(CHIP_W, 24),
+		}, panel)
 		make("UICorner", { CornerRadius = UDim.new(0, 7) }, b)
 		b.Activated:Connect(cb)
 	end
 	smallBtn("Reset stat", 0, function()
 		resetStats()
-		if UI.refresh then
-			UI.refresh()
-		end
+		UI.refresh()
 	end)
-	smallBtn("Ringkasan", 0.5, function()
+	smallBtn("Ringkasan", 1, function()
 		report()
 	end)
 
-	order += 1
-	make("TextLabel", {
-		Text = CFG.ToggleKey.Name .. " = ON/OFF · " .. CFG.UIKey.Name .. " = sembunyiin",
-		Font = Enum.Font.Gotham,
-		TextSize = 10,
-		TextColor3 = Color3.fromRGB(120, 122, 138),
-		BackgroundTransparency = 1,
-		Size = UDim2.new(1, 0, 0, 14),
-		LayoutOrder = order,
-	}, body)
-
-	-- minimize
-	minBtn.Activated:Connect(function()
-		body.Visible = not body.Visible
-		minBtn.Text = body.Visible and "–" or "+"
-	end)
-
-	-- geser lewat header (mouse / sentuh)
-	local dragging, dragStart, startPos = false, nil, nil
-	header.InputBegan:Connect(function(input)
+	-- geser = pindah, tap (gerak < 6px) = buka/tutup panel
+	local dragging, moved, dragStart, startPos = false, false, nil, nil
+	btn.InputBegan:Connect(function(input)
 		local t = input.UserInputType
-		if t == Enum.UserInputType.MouseButton1 or t == Enum.UserInputType.Touch then
-			dragging, dragStart, startPos = true, input.Position, root.Position
-			if UI.dragConn then
-				UI.dragConn:Disconnect()
+		if t ~= Enum.UserInputType.MouseButton1 and t ~= Enum.UserInputType.Touch then
+			return
+		end
+		dragging, moved = true, false
+		dragStart, startPos = input.Position, root.Position
+		if UI.dragConn then
+			UI.dragConn:Disconnect()
+		end
+		UI.dragConn = UserInputService.InputChanged:Connect(function(i)
+			if not dragging then
+				return
 			end
-			UI.dragConn = UserInputService.InputChanged:Connect(function(i)
-				if not dragging then
-					return
+			local tt = i.UserInputType
+			if tt == Enum.UserInputType.MouseMovement or tt == Enum.UserInputType.Touch then
+				local d = i.Position - dragStart
+				if not moved and d.Magnitude > 6 then
+					moved = true
 				end
-				local tt = i.UserInputType
-				if tt == Enum.UserInputType.MouseMovement or tt == Enum.UserInputType.Touch then
-					local d = i.Position - dragStart
+				if moved then
 					root.Position =
 						UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
 				end
-			end)
-			input.Changed:Connect(function()
-				if input.UserInputState == Enum.UserInputState.End then
-					dragging = false
-					if UI.dragConn then
-						UI.dragConn:Disconnect()
-						UI.dragConn = nil
-					end
+			end
+		end)
+		input.Changed:Connect(function()
+			if input.UserInputState == Enum.UserInputState.End then
+				dragging = false
+				if UI.dragConn then
+					UI.dragConn:Disconnect()
+					UI.dragConn = nil
 				end
-			end)
-		end
+				if not moved then
+					UI.togglePanel()
+				end
+			end
+		end)
 	end)
 
-	UI.setVisible = function()
-		gui.Enabled = not gui.Enabled
-	end
+	local lastStats, lastOn = "", nil
 	UI.refresh = function()
 		for _, p in ipairs(paints) do
 			p()
 		end
-		dot.BackgroundColor3 = CFG.Enabled and GREEN or RED
-		if body.Visible then
-			stats.Text = statsText()
+		local on = CFG.Enabled and true or false
+		if on ~= lastOn then
+			lastOn = on
+			btn.BackgroundColor3 = on and GREEN or RED
 		end
+		if panel.Visible then
+			local s = statsText()
+			if s ~= lastStats then
+				lastStats = s
+				stats.Text = s
+			end
+		end
+	end
+	UI.togglePanel = function()
+		local open = not panel.Visible
+		if open then
+			-- panel nggak boleh keluar layar
+			local vs, ap = gui.AbsoluteSize, root.AbsolutePosition
+			local x = (ap.X + PW > vs.X - 4) and (SIZE - PW) or 0
+			local y = (ap.Y + SIZE + 6 + PH > vs.Y - 4) and -(PH + 6) or (SIZE + 6)
+			panel.Position = UDim2.fromOffset(x, y)
+			UI.refresh()
+		end
+		panel.Visible = open
+	end
+	UI.setVisible = function()
+		gui.Enabled = not gui.Enabled
 	end
 	UI.refresh()
 
-	-- update 4x per detik (bukan per frame) biar nggak nambah beban
+	-- panel tutup = nol update. Kebuka = 2x per detik, itu pun cuma kalau teksnya berubah
 	task.spawn(function()
 		while alive and gui.Parent do
-			if gui.Enabled then
+			task.wait(0.5)
+			if gui.Enabled and (panel.Visible or (CFG.Enabled and true or false) ~= lastOn) then
 				pcall(UI.refresh)
 			end
-			task.wait(0.25)
 		end
 	end)
 end
@@ -2321,5 +2435,5 @@ if CFG.UI then
 	end)
 end
 
-notify("v5.0 loaded - tekan " .. CFG.ToggleKey.Name .. " buat toggle")
-log("loaded v5.0. toggle:", CFG.ToggleKey.Name, "| panel:", CFG.UIKey.Name, "| getgenv().__NyxAutoParry.Report() buat ringkasan")
+notify("v6.0 loaded - tekan " .. CFG.ToggleKey.Name .. " buat toggle")
+log("loaded v6.0. toggle:", CFG.ToggleKey.Name, "| panel:", CFG.UIKey.Name, "| getgenv().__NyxAutoParry.Report() buat ringkasan")
