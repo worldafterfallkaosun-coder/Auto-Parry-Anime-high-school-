@@ -109,6 +109,19 @@
 					asal paketnya masih sempat nyampe sebelum hit mendarat.
 ]]
 
+--[[
+	v8.0 (= v7 + kejar combo + unlock stun lebih awal + fallback block lewat remote + log "kenapa kena")
+	  COMBO  : abis M1 attacker mendarat di lu (kena / ke-block), hit combo berikutnya langsung direncanain dari event Hit itu
+			   (Endlag + Windup swing berikutnya) -> Block ON dikirim TEPAT pas stun lepas: parry kalau umur block masuk window,
+			   kalau nggak block biasa (ditahan), kalau block juga nggak sempat dodge. Attacker yang lagi nge-combo lu tetap
+			   dianggap ancaman walau cek hitbox meleset (knockback / ping / lunge).
+	  UNLOCK : stun dari hit dulu dihitung rtt/2 (kekonservatif). Sekarang dipelajari: block dikirim se-awal mungkin yang masih
+			   diterima server (stunSlack naik kalau BlockRefused, turun kalau block pas-unlock sukses).
+	  BLOCK  : cek lokal game (SetLocalBlocking) nolak padahal model kita bilang server bakal nerima -> kirim remote langsung
+			   (dulu: skip "local-refuse" -> hit lolos). Block biasa (fallback) dikirim lebih awal (BlockOnlyAge 0.22).
+	  DIAG   : getgenv().__NyxAutoParry.Why() = 10 hit terakhir + alasannya (skip apa, rtt, fps, block nyala/nggak, kunci, stun).
+]]
+
 local genv = (getgenv and getgenv()) or _G
 if genv.__NyxAutoParry then
 	pcall(genv.__NyxAutoParry.Stop)
@@ -186,7 +199,7 @@ local CFG = {
 
 	-- ===== v4: block fallback =====
 	BlockFallback = true, -- parry nggak mungkin -> block biasa (ditahan, nyambung pakai ChainGuard)
-	BlockOnlyAge = 0.14, -- umur block pas hit mendarat kalau cuma mau ngeblock (nggak ngincer window parry)
+	BlockOnlyAge = 0.22, -- umur block pas hit mendarat kalau cuma mau ngeblock (nggak ngincer window parry)
 	ResultPad = 0.06, -- hold minimal sampai segini detik setelah hit mendarat (nunggu event hasil)
 	ReleaseOnParry = true, -- abis Parried block langsung dilepas (kecuali ada hit lain dalam <0.9s)
 
@@ -235,6 +248,18 @@ local CFG = {
 	PredictBelow = 0.12, -- cuma nebak kalau (windup berikutnya - rtt - frame) < segini; di atas itu react biasa udah cukup
 	PredictMaxDist = 14, -- stud: attacker harus sedeket ini buat ditebak
 	RetryAfterUnlock = true, -- block kekunci tapi masih sempat -> coba lagi begitu kunci kebuka
+
+	-- ===== v8 =====
+	HitReflex = true, -- abis kena/ke-block M1: langsung rencanain parry (atau block) buat hit combo berikutnya
+	ComboKeep = true, -- attacker yang lagi nge-combo lu tetap dianggap ancaman walau cek hitbox meleset
+	ComboKeepRange = 16, -- stud
+	ComboKeepTime = 1.1, -- detik sejak hit terakhir dari attacker itu
+	FastUnlock = true, -- belajar kapan stun beneran lepas di server -> block keluar tepat pas kunci kebuka
+	StunSlackStart = 0.35, -- fraksi rtt pengaman awal (0.5 = persis v7). Turun kalau block pas-unlock diterima, naik kalau ditolak
+	StunSlackMin = 0.1,
+	StunSlackMax = 0.65,
+	RawOnLocalRefuse = true, -- cek lokal game nolak Block tapi model kita bilang boleh -> kirim remote langsung
+	WhyHit = true, -- catat alasan tiap kena hit (getgenv().__NyxAutoParry.Why())
 }
 
 ----------------------------------------------------------------------
@@ -318,6 +343,12 @@ local planToken = setmetatable({}, weak)
 local heavySeen = setmetatable({}, weak)
 local lastSwingSeen = setmetatable({}, weak) -- v6: [attacker] = os.clock() swing terakhir yang kebaca
 local m2Miss = setmetatable({}, weak) -- [attacker] = berapa kali parry M2 dia miss berturut-turut
+local comboVictim = setmetatable({}, weak) -- v8: [attacker] = { at = hit terakhir yang nyampe ke lu, n = jumlah hit/block beruntun }
+local rawOn = false -- v8: Block ON terakhir lewat remote langsung (cek lokal game nolak, model kita bilang aman)
+local stunSlack = CFG.StunSlackStart -- v8: lihat stunComp()
+local stunSrcUntil = -math.huge -- v8: lockedUntil terakhir yang asalnya dari stun hit
+local stunProbeAt = -math.huge -- v8: Block ON terakhir yang dikirim persis pas stun lepas (bahan belajar stunSlack)
+local whyLog = {} -- v8: alasan tiap kena hit (whyReport)
 
 local counters = {
 	planned = 0,
@@ -339,6 +370,7 @@ local counters = {
 	swingheld = 0,
 	predicted = 0,
 	retried = 0,
+	reflex = 0,
 }
 local skips = {}
 local lastSkip = { reason = "-", at = -math.huge }
@@ -428,6 +460,17 @@ end
 -- PING TRACKER
 ----------------------------------------------------------------------
 local net = { rtt = 0.10, var = 0.012, at = -math.huge }
+
+-- v8: kompensasi jaringan buat timer stun (dihitung dari saat event Hit nyampe). Stun server mulai pas hit mendarat, event nyampe
+-- rtt/2 kemudian, dan paket Block kita butuh rtt/2 lagi -> paling cepat dikirim (event + Stun - rtt). v7 cuma ngurangin rtt/2.
+-- stunSlack = fraksi rtt yang masih disisakan sebagai pengaman (0.5 = persis v7). Turun pelan kalau block yang dikirim pas unlock
+-- terbukti diterima, naik lagi kalau server nolak (BlockRefused).
+local function stunComp()
+	if not CFG.FastUnlock then
+		return net.rtt * 0.5
+	end
+	return net.rtt * (1 - stunSlack)
+end
 
 local pingItem = nil
 
@@ -593,7 +636,7 @@ local function gameLock()
 	if type(L) ~= "table" then
 		return nil
 	end
-	local ok, res = pcall(readLock, L, workspace:GetServerTimeNow(), os.clock(), net.rtt * 0.5)
+	local ok, res = pcall(readLock, L, workspace:GetServerTimeNow(), os.clock(), stunComp())
 	if ok and res ~= -math.huge and res < os.clock() + 3 then
 		return res -- nilai > 3 detik ke depan dianggap bogus
 	end
@@ -762,13 +805,25 @@ local function sendBlock(on)
 				if on then
 					local L2 = h.Local
 					if type(L2) ~= "table" or L2.Blocking ~= true then
+						-- v8: cek lokal game nolak (state stun/busy lokalnya telat), padahal model kita (stun/cooldown/busy
+						-- udah lewat) bilang server bakal nerima -> kirim remote langsung. Kalau server nolak, BlockRefused ngurus.
+						if CFG.RawOnLocalRefuse then
+							rawOn = true
+							Combat:FireServer({ Info = "Block", On = true })
+							return true
+						end
 						return false
 					end
+					rawOn = false
+				elseif rawOn then
+					rawOn = false
+					Combat:FireServer({ Info = "Block", On = false })
 				end
 				return true
 			end
 		end
 	end
+	rawOn = false
 	Combat:FireServer({ Info = "Block", On = on })
 	return true
 end
@@ -816,6 +871,10 @@ local function pressBlock(hold)
 	if CFG.Trace then trace(("BLOCK ON dikirim (hold %.3f)"):format(hold)) end
 	blockHeld = true
 	blockOnAt = now
+	-- v8: block ini dikirim persis pas stun hit baru lepas -> hasilnya (diterima / ditolak) jadi bahan belajar stunSlack
+	if CFG.FastUnlock and now - stunSrcUntil >= -0.01 and now - stunSrcUntil < 0.15 then
+		stunProbeAt = now
+	end
 	if sendBlock(true) == false then
 		blockHeld = false
 		if CFG.Trace then trace("block ditolak cek lokal game (stun/busy/cooldown/InCombat)") end
@@ -851,6 +910,7 @@ end
 local function dropLocalBlock()
 	cancel(releaseHandle)
 	blockHeld = false
+	rawOn = false
 	-- v7: Local.Blocking game jangan nyangkut true (ON berikutnya jadi no-op, nggak ngirim apa-apa)
 	if CFG.UseGameBlock then
 		local h = getHandler()
@@ -1538,7 +1598,18 @@ local function predictedStillValid(attacker, plan, hitAt)
 	if not (c and h) then
 		return false
 	end
-	return (threatens(attacker, h, plan, math.max(hitAt - os.clock(), 0)))
+	local ok, dist = threatens(attacker, h, plan, math.max(hitAt - os.clock(), 0))
+	if ok then
+		return true
+	end
+	-- v8: rencana dari reflex combo: attacker masih di sekitar lu dan combo-nya masih jalan -> tetap kirim
+	if plan.reflex and CFG.ComboKeep then
+		local cv = comboVictim[attacker]
+		if cv and os.clock() - cv.at < CFG.ComboKeepTime + 0.5 and dist <= CFG.ComboKeepRange then
+			return true
+		end
+	end
+	return false
 end
 
 -- v7: Block ON gagal gara-gara kekunci (stun abis kena hit / busy / cooldown) tapi masih sempat nyampe
@@ -1686,6 +1757,13 @@ local function react(attacker, plan, tag)
 	-- v7: plan prediksi leadnya jauh (~0.9s) -> cek ancaman pakai horizon pendek, posisi 0.9s ke depan nggak bisa ditebak
 	local isThreat, dist, sure =
 		threatens(attacker, hrp, plan, plan.predicted and math.min(plan.lead + corr, 0.35) or (plan.lead + corr))
+	-- v8: attacker ini lagi nge-combo lu (hit/block barusan) -> tetap ancaman walau cek hitbox meleset (knockback, ping, lunge)
+	if (not isThreat or not sure) and plan.kind == "M1" and CFG.ComboKeep then
+		local cv = comboVictim[attacker]
+		if cv and now - cv.at < CFG.ComboKeepTime and attacker:FindFirstChild("HumanoidRootPart") and dist <= CFG.ComboKeepRange * (plan.reach or 1) then
+			isThreat, sure = true, true
+		end
+	end
 	if not isThreat then
 		return skip("range")
 	end
@@ -1877,6 +1955,60 @@ local function predictFollowUp(attacker, plan, now)
 	}, "M1*")
 end
 
+-- v8: M1 dari attacker barusan nyampe ke lu (kena / ke-block) -> hit combo berikutnya mendarat Endlag_i*k + Windup_(i+1)*k setelah
+-- hit itu (swing berikutnya mulai pas busy abis, sama kayak predictFollowUp). Bedanya: dihitung dari event HIT yang beneran nyampe
+-- dan dijalanin SETELAH stun/lock ke-update, jadi react nunda Block ON sampai kunci kebuka lalu kirim tepat waktu (parry kalau
+-- umur block masuk window, kalau nggak block biasa, kalau block nggak sempat dodge). Gating dilonggarin lewat comboVictim.
+local function hitReflex(attacker, now)
+	if not (alive and CFG.Enabled and CFG.HitReflex and CFG.BlockFallback) then
+		return
+	end
+	local style = styleOf(attacker)
+	local swings = style and style.M1 and style.M1.Swings
+	local st = combo[attacker]
+	if type(swings) ~= "table" or not st or type(st.idx) ~= "number" then
+		return
+	end
+	local idx = st.idx
+	local spec, nxt = swings[idx], swings[idx + 1]
+	if type(spec) ~= "table" or type(nxt) ~= "table" then
+		return -- swing terakhir: abis ini ada ChainCooldown
+	end
+	local ahrp = attacker:FindFirstChild("HumanoidRootPart")
+	local _, hrp = myState()
+	if not (ahrp and hrp) or (ahrp.Position - hrp.Position).Magnitude > CFG.ComboKeepRange then
+		return
+	end
+	local k1 = timeScale(attacker, style, spec)
+	local k2 = timeScale(attacker, style, nxt)
+	counters.reflex += 1
+	react(attacker, {
+		kind = "M1",
+		lead = (spec.Endlag or 0.45) * k1 + (nxt.Windup or CFG.DefaultM1Lead) * k2,
+		reach = reachOf(attacker, style),
+		spec = nxt,
+		height = nxt.Height or style.M1.Height,
+		idx = idx + 1,
+		key = attacker.Name .. ":" .. (idx + 1),
+		learn = false,
+		predicted = true,
+		reflex = true,
+	}, "M1r")
+end
+
+-- v8: belajar seberapa awal block boleh dikirim pas stun lepas. accepted = block yang dikirim pas unlock diterima server.
+local function stunLearn(accepted)
+	if not CFG.FastUnlock or os.clock() - stunProbeAt > 1.0 then
+		return
+	end
+	stunProbeAt = -math.huge
+	if accepted then
+		stunSlack = math.max(CFG.StunSlackMin, stunSlack - 0.06)
+	else
+		stunSlack = math.min(CFG.StunSlackMax, stunSlack + 0.12)
+	end
+end
+
 local function resyncCombo(attacker, obs)
 	local style = styleOf(attacker)
 	local m1 = style and style.M1
@@ -1967,6 +2099,22 @@ local function onHit(data)
 	local res = data.Result
 	local inParryCd = (now - parriedAt) < SR.ParryCooldown
 
+	-- v8: lacak combo: attacker yang barusan kena/ke-block M1 ke lu lagi nge-combo, parry/dodge = combo putus
+	if kind == "M1" and typeof(attacker) == "Instance" then
+		if res == "Hit" or res == "Blocked" or res == "GuardBroken" then
+			local cv = comboVictim[attacker]
+			if cv and now - cv.at < CFG.ComboKeepTime then
+				cv.n += 1
+			else
+				cv = { n = 1 }
+				comboVictim[attacker] = cv
+			end
+			cv.at = now
+		elseif res == "Parried" or res == "Dodged" then
+			comboVictim[attacker] = nil
+		end
+	end
+
 	-- v4: parry M2 miss -> M2 berikutnya dari attacker ini dodge duluan
 	if kind == "M2" and typeof(attacker) == "Instance" then
 		if res == "Parried" then
@@ -1979,6 +2127,9 @@ local function onHit(data)
 
 	if res == "Parried" then
 		counters.parried += 1
+		if stunProbeAt == blockOnAt and lastRefusedAt < blockOnAt then
+			stunLearn(true)
+		end
 		lastEvent = "PARRY " .. kind .. " · " .. nameOf(attacker)
 		parriedAt = now
 		streak[kind].n = 0
@@ -2023,6 +2174,9 @@ local function onHit(data)
 		if CFG.Debug then log(("PARRY  (%d parry / %d block / %d gb / %d hit)"):format(counters.parried, counters.blocked, counters.guardbroken, counters.hit)) end
 	elseif res == "Blocked" then
 		counters.blocked += 1
+		if stunProbeAt == blockOnAt and lastRefusedAt < blockOnAt then
+			stunLearn(true)
+		end
 		lastEvent = "block " .. kind .. " · " .. nameOf(attacker)
 		-- ke-Block doang = umur block kegedean (kecepetan) -> kirim lebih lambat
 		if sent and not inParryCd then
@@ -2043,20 +2197,35 @@ local function onHit(data)
 		if CFG.Debug then log(("GUARD BREAK %s (tune M1 %+.3f M2 %+.3f%s)"):format(kind, tune.M1, tune.M2, inParryCd and ", parry cooldown" or "")) end
 	elseif res == "Hit" then
 		counters.hit += 1
+		local lockBefore = math.max(lockedUntil - now, 0) -- v8: kondisi kunci SEBELUM stun hit ini masuk
 		lastEvent = "KENA " .. kind .. " · " .. nameOf(attacker)
 		if (now - dodgeSentAt) < 0.9 then
 			counters.dodgemiss += 1
 			if CFG.Trace then trace(("dodge nggak nutup hit ini (dodge dikirim %.2fs lalu)"):format(now - dodgeSentAt)) end
 		end
 		if type(data.Stun) == "number" then
-			lockedUntil = math.max(lockedUntil, now + data.Stun - net.rtt / 2)
+			-- v8: unlock stun dihitung pakai stunComp() (dipelajari); dodge tetap konservatif (iframe nggak boleh nyasar)
+			local su = now + data.Stun - stunComp()
+			lockedUntil = math.max(lockedUntil, su)
 			stunUntil = math.max(stunUntil, now + data.Stun - net.rtt / 2)
+			stunSrcUntil = su
 		end
 		-- kena padahal block udah dikirim = kelambatan -> kirim lebih cepat
 		if sent then
 			tuneBy(kind, -1)
 		end
 		local reason = (now - lastSkip.at) < 1.2 and lastSkip.reason or (sent and "block telat" or "nggak ada rencana")
+		if CFG.WhyHit then
+			local cvw = typeof(attacker) == "Instance" and comboVictim[attacker]
+			whyLog[#whyLog + 1] = {
+				t = now, kind = kind, who = nameOf(attacker), why = reason, rtt = net.rtt, fps = frame.fps,
+				held = blockHeld, locked = lockBefore, stun = type(data.Stun) == "number" and data.Stun or 0,
+				sent = sent and true or false, slack = stunSlack, combo = cvw and cvw.n or 1,
+			}
+			if #whyLog > 20 then
+				table.remove(whyLog, 1)
+			end
+		end
 		if CFG.Debug then log(
 			("kena   %s (tune M1 %+.3f M2 %+.3f, rtt %.3f±%.3f, fps %.0f, alasan: %s)"):format(
 				kind, tune.M1, tune.M2, net.rtt, net.var, frame.fps, reason
@@ -2066,6 +2235,14 @@ local function onHit(data)
 		counters.dodged += 1
 		lastEvent = "DODGE " .. kind .. " · " .. nameOf(attacker)
 		if CFG.Debug then log(("DODGE sukses %s (%d dodge)"):format(kind, counters.dodged)) end
+	end
+
+	-- v8: abis kena / ke-block M1 -> langsung rencanain hit combo berikutnya (stun/lock udah ke-update di atas)
+	if (res == "Hit" or res == "Blocked") and kind == "M1" and typeof(attacker) == "Instance" then
+		local okR, errR = pcall(hitReflex, attacker, now)
+		if not okR then
+			trace("hitReflex error:", tostring(errR))
+		end
 	end
 end
 
@@ -2193,6 +2370,9 @@ local function onCombat(data)
 		if type(untilServer) == "number" then
 			lockedUntil = math.max(lockedUntil, os.clock() + math.max(0, untilServer - workspace:GetServerTimeNow()))
 		end
+		if stunProbeAt == blockOnAt and os.clock() - blockOnAt < net.rtt + 0.4 then
+			stunLearn(false) -- v8: block pas-unlock ditolak -> kita kemaleman? bukan, kecepetan -> pengaman dinaikin
+		end
 		lastRefusedAt = os.clock()
 		counters.refused += 1
 		dropLocalBlock()
@@ -2241,6 +2421,30 @@ local function report()
 			tune.M1, tune.M2, net.rtt, net.var, frame.fps, frame.p90 * 1000, Specs.count, gameLock() and "ya" or "nggak"
 		)
 	)
+	print(
+		("[AutoParry] unlock: slack %.2f (kompensasi stun %.0fms dari rtt %.0fms) | fast unlock %s | raw block %s | reflex %d"):format(
+			stunSlack, stunComp() * 1000, net.rtt * 1000, CFG.FastUnlock and "ya" or "nggak",
+			CFG.RawOnLocalRefuse and "ya" or "nggak", counters.reflex
+		)
+	)
+end
+
+-- v8: kenapa kena hit (20 terakhir kecatat, 10 ditampilin). Kirim hasilnya kalau masih sering kena.
+local function whyReport()
+	if #whyLog == 0 then
+		print("[AutoParry:why] belum ada hit yang kecatat")
+		return
+	end
+	local clk = os.clock()
+	for i = math.max(1, #whyLog - 9), #whyLog do
+		local w = whyLog[i]
+		print(
+			("[AutoParry:why] %.1fs lalu | %s dari %s (combo ke-%d) | alasan: %s | rtt %.0fms fps %.0f | block %s | kunci %.2fs | stun %.2fs | sent %s | slack %.2f"):format(
+				clk - w.t, w.kind, w.who, w.combo, tostring(w.why), w.rtt * 1000, w.fps,
+				w.held and "nyala" or "mati", w.locked, w.stun, tostring(w.sent), w.slack
+			)
+		)
+	end
 end
 
 ----------------------------------------------------------------------
@@ -2475,6 +2679,10 @@ local function buildUI()
 		{ "M2 dodge", "DodgeFirstM2" },
 		{ "Prio block", "GuardPriority" },
 		{ "Prediksi", "PredictCombo" },
+		{ "Combo", "HitReflex" },
+		{ "Unlock", "FastUnlock" },
+		{ "Raw block", "RawOnLocalRefuse" },
+		{ "Log hit", "WhyHit" },
 	}
 	local rows = math.ceil(#defs / 2)
 	local statsY = 8 + rows * 28 + 2
@@ -2675,6 +2883,7 @@ genv.__NyxAutoParry = {
 	Net = net,
 	Frame = frame,
 	Report = report,
+	Why = whyReport,
 	Reset = resetStats,
 	UI = UI,
 	Stop = function()
@@ -2720,5 +2929,5 @@ if CFG.UI then
 	end)
 end
 
-notify("v7.0 loaded - tekan " .. CFG.ToggleKey.Name .. " buat toggle")
-log("loaded v7.0. toggle:", CFG.ToggleKey.Name, "| panel:", CFG.UIKey.Name, "| getgenv().__NyxAutoParry.Report() buat ringkasan")
+notify("v8.0 loaded - tekan " .. CFG.ToggleKey.Name .. " buat toggle")
+log("loaded v8.0. toggle:", CFG.ToggleKey.Name, "| panel:", CFG.UIKey.Name, "| getgenv().__NyxAutoParry.Report() buat ringkasan")
