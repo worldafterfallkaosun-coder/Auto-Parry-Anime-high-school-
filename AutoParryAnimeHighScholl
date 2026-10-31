@@ -1,39 +1,45 @@
 --!nonstrict
 --[[
-    AutoParry v2
+    AutoParry v3
     Game    : Roblox fighting game (ReplicatedStorage.Remotes.Combat, M1/M2/Block/Parry)
     Runtime : Luau, client-side (jalanin lewat executor lu)
     Toggle  : P  (ubah di CFG.ToggleKey)
 
-    Aturan server (dibaca dari dump CombatHandler / CombatSettings, bukan tebakan):
-      - Parry  = Block ON dengan umur 0..ParryWindow(0.25s) pas hit mendarat,
+    Aturan server (dari dump CombatHandler / CombatSettings):
+      - Parry  = Block ON dengan umur 0..ParryWindow(0.25s) pas hit mendarat di server,
                  DAN udah >= ParryCooldown(0.7s) sejak parry terakhir.
-      - Block biasa = damage 0 buat M1, tapi M2/heavy punya BreaksBlock -> kena
-                 GuardBroken (damage penuh + nggak bisa block 1.2s). Jadi M2 CUMA
-                 bisa diselamatin sama parry yang pas.
-      - Block ON ditolak kalau: stun, guard break, lagi busy (nyerang/dash),
-                 atau BELUM lewat BlockCooldown(0.75s) sejak Block OFF terakhir.
-      - Hit M1 mendarat Windup detik setelah Sound "Swing" nyampe.
-        Windup = spec.Windup * SwingFactor / (style.Speed * spec.SwingSpeed),
-        beda tiap style & tiap combo (Basic 0.2/0.23/0.2/0.2, Katana ~0.31, dst).
-      - Hit M2 mendarat Windup detik setelah Flash "Heavy" nyampe. Hold di Flash
-        = Windup + FlashTail, jadi hit pertama = Hold - FlashTail (bukan Hold + 0.04).
-      - Attacker kena stun / ke-parry -> swing-nya batal (EndFlash) + combo reset.
+      - Umur block diukur di SERVER (BlockStartedAt = waktu paket Block ON nyampe).
+        Jadi yang penting = kapan paket lu NYAMPE, bukan kapan lu kirim.
+      - M1 mendarat Windup detik setelah Sound swing disiarkan server.
+      - M2 mendarat Windup detik setelah Flash "Heavy". M2 BreaksBlock -> cuma parry yang nyelametin.
+      - Block ON ditolak kalau: stun, guard break, BusyUntil (lagi nyerang/dash), atau
+        belum lewat BlockCooldown(0.75s) sejak Block OFF.
 
-    Yang beda dari v1:
-      1. Nggak ada lagi gate StaminaExhausted. Itu yang bikin script cuma jalan
-         pas diem (lari = stamina abis = script mati, padahal server nggak peduli).
-      2. Timing diambil dari spec style attacker (require module style-nya),
-         bukan konstanta. Fallback ke cara lama kalau modul nggak ketemu.
-      3. Cek ancaman pakai hitbox asli (range, radius, tinggi) + prediksi gerak
-         lu, bukan lingkaran 11 stud + FacingDot.
-      4. Model cooldown server (BlockCooldown, BlockRefused, GuardBroken, stun)
-         dipakai buat nentuin kapan Block ON masih bisa diterima.
-      5. M1 custom sound (Axe_and_Flail: Slash1/Flail2/...) ikut kedeteksi,
-         HeavySwing sound jadi cadangan kalau Flash nggak nyampe.
-      6. Tune adaptif dipisah M1 vs M2, + koreksi lead per-attacker.
-      7. Chain guard: kalau cuma ke-Block (bukan parry), block ditahan buat
-         nutup hit M1 berikutnya.
+    Yang baru di v3 (fokus: fps + ping + miss):
+      1. Scheduler pakai Heartbeat, bukan task.delay. task.delay selalu telat 0..1 frame
+         (di 30 fps bisa 33ms). Sekarang block dikirim di frame yang PALING DEKAT
+         sama waktu target (error maksimal setengah frame, bisa lebih awal).
+      2. Tracker FPS (rata-rata + p90 frame time). Telat proses event (~setengah frame)
+         dan telat kirim dikompensasi otomatis di rumus timing. Hold block juga
+         melebar kalau fps jelek / ping goyang.
+      3. Tracker ping ala TCP (SRTT + variasi), disampel terus tiap 0.1s (v2 cuma
+         nyampel pas ada event, jadi sering basi). Lonjakan sesaat nggak langsung dipercaya.
+      4. Cek ancaman pakai riwayat posisi lu (bukan cuma prediksi ke depan). Server
+         nge-rewind posisi lu ke masa lalu, jadi kalau lu dash menjauh, server masih
+         nganggep lu di range. Beberapa horizon dicoba, margin ikut melebar kalau ping tinggi.
+      5. Baca state game sendiri (CombatHandler.Local: BusyUntil, BlockReadyAt,
+         StunnedUntil, GuardBrokenUntil) buat tau kapan Block ON PASTI diterima server,
+         termasuk pas lu abis nyerang manual. Kalau nggak bisa di-require, balik ke model v2.
+      6. Belajar timing per attacker PER SWING (M1 combo ke-1/2/3/4) dan M2, bukan
+         satu angka per attacker. Murni dari selisih Sound -> Hit yang lu terima.
+      7. Prioritas: kalau M1 dan M2 bentrok dalam satu jendela cooldown, M2 yang diparry
+         (M2 = GuardBroken). M1 beruntun ke-Block ditutup pakai perpanjangan hold.
+      8. Sebelum M2 mendarat di masa parry cooldown, block yang masih nyala dilepas
+         dulu biar nggak jadi GuardBroken (cuma kena hit biasa).
+      9. Tune adaptif pakai momentum: salah arah berulang -> langkah makin gede.
+
+    Catatan jujur: M1 yang lead-nya <= ping lu (mis. windup 0.2s, ping 220ms) emang
+    nggak bisa di-react, paketnya nyampe setelah hit. Buat itu cuma ada chain cover.
 ]]
 
 local genv = (getgenv and getgenv()) or _G
@@ -44,6 +50,7 @@ end
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
 local Stats = game:GetService("Stats")
 local StarterGui = game:GetService("StarterGui")
 
@@ -57,22 +64,32 @@ local CFG = {
 	Enabled = true,
 	ToggleKey = Enum.KeyCode.P,
 
-	-- cek ancaman (hitbox asli + margin buat gerakan)
+	-- cek ancaman (hitbox asli + margin buat gerakan & lag)
 	UseVolume = true,
 	RangeMargin = 2.0, -- stud tambahan di depan
 	WidthMargin = 1.5, -- stud tambahan di samping
 	ConeSlack = 0.30, -- lebar tambahan per stud ke depan (attacker bisa nge-aim ulang pas windup)
 	BackMargin = 3, -- toleransi di belakang attacker
 	AttackerLag = 0.15, -- kira-kira berapa detik ke belakang server nge-rewind posisi lu
+	LagSpread = 0.10, -- horizon rewind yang dicoba: h-spread, h, h+spread
+	PingMargin = 8, -- stud tambahan per detik RTT (RTT 0.15 -> +1.2 stud)
+	MaxPingMargin = 3,
 	FallbackRange = 11, -- dipakai kalau spec style nggak ketemu
 	FallbackFacingDot = -0.1,
 
 	-- timing (detik)
-	TargetAge = 0.12, -- umur block pas hit mendarat; window parry 0..0.25 (tengah = aman dua arah)
-	HoldAfterHit = 0.08, -- block ditahan segini setelah hit (makin pendek = cooldown 0.75s mulai lebih cepat)
-	MinAge = 0.01,
-	Jitter = 0.010,
-	DedupeWindow = 0.12, -- dua rencana block yang terlalu dekat digabung jadi satu
+	TargetAgeM1 = 0.135, -- umur block pas M1 mendarat; window 0..0.25. Agak ke awal: ke-Block M1 = 0 damage, telat = kena
+	TargetAgeM2 = 0.125, -- M2: tengah window (telat = kena, kecepetan = GuardBroken)
+	HoldAfterHit = 0.05, -- dasar hold setelah hit; ditambah 2x variasi ping + p90 frame time
+	LateTolerance = 0.02, -- paket yang diperkirakan telat sampai segini masih dikirim (jitter bisa nyelametin)
+	Jitter = 0.005,
+	DedupeWindow = 0.12, -- dua hit yang selisihnya segini = satu block cukup
+	ConflictWindow = 0.95, -- hit yang selisihnya kurang dari ini nggak bisa diparry dua-duanya (cooldown parry + block)
+
+	-- kompensasi frame (dikali frame time rata-rata)
+	RecvFrame = 0.5, -- event diproses rata-rata setengah frame setelah paket nyampe
+	SendFrame = 0.15, -- paket keluar sedikit telat setelah FireServer
+	FireEarly = 0.5, -- kirim di frame terdekat: fire kalau sisa waktu < setengah frame
 
 	DefaultM1Lead = 0.20, -- cuma dipakai kalau spec nggak ketemu
 	HeavyMin = 0.30, -- cuma dipakai kalau spec nggak ketemu
@@ -84,14 +101,17 @@ local CFG = {
 	LateModeM2 = "skip",
 	LateHold = 0.5,
 
-	-- kalau ke-Block doang (bukan parry), tahan block buat nutup hit M1 berikutnya
+	-- kalau ke-Block doang (bukan parry), atau ada M1 lain dalam masa cooldown parry, tahan block
 	ChainGuard = true,
 	ChainHold = 0.7,
 	MaxHold = 1.3,
 
-	Adaptive = true, -- geser timing otomatis kalau hasilnya "Blocked"/"GuardBroken"/"Hit" terus
-	TuneStep = 0.015,
-	TuneMax = 0.07,
+	ReleaseBeforeHeavy = true, -- lepas block sebelum M2 yang nggak bisa diparry (hindari GuardBroken)
+	UseGameState = true, -- baca CombatHandler.Local buat cek kapan Block ON diterima
+
+	Adaptive = true,
+	TuneStep = 0.012,
+	TuneMax = 0.09,
 	PingOverride = nil, -- RTT dalam detik, mis. 0.12. nil = baca otomatis
 	Debug = true,
 	DebugPlan = false, -- print tiap rencana block (rame, nyalain pas lagi nge-tune)
@@ -125,22 +145,23 @@ local Specs = {
 local alive = true
 local connections = {}
 
-local rtt = 0.10
 local tune = { M1 = 0, M2 = 0 } -- >0 = kirim lebih lambat, <0 = lebih cepat
-local leadCorr = {} -- [attackerName] = koreksi lead M1 hasil belajar
+local streak = { M1 = { dir = 0, n = 0 }, M2 = { dir = 0, n = 0 } }
+local leadCorr = {} -- ["Nama:idx"] / ["Nama:M2"] = koreksi lead hasil belajar
+local leadAll = {} -- [Nama] = koreksi M1 umum (cadangan kalau key swing belum kebelajar)
 
 local blockHeld = false
 local blockOnAt = -math.huge
 local releaseAt = 0
-local releaseToken = 0
+local releaseHandle = nil
 local readyAt = 0 -- Block ON baru diterima server setelah ini
 local lockedUntil = 0 -- BlockRefused / stun / guard break
 local parriedAt = -math.huge
 local lastRefusedAt = -math.huge
-local planned = {}
+local pending = {} -- rencana block yang belum dikirim
 
 local weak = { __mode = "k" }
-local swingAt = setmetatable({}, weak) -- [attacker] = { t, lead }
+local swingAt = setmetatable({}, weak) -- [attacker] = { t, lead, kind, key, learn }
 local combo = setmetatable({}, weak) -- [attacker] = { idx, at }
 local planToken = setmetatable({}, weak)
 local heavySeen = setmetatable({}, weak)
@@ -157,6 +178,8 @@ local counters = {
 	locked = 0,
 	refused = 0,
 	cancelled = 0,
+	chained = 0,
+	released = 0,
 }
 local skips = {}
 local lastSkip = { reason = "-", at = -math.huge }
@@ -185,6 +208,205 @@ local function skip(reason)
 	skips[reason] = (skips[reason] or 0) + 1
 	lastSkip.reason = reason
 	lastSkip.at = os.clock()
+end
+
+----------------------------------------------------------------------
+-- SCHEDULER (Heartbeat) + FPS TRACKER
+----------------------------------------------------------------------
+local queue = {}
+
+local function schedule(at, fn)
+	local h = { at = at, fn = fn, dead = false }
+	queue[#queue + 1] = h
+	return h
+end
+
+local function cancel(h)
+	if h then
+		h.dead = true
+	end
+end
+
+local frame = { avg = 1 / 60, p90 = 1 / 60, fps = 60 }
+local dtRing, dtN, dtIdx, dtTick = {}, 48, 0, 0
+
+local function trackFrame(dt)
+	dt = math.clamp(dt, 1 / 240, 0.25)
+	dtIdx = dtIdx % dtN + 1
+	dtRing[dtIdx] = dt
+	frame.avg = frame.avg + (dt - frame.avg) * 0.08
+	dtTick += 1
+	if dtTick >= 12 then
+		dtTick = 0
+		local copy = table.clone(dtRing)
+		table.sort(copy)
+		frame.p90 = copy[math.max(1, math.ceil(#copy * 0.9))]
+	end
+	frame.fps = 1 / math.max(frame.avg, 0.001)
+end
+
+local function frameLag()
+	return frame.avg * (CFG.RecvFrame + CFG.SendFrame)
+end
+
+----------------------------------------------------------------------
+-- PING TRACKER
+----------------------------------------------------------------------
+local net = { rtt = 0.10, var = 0.012, at = -math.huge }
+
+local function readPing()
+	if CFG.PingOverride then
+		return CFG.PingOverride
+	end
+	local ok, ms = pcall(function()
+		return Stats.Network.ServerStatsItem["Data Ping"]:GetValue()
+	end)
+	if ok and type(ms) == "number" and ms > 0 then
+		return ms / 1000
+	end
+	local ok2, p = pcall(function()
+		return LocalPlayer:GetNetworkPing()
+	end)
+	if ok2 and type(p) == "number" and p > 0 then
+		return p * 2 -- GetNetworkPing = satu arah
+	end
+	return nil
+end
+
+local function sampleNet(now)
+	if now - net.at < 0.1 then
+		return
+	end
+	net.at = now
+	local s = readPing()
+	if not s then
+		return
+	end
+	if CFG.PingOverride then
+		net.rtt = s
+		net.var = 0.004
+		return
+	end
+	local err = s - net.rtt
+	local gain = (err > 0.08) and 0.10 or 0.25 -- lonjakan sesaat jangan langsung dipercaya
+	net.rtt += err * gain
+	net.var += (math.abs(err) - net.var) * 0.20
+	net.var = math.clamp(net.var, 0.002, 0.12)
+end
+
+----------------------------------------------------------------------
+-- RIWAYAT POSISI LU (server nge-rewind posisi lu, jadi masa lalu juga penting)
+----------------------------------------------------------------------
+local H_N = 128
+local hT, hP, hHead, hCount = {}, {}, 0, 0
+local histOwner = nil
+
+local function pushPos(t, p)
+	hHead = hHead % H_N + 1
+	hT[hHead] = t
+	hP[hHead] = p
+	if hCount < H_N then
+		hCount += 1
+	end
+end
+
+-- posisi `sec` detik yang lalu (interpolasi), nil kalau belum ada riwayat
+local function posAgo(sec)
+	if hCount == 0 then
+		return nil
+	end
+	local want = os.clock() - sec
+	local prevT, prevP
+	for i = 0, hCount - 1 do
+		local idx = (hHead - i - 1) % H_N + 1
+		local t = hT[idx]
+		if t <= want then
+			if prevT and prevT > t then
+				local a = (want - t) / (prevT - t)
+				return hP[idx]:Lerp(prevP, a)
+			end
+			return hP[idx]
+		end
+		prevT, prevP = t, hP[idx]
+	end
+	return prevP
+end
+
+local function predictedPos(hrp, t)
+	local v = hrp.AssemblyLinearVelocity
+	return hrp.Position + Vector3.new(v.X, 0, v.Z) * t
+end
+
+-- h > 0 = prediksi ke depan, h < 0 = posisi di masa lalu
+local function posAtRel(hrp, h)
+	if h >= 0 then
+		return predictedPos(hrp, h)
+	end
+	return posAgo(-h) or hrp.Position
+end
+
+----------------------------------------------------------------------
+-- STATE GAME SENDIRI (CombatHandler.Local)
+----------------------------------------------------------------------
+local Game = { handler = nil }
+
+local function getHandler()
+	if Game.handler ~= nil then
+		return Game.handler or nil
+	end
+	local ok, mod = pcall(function()
+		local m = ReplicatedStorage:FindFirstChild("Modules")
+		local sh = m and m:FindFirstChild("Shared")
+		local ch = sh and sh:FindFirstChild("CombatHandler")
+		return ch and require(ch)
+	end)
+	if ok and type(mod) == "table" then
+		Game.handler = mod
+	else
+		Game.handler = false
+	end
+	return Game.handler or nil
+end
+
+-- hasil: jam os.clock() paling awal Block ON PASTI diterima server, atau nil kalau nggak tau
+local function gameLock()
+	if not CFG.UseGameState then
+		return nil
+	end
+	local h = getHandler()
+	local L = h and h.Local
+	if type(L) ~= "table" then
+		return nil
+	end
+	local ok, res = pcall(function()
+		local sn = workspace:GetServerTimeNow()
+		local clk = os.clock()
+		local latest = -math.huge
+		-- Busy / BlockReady di-set client pas lu mencet; server nerima rtt/2 lebih lambat,
+		-- paket kita juga nyampe rtt/2 lebih lambat -> saling cancel, pakai nilai client langsung.
+		local k1 = L.BusyUntil
+		if type(k1) == "number" and k1 > sn then
+			latest = math.max(latest, clk + (k1 - sn))
+		end
+		local k2 = L.BlockReadyAt
+		if type(k2) == "number" and k2 > sn then
+			latest = math.max(latest, clk + (k2 - sn))
+		end
+		-- Stun / GuardBreak datang dari server, client tau telat ~rtt/2
+		local k3 = L.StunnedUntil
+		if type(k3) == "number" and k3 > sn then
+			latest = math.max(latest, clk + (k3 - sn) - net.rtt * 0.5)
+		end
+		local k4 = L.GuardBrokenUntil
+		if type(k4) == "number" and k4 > sn then
+			latest = math.max(latest, clk + (k4 - sn) - net.rtt * 0.5)
+		end
+		return latest
+	end)
+	if ok and res ~= -math.huge then
+		return res
+	end
+	return nil
 end
 
 ----------------------------------------------------------------------
@@ -263,19 +485,6 @@ end
 ----------------------------------------------------------------------
 -- HELPERS
 ----------------------------------------------------------------------
-local function sampleRTT()
-	if CFG.PingOverride then
-		rtt = CFG.PingOverride
-		return
-	end
-	local ok, ms = pcall(function()
-		return Stats.Network.ServerStatsItem["Data Ping"]:GetValue()
-	end)
-	if ok and type(ms) == "number" and ms > 0 then
-		rtt = rtt * 0.6 + (ms / 1000) * 0.4
-	end
-end
-
 local function myState()
 	local char = LocalPlayer.Character
 	if not char then
@@ -300,20 +509,8 @@ local function cannotAct(char)
 	return nil
 end
 
-local function reserve(at)
-	local now = os.clock()
-	for i = #planned, 1, -1 do
-		if planned[i] < now - 0.05 then
-			table.remove(planned, i)
-		end
-	end
-	for _, t in ipairs(planned) do
-		if math.abs(t - at) < CFG.DedupeWindow then
-			return false
-		end
-	end
-	table.insert(planned, at)
-	return true
+local function holdAfter()
+	return math.clamp(CFG.HoldAfterHit + 2 * net.var + frame.p90, 0.05, 0.30)
 end
 
 ----------------------------------------------------------------------
@@ -325,10 +522,9 @@ end
 
 local function scheduleRelease(at)
 	releaseAt = at
-	releaseToken += 1
-	local tok = releaseToken
-	task.delay(math.max(at - os.clock(), 0), function()
-		if tok ~= releaseToken or not blockHeld then
+	cancel(releaseHandle)
+	releaseHandle = schedule(at, function()
+		if not blockHeld then
 			return
 		end
 		sendBlock(false)
@@ -341,6 +537,10 @@ end
 local function pressBlock(hold)
 	local now = os.clock()
 	if blockHeld or now < readyAt - 0.005 or now < lockedUntil then
+		return false
+	end
+	local gl = gameLock()
+	if gl and now < gl - 0.01 then
 		return false
 	end
 	-- lu lagi nahan block manual -> jangan diganggu (OFF kita bakal ngelepas block lu)
@@ -356,19 +556,29 @@ local function pressBlock(hold)
 	return true
 end
 
-local function extendHold(sec)
+-- pastikan block yang lagi nyala masih nyala sampai `untilClock`
+local function extendHoldTo(untilClock)
 	if not blockHeld then
-		return
+		return false
 	end
-	local want = math.min(os.clock() + sec, blockOnAt + CFG.MaxHold)
+	local want = math.min(untilClock, blockOnAt + CFG.MaxHold)
 	if want > releaseAt then
 		scheduleRelease(want)
 	end
+	return true
+end
+
+local function releaseBefore(t)
+	if not blockHeld or releaseAt <= t then
+		return
+	end
+	scheduleRelease(math.max(t, os.clock()))
+	counters.released += 1
 end
 
 -- server udah nolak / matiin block kita -> batalin rencana release, jangan kirim OFF sia-sia
 local function dropLocalBlock()
-	releaseToken += 1
+	cancel(releaseHandle)
 	blockHeld = false
 end
 
@@ -427,6 +637,7 @@ local function m1Plan(attacker, now)
 	local spec = swings[idx]
 	if type(spec) ~= "table" then
 		spec = swings[1]
+		idx = 1
 	end
 	return {
 		kind = "M1",
@@ -434,6 +645,9 @@ local function m1Plan(attacker, now)
 		reach = reachOf(attacker, style),
 		spec = spec,
 		height = spec.Height or m1.Height,
+		idx = idx,
+		key = attacker.Name .. ":" .. idx,
+		learn = true,
 	}
 end
 
@@ -482,6 +696,9 @@ local function m2Plan(attacker, hold)
 		reach = reachOf(attacker, style),
 		spec = spec,
 		height = spec.Height,
+		key = attacker.Name .. ":M2",
+		-- jarak-dependen (sweep/projectile/throw/dash/teleport) nggak ikut dipelajari
+		learn = not (spec.Sweep or spec.Projectile or spec.Throw or spec.Dash or spec.Teleport),
 	}
 end
 
@@ -541,20 +758,16 @@ local function extraReach(spec)
 	return e
 end
 
-local function predictedPos(hrp, t)
-	local v = hrp.AssemblyLinearVelocity
-	return hrp.Position + Vector3.new(v.X, 0, v.Z) * t
-end
-
 -- tiru InReach server: kotak di depan attacker (Range + toleransi, lebar Radius, tinggi Height)
-local function inVolume(ahrp, pos, plan)
+-- boost = margin ekstra (stud) karena ping
+local function inVolume(ahrp, pos, plan, boost)
 	local spec, reach = plan.spec, plan.reach or 1
 	local d = pos - ahrp.Position
 	local flat = Vector3.new(d.X, 0, d.Z)
 	local mag = flat.Magnitude
 
 	if not (CFG.UseVolume and type(spec) == "table" and type(spec.Range) == "number") then
-		if mag > CFG.FallbackRange * reach then
+		if mag > CFG.FallbackRange * reach + boost then
 			return false
 		end
 		if mag > 0.5 and CFG.FallbackFacingDot > -1 then
@@ -571,7 +784,7 @@ local function inVolume(ahrp, pos, plan)
 	if math.abs(d.Y) > height then
 		return false
 	end
-	local range = spec.Range * reach + SR.RangeTolerance + SR.TargetRadius + CFG.RangeMargin + extraReach(spec)
+	local range = spec.Range * reach + SR.RangeTolerance + SR.TargetRadius + CFG.RangeMargin + boost + extraReach(spec)
 	if spec.MinRange and mag < spec.MinRange * reach - 1 then
 		return false
 	end
@@ -592,31 +805,83 @@ local function inVolume(ahrp, pos, plan)
 		return false
 	end
 	local lat = (flat - fl * fwd).Magnitude
-	local half = (spec.Radius or 2.5) + SR.TargetRadius + CFG.WidthMargin + math.min(math.max(fwd, 0), 8) * CFG.ConeSlack
+	local half = (spec.Radius or 2.5)
+		+ SR.TargetRadius
+		+ CFG.WidthMargin
+		+ boost * 0.5
+		+ math.min(math.max(fwd, 0), 8) * CFG.ConeSlack
 	return lat <= half
 end
 
-local function threatens(attacker, myHrp, plan)
+local OFFS = { 0, -1, 1 }
+
+local function threatens(attacker, myHrp, plan, lead)
 	local ahrp = attacker:FindFirstChild("HumanoidRootPart")
 	if not ahrp then
 		return false, 0
 	end
 	local d = myHrp.Position - ahrp.Position
 	local dist = Vector3.new(d.X, 0, d.Z).Magnitude
-	if inVolume(ahrp, myHrp.Position, plan) then
+	local boost = math.clamp(net.rtt * CFG.PingMargin, 0, CFG.MaxPingMargin)
+
+	if inVolume(ahrp, myHrp.Position, plan, boost) then
 		return true, dist
 	end
-	-- server ngecek posisi lu yang di-rewind + gerak lu selama windup
-	local t = math.clamp(plan.lead - CFG.AttackerLag - rtt, 0, 0.4)
-	if t > 0 and inVolume(ahrp, predictedPos(myHrp, t), plan) then
-		return true, dist
+	-- server ngecek posisi lu yang di-rewind (bisa di masa lalu) + gerak lu selama windup.
+	-- Coba beberapa horizon: kena di salah satu = anggap ancaman.
+	local h = lead - CFG.AttackerLag - net.rtt
+	for _, o in ipairs(OFFS) do
+		local hh = math.clamp(h + o * CFG.LagSpread, -0.5, 0.45)
+		if inVolume(ahrp, posAtRel(myHrp, hh), plan, boost) then
+			return true, dist
+		end
 	end
 	return false, dist
 end
 
 ----------------------------------------------------------------------
+-- ARBITRASE RENCANA (satu parry per jendela cooldown, M2 menang atas M1)
+----------------------------------------------------------------------
+local function arbitrate(kind, hitAt, now)
+	for i = #pending, 1, -1 do
+		local p = pending[i]
+		if p.done or p.hit < now - 0.2 then
+			table.remove(pending, i)
+		end
+	end
+	for i = #pending, 1, -1 do
+		local p = pending[i]
+		local gap = math.abs(hitAt - p.hit)
+		if gap < CFG.ConflictWindow then
+			if kind == "M2" and p.kind == "M1" then
+				-- M2 = GuardBroken kalau nggak diparry, M1 cukup ke-Block -> M2 yang diprioritaskan
+				cancel(p.handle)
+				table.remove(pending, i)
+				counters.cancelled += 1
+			elseif gap < CFG.DedupeWindow or (kind == "M1" and p.kind == "M2") then
+				return "dup"
+			end
+		end
+	end
+	return "ok"
+end
+
+----------------------------------------------------------------------
 -- REACT
 ----------------------------------------------------------------------
+local function corrFor(attacker, plan)
+	if plan.key then
+		local c = leadCorr[plan.key]
+		if c then
+			return c
+		end
+	end
+	if plan.kind == "M1" then
+		return leadAll[attacker.Name] or 0
+	end
+	return 0
+end
+
 local function react(attacker, plan, tag)
 	if not alive or not CFG.Enabled or typeof(attacker) ~= "Instance" then
 		return
@@ -637,23 +902,30 @@ local function react(attacker, plan, tag)
 		return skip("unparryable")
 	end
 
-	sampleRTT()
-	local isThreat, dist = threatens(attacker, hrp, plan)
+	local now = os.clock()
+	sampleNet(now)
+	local rtt = net.rtt
+	local fl = frameLag()
+	local corr = corrFor(attacker, plan)
+
+	local isThreat, dist = threatens(attacker, hrp, plan, plan.lead + corr)
 	if not isThreat then
 		return skip("range")
 	end
 
-	local lead = plan.lead
+	local lead
 	if plan.kind == "M1" then
-		lead += leadCorr[attacker.Name] or 0
+		lead = plan.lead + corr
 	else
-		lead = refineLead(plan, dist)
+		lead = refineLead(plan, dist) + corr
 	end
 
-	local now = os.clock()
-
-	-- parry masih cooldown: M2 (BreaksBlock) jadi GuardBroken kalau cuma ke-Block, mending skip
+	-- parry masih cooldown: M2 (BreaksBlock) jadi GuardBroken kalau cuma ke-Block.
+	-- Block yang masih nyala dilepas sebelum M2 mendarat -> cuma kena hit biasa.
 	if plan.kind == "M2" and now + lead < parriedAt + SR.ParryCooldown - 0.02 then
+		if CFG.ReleaseBeforeHeavy then
+			releaseBefore(now + lead - rtt - fl - 0.03)
+		end
 		return skip("parrycd")
 	end
 
@@ -663,10 +935,11 @@ local function react(attacker, plan, tag)
 		return skip("iframes")
 	end
 
-	-- Block yang dikirim sekarang nyampe di server ~rtt/2 lagi, hit nyampe di server lead - rtt/2
-	-- dari sekarang, jadi umur block saat hit = lead - rtt - sendIn.
-	local sendIn = lead - CFG.TargetAge - rtt + tune[plan.kind] + (math.random() * 2 - 1) * CFG.Jitter
-	local earliest = math.max(readyAt, lockedUntil)
+	-- Block yang dikirim sekarang nyampe di server ~rtt/2 lagi, hit nyampe di server lead - rtt/2 - (telat proses event)
+	-- dari sekarang, jadi umur block saat hit = lead - rtt - fl - sendIn.
+	local targetAge = (plan.kind == "M2") and CFG.TargetAgeM2 or CFG.TargetAgeM1
+	local sendIn = lead - targetAge - rtt - fl + tune[plan.kind] + (math.random() * 2 - 1) * CFG.Jitter
+	local earliest = math.max(readyAt, lockedUntil, gameLock() or -math.huge)
 	local wait = earliest - now
 	local bound = false
 	if sendIn < wait then
@@ -676,9 +949,9 @@ local function react(attacker, plan, tag)
 	if sendIn < 0 then
 		sendIn = 0
 	end
-	local age = lead - rtt - sendIn
+	local age = lead - rtt - fl - sendIn
 
-	if age < CFG.MinAge then
+	if age < -CFG.LateTolerance then
 		if bound then
 			counters.locked += 1
 			skip("locked")
@@ -686,28 +959,41 @@ local function react(attacker, plan, tag)
 		else
 			counters.late += 1
 			skip("late")
-			log(("%s terlalu cepat buat di-react (lead %.3f <= rtt %.3f)"):format(tag, lead, rtt))
+			log(("%s terlalu cepat buat di-react (lead %.3f <= rtt %.3f + frame %.3f)"):format(tag, lead, rtt, fl))
 		end
 		local mode = plan.kind == "M2" and CFG.LateModeM2 or CFG.LateModeM1
 		if mode == "block" then
-			pressBlock(CFG.LateHold)
+			if not pressBlock(CFG.LateHold) and plan.kind == "M1" and CFG.ChainGuard then
+				extendHoldTo(now + CFG.LateHold)
+			end
 		end
 		return
 	end
 
-	if not reserve(now + sendIn) then
-		return skip("dup")
+	local hitAt = now + lead
+	local verdict = arbitrate(plan.kind, hitAt, now)
+	if verdict ~= "ok" then
+		return skip(verdict)
 	end
 
 	local tok = (planToken[attacker] or 0) + 1
 	planToken[attacker] = tok
-	local hold = age + CFG.HoldAfterHit
+	local ha = holdAfter()
+	local hold = math.max(age, 0) + ha
+	local coverTo = now + lead - rtt - fl + ha -- block harus tetap nyala sampai jam ini biar hit ini ketutup
 	counters.planned += 1
 	if CFG.DebugPlan then
-		log(("%s plan: lead %.3f rtt %.3f sendIn %.3f age %.3f tune %+.3f"):format(tag, lead, rtt, sendIn, age, tune[plan.kind]))
+		log(
+			("%s plan: lead %.3f rtt %.3f±%.3f fps %.0f sendIn %.3f age %.3f hold %.3f tune %+.3f"):format(
+				tag, lead, rtt, net.var, frame.fps, sendIn, age, hold, tune[plan.kind]
+			)
+		)
 	end
 
-	task.delay(sendIn, function()
+	local rec = { kind = plan.kind, hit = hitAt, done = false }
+	pending[#pending + 1] = rec
+	rec.handle = schedule(now + sendIn, function()
+		rec.done = true
 		if not alive or not CFG.Enabled then
 			return
 		end
@@ -715,7 +1001,12 @@ local function react(attacker, plan, tag)
 			counters.cancelled += 1
 			return
 		end
-		pressBlock(hold)
+		if not pressBlock(hold) then
+			-- block udah nyala (rencana sebelumnya / chain): M1 cukup ditutup pakai perpanjangan hold
+			if plan.kind == "M1" and CFG.ChainGuard and extendHoldTo(coverTo) then
+				counters.chained += 1
+			end
+		end
 	end)
 end
 
@@ -744,9 +1035,45 @@ local function resyncCombo(attacker, obs)
 	end
 end
 
-local function tuneBy(kind, delta)
-	if CFG.Adaptive then
-		tune[kind] = math.clamp(tune[kind] + delta, -CFG.TuneMax, CFG.TuneMax)
+local function tuneBy(kind, dir)
+	if not CFG.Adaptive then
+		return
+	end
+	local s = streak[kind]
+	if s.dir == dir then
+		s.n += 1
+	else
+		s.dir = dir
+		s.n = 1
+	end
+	local step = CFG.TuneStep * math.min(1 + (s.n - 1) * 0.5, 3)
+	tune[kind] = math.clamp(tune[kind] + dir * step, -CFG.TuneMax, CFG.TuneMax)
+end
+
+-- belajar selisih Sound -> Hit per swing (kedua event kena jalur jaringan yang sama,
+-- jadi selisihnya = lead sebenarnya di server, nggak kena ping)
+local function learnLead(attacker, kind, now)
+	local rec = swingAt[attacker]
+	if not rec or rec.kind ~= kind then
+		return
+	end
+	swingAt[attacker] = nil
+	local obs = now - rec.t
+	if obs < 0.04 or obs > 1.0 then
+		return
+	end
+	local err = obs - rec.lead
+	if kind == "M1" and math.abs(err) > 0.06 then
+		resyncCombo(attacker, obs) -- kemungkinan salah index combo, jangan dipelajari
+		return
+	end
+	if rec.learn and rec.key then
+		local cur = leadCorr[rec.key] or 0
+		leadCorr[rec.key] = math.clamp(cur * 0.7 + err * 0.3, -0.08, 0.08)
+	end
+	if kind == "M1" then
+		local cur = leadAll[attacker.Name] or 0
+		leadAll[attacker.Name] = math.clamp(cur * 0.8 + err * 0.2, -0.06, 0.06)
 	end
 end
 
@@ -755,24 +1082,13 @@ local function onHit(data)
 	local myChar = LocalPlayer.Character
 	local now = os.clock()
 
-	-- belajar swing -> hit per attacker (semua hit M1 yang nyampe ke client ikut dihitung)
-	if data.Kind == "M1" and typeof(attacker) == "Instance" and swingAt[attacker] then
-		local rec = swingAt[attacker]
-		swingAt[attacker] = nil
-		local obs = now - rec.t
-		if obs > 0.04 and obs < 0.9 then
-			local err = obs - rec.lead
-			if math.abs(err) > 0.06 then
-				resyncCombo(attacker, obs)
-			end
-			local cur = leadCorr[attacker.Name] or 0
-			leadCorr[attacker.Name] = math.clamp(cur * 0.7 + err * 0.3, -0.06, 0.06)
-		end
+	if (data.Kind == "M1" or data.Kind == "M2") and typeof(attacker) == "Instance" then
+		learnLead(attacker, data.Kind, now)
 	end
 
 	-- gue yang nyerang dan ke-parry -> gue yang stun
 	if attacker == myChar and data.Result == "Parried" then
-		lockedUntil = math.max(lockedUntil, now + (data.AttackerStun or SR.ParryRecovery) - rtt / 2)
+		lockedUntil = math.max(lockedUntil, now + (data.AttackerStun or SR.ParryRecovery) - net.rtt / 2)
 		return
 	end
 	if victim ~= myChar then
@@ -787,6 +1103,8 @@ local function onHit(data)
 	if res == "Parried" then
 		counters.parried += 1
 		parriedAt = now
+		streak[kind].n = 0
+		streak[kind].dir = 0
 		if typeof(attacker) == "Instance" then
 			combo[attacker] = nil -- attacker kena stun -> combo reset di server
 			planToken[attacker] = (planToken[attacker] or 0) + 1
@@ -796,31 +1114,35 @@ local function onHit(data)
 		counters.blocked += 1
 		-- ke-Block doang = umur block kegedean (kecepetan) -> kirim lebih lambat
 		if sent and not inParryCd then
-			tuneBy(kind, CFG.TuneStep)
+			tuneBy(kind, 1)
 		end
 		if CFG.ChainGuard and kind == "M1" then
-			extendHold(CFG.ChainHold)
+			extendHoldTo(now + CFG.ChainHold)
 		end
 		log(("block  %s (tune M1 %+.3f M2 %+.3f%s)"):format(kind, tune.M1, tune.M2, inParryCd and ", parry cooldown" or ""))
 	elseif res == "GuardBroken" then
 		counters.guardbroken += 1
 		dropLocalBlock()
-		lockedUntil = math.max(lockedUntil, now + SR.GuardBreak - rtt / 2)
+		lockedUntil = math.max(lockedUntil, now + SR.GuardBreak - net.rtt / 2)
 		if sent and not inParryCd then
-			tuneBy(kind, CFG.TuneStep)
+			tuneBy(kind, 1)
 		end
 		log(("GUARD BREAK %s (tune M1 %+.3f M2 %+.3f%s)"):format(kind, tune.M1, tune.M2, inParryCd and ", parry cooldown" or ""))
 	elseif res == "Hit" then
 		counters.hit += 1
 		if type(data.Stun) == "number" then
-			lockedUntil = math.max(lockedUntil, now + data.Stun - rtt / 2)
+			lockedUntil = math.max(lockedUntil, now + data.Stun - net.rtt / 2)
 		end
 		-- kena padahal block udah dikirim = kelambatan -> kirim lebih cepat
 		if sent then
-			tuneBy(kind, -CFG.TuneStep)
+			tuneBy(kind, -1)
 		end
 		local reason = (now - lastSkip.at) < 1.2 and lastSkip.reason or (sent and "block telat" or "nggak ada rencana")
-		log(("kena   %s (tune M1 %+.3f M2 %+.3f, rtt %.3f, alasan: %s)"):format(kind, tune.M1, tune.M2, rtt, reason))
+		log(
+			("kena   %s (tune M1 %+.3f M2 %+.3f, rtt %.3f±%.3f, fps %.0f, alasan: %s)"):format(
+				kind, tune.M1, tune.M2, net.rtt, net.var, frame.fps, reason
+			)
+		)
 	elseif res == "Dodged" then
 		counters.dodged += 1
 	end
@@ -842,25 +1164,31 @@ local function onCombat(data)
 			local now = os.clock()
 			if now - (heavySeen[a] or -math.huge) > 0.25 then
 				heavySeen[a] = now
-				react(a, m2Plan(a, nil), "M2")
+				local plan = m2Plan(a, nil)
+				swingAt[a] = { t = now, lead = plan.lead, kind = "M2", key = plan.key, learn = plan.learn }
+				react(a, plan, "M2")
 			end
 		elseif Specs.swingSound[kind] then
 			local now = os.clock()
 			local plan = m1Plan(a, now)
-			swingAt[a] = { t = now, lead = plan.lead }
+			swingAt[a] = { t = now, lead = plan.lead, kind = "M1", key = plan.key, learn = plan.learn }
 			react(a, plan, "M1")
 		end
 	elseif info == "Flash" and kind == "Heavy" then
 		local a, hold = data.Character, data.Hold
 		if typeof(a) == "Instance" and a ~= LocalPlayer.Character and type(hold) == "number" then
-			heavySeen[a] = os.clock()
-			react(a, m2Plan(a, hold), "M2")
+			local now = os.clock()
+			heavySeen[a] = now
+			local plan = m2Plan(a, hold)
+			swingAt[a] = { t = now, lead = plan.lead, kind = "M2", key = plan.key, learn = plan.learn }
+			react(a, plan, "M2")
 		end
 	elseif info == "EndFlash" then
 		-- heavy attacker dibatalin (kena stun / ke-parry orang lain) -> hit nggak bakal mendarat
 		local a = data.Character
 		if typeof(a) == "Instance" then
 			planToken[a] = (planToken[a] or 0) + 1
+			swingAt[a] = nil
 		end
 	elseif info == "Hit" then
 		onHit(data)
@@ -889,15 +1217,61 @@ local function report()
 	end
 	table.sort(c)
 	table.sort(s)
+	local tot = counters.parried + counters.blocked + counters.guardbroken + counters.hit
+	local rate = tot > 0 and (counters.parried / tot * 100) or 0
 	print("[AutoParry] hitung :", table.concat(c, " "))
 	print("[AutoParry] skip   :", #s > 0 and table.concat(s, " ") or "-")
-	print(("[AutoParry] tune M1 %+.3f | M2 %+.3f | rtt %.3f | style kebaca %d"):format(tune.M1, tune.M2, rtt, Specs.count))
+	print(("[AutoParry] parry rate %.0f%% dari %d hit yang nyampe ke lu"):format(rate, tot))
+	print(
+		("[AutoParry] tune M1 %+.3f | M2 %+.3f | rtt %.3f±%.3f | fps %.0f (p90 frame %.0fms) | style kebaca %d | game state %s"):format(
+			tune.M1, tune.M2, net.rtt, net.var, frame.fps, frame.p90 * 1000, Specs.count, gameLock() and "ya" or "nggak"
+		)
+	)
 end
 
 ----------------------------------------------------------------------
 -- WIRING
 ----------------------------------------------------------------------
 table.insert(connections, Combat.OnClientEvent:Connect(onCombat))
+
+table.insert(
+	connections,
+	RunService.Heartbeat:Connect(function(dt)
+		trackFrame(dt)
+		local now = os.clock()
+		sampleNet(now)
+
+		-- riwayat posisi
+		local char = LocalPlayer.Character
+		local hrp = char and char:FindFirstChild("HumanoidRootPart")
+		if hrp ~= histOwner then
+			histOwner = hrp
+			hCount = 0
+		end
+		if hrp then
+			pushPos(now, hrp.Position)
+		end
+
+		-- jalanin antrean: kirim di frame yang paling dekat sama waktu target
+		local early = frame.avg * CFG.FireEarly
+		local i = 1
+		while i <= #queue do
+			local q = queue[i]
+			if q.dead then
+				table.remove(queue, i)
+			elseif q.at - early <= now then
+				table.remove(queue, i)
+				local ok, err = pcall(q.fn)
+				if not ok then
+					log("error scheduler:", err)
+				end
+			else
+				i += 1
+			end
+		end
+	end)
+)
+
 table.insert(
 	connections,
 	UserInputService.InputBegan:Connect(function(input, gameProcessed)
@@ -915,6 +1289,8 @@ genv.__NyxAutoParry = {
 	CFG = CFG,
 	Counters = counters,
 	Skips = skips,
+	Net = net,
+	Frame = frame,
 	Report = report,
 	Stop = function()
 		alive = false
@@ -925,10 +1301,11 @@ genv.__NyxAutoParry = {
 		for _, c in ipairs(connections) do
 			c:Disconnect()
 		end
+		table.clear(queue)
 	end,
 }
 
 task.spawn(loadSpecs)
 
-notify("v2 loaded - tekan " .. CFG.ToggleKey.Name .. " buat toggle")
-log("loaded v2. toggle:", CFG.ToggleKey.Name, "| ngetik getgenv().__NyxAutoParry.Report() buat ringkasan")
+notify("v3 loaded - tekan " .. CFG.ToggleKey.Name .. " buat toggle")
+log("loaded v3. toggle:", CFG.ToggleKey.Name, "| ngetik getgenv().__NyxAutoParry.Report() buat ringkasan")
