@@ -1,6 +1,6 @@
 --!nonstrict
 --[[
-    AutoParry v3.1 (fix: v3 nggak ngeparry sama sekali; semua fitur baru yang berisiko dibikin aman + ada trace)
+    AutoParry v4.0 (= v3.1 + block fallback + auto dodge; logika parry v3.1 nggak diubah)
     Game    : Roblox fighting game (ReplicatedStorage.Remotes.Combat, M1/M2/Block/Parry)
     Runtime : Luau, client-side (jalanin lewat executor lu)
     Toggle  : P  (ubah di CFG.ToggleKey)
@@ -40,6 +40,20 @@
 
     Catatan jujur: M1 yang lead-nya <= ping lu (mis. windup 0.2s, ping 220ms) emang
     nggak bisa di-react, paketnya nyampe setelah hit. Buat itu cuma ada chain cover.
+
+    Yang baru di v4:
+      A. Block fallback (M1): kalau parry nggak mungkin (parry cooldown, M1 Unparryable, block lama
+         udah lewat window parry) -> tetap Block biasa dan DITAHAN nyambung selama M1 beruntun.
+         Hold awal sekarang minimal sampai event hasil hit nyampe (dulu sering lepas duluan ->
+         chain guard nggak sempat nyambung -> kena cooldown block 0.75s -> hit penuh).
+         Kalau hasilnya Parried, block langsung dilepas lagi biar cooldown-nya cepet beres (ReleaseOnParry).
+      B. Auto dodge: M2 yang nggak bisa diparry (parry cd, Unparryable, block lama/kekunci, kecepetan)
+         -> Dodge, dikirim supaya hit mendarat di TENGAH iframe (0.26s). Block dilepas dulu (server
+         nolak dodge kalau masih Blocking). Pakai TryDodge bawaan game kalau bisa di-require.
+         Dodge juga jadi cadangan terakhir buat M1 yang nggak bisa diparry DAN nggak bisa diblock.
+      C. Parry M2 dari attacker itu pernah miss (GuardBroken / Hit) -> M2 berikutnya dari dia dodge
+         duluan sampai parry-nya berhasil lagi (DodgeAfterMiss).
+      Cooldown dash 2.25s, jadi dodge itu jatah langka: dipakai buat M2 dulu.
 ]]
 
 local genv = (getgenv and getgenv()) or _G
@@ -104,7 +118,7 @@ local CFG = {
 	-- kalau ke-Block doang (bukan parry), atau ada M1 lain dalam masa cooldown parry, tahan block
 	ChainGuard = true,
 	ChainHold = 0.7,
-	MaxHold = 1.3,
+	MaxHold = 2.0, -- batas tahan block nyambung (v3.1: 1.3)
 
 	ReleaseBeforeHeavy = true, -- lepas block sebelum M2 yang nggak bisa diparry (hindari GuardBroken)
 	UseGameState = false, -- eksperimen: baca CombatHandler.Local buat cek kapan Block ON diterima (nyalain kalau udah yakin jalan)
@@ -116,6 +130,24 @@ local CFG = {
 	Debug = true,
 	Trace = true, -- print tiap event swing + keputusannya (kenapa block dikirim / kenapa nggak). Matiin kalau udah beres
 	DebugPlan = false, -- print tiap rencana block (rame, nyalain pas lagi nge-tune)
+
+	-- ===== v4: block fallback =====
+	BlockFallback = true, -- parry nggak mungkin -> block biasa (ditahan, nyambung pakai ChainGuard)
+	BlockOnlyAge = 0.14, -- umur block pas hit mendarat kalau cuma mau ngeblock (nggak ngincer window parry)
+	ResultPad = 0.06, -- hold minimal sampai segini detik setelah hit mendarat (nunggu event hasil)
+	ReleaseOnParry = true, -- abis Parried block langsung dilepas (kecuali ada hit lain dalam <0.9s)
+
+	-- ===== v4: auto dodge =====
+	DodgeEnabled = true,
+	DodgeForM2 = true, -- M2 yang nggak bisa diparry -> dodge
+	DodgeForM1 = true, -- M1 yang nggak bisa diparry DAN nggak bisa diblock -> dodge (cadangan terakhir)
+	DodgeFirstM2 = false, -- true = M2 SELALU dodge (parry M2 cuma dipakai kalau dodge lagi cooldown)
+	DodgeAfterMiss = true, -- parry M2 dari attacker itu pernah miss -> M2 berikutnya dodge duluan
+	DodgeViaGame = true, -- panggil CombatHandler:TryDodge() bawaan game (animasi + dorongan ikut bener)
+	DodgeDirection = "Back", -- cuma dipakai kalau TryDodge nggak bisa dipanggil (kirim remote langsung)
+	DodgeAgeFrac = 0.5, -- target: hit mendarat di sekian persen dari lama iframe (0.5 = tengah)
+	DodgeMinAge = 0.02, -- iframe harus udah jalan minimal segini sebelum hit mendarat
+	DodgeEdge = 0.03, -- sisakan margin segini dari ujung akhir iframe
 }
 
 ----------------------------------------------------------------------
@@ -131,6 +163,7 @@ local SR = {
 	TargetRadius = 1.2,
 	HitHeight = 4,
 	DefaultStyle = "Basic",
+	Dash = { IFrames = 0.26, Duration = 0.4, Cooldown = 2.25 },
 }
 
 local Specs = {
@@ -161,11 +194,32 @@ local parriedAt = -math.huge
 local lastRefusedAt = -math.huge
 local pending = {} -- rencana block yang belum dikirim
 
+-- v4
+local expected = {} -- { atk, at }: hit yang lagi diantisipasi (buat nentuin perlu nahan block abis parry atau nggak)
+
+local function noteExpected(atk, at, now)
+	for i = #expected, 1, -1 do
+		if expected[i].at < now - 0.3 then
+			table.remove(expected, i)
+		end
+	end
+	expected[#expected + 1] = { atk = atk, at = at }
+end
+
+local pressMode = "parry" -- mode Block ON terakhir: "parry" / "plain"
+local dodgeReadyAt = 0 -- Dodge baru bisa dikirim setelah ini (os.clock)
+local dodgeBusyUntil = 0 -- Busy selama dodge jalan
+local dodgePlannedUntil = 0 -- dodge yang udah dijadwalin (biar nggak dobel)
+local dodgeBlockUntil = 0 -- Block ON ditolak server sampai sini gara-gara dodge
+local dodgeSentAt = -math.huge
+local stunUntil = 0 -- stun dari hit (nge-blok dodge)
+
 local weak = { __mode = "k" }
 local swingAt = setmetatable({}, weak) -- [attacker] = { t, lead, kind, key, learn }
 local combo = setmetatable({}, weak) -- [attacker] = { idx, at }
 local planToken = setmetatable({}, weak)
 local heavySeen = setmetatable({}, weak)
+local m2Miss = setmetatable({}, weak) -- [attacker] = berapa kali parry M2 dia miss berturut-turut
 
 local counters = {
 	planned = 0,
@@ -181,6 +235,9 @@ local counters = {
 	cancelled = 0,
 	chained = 0,
 	released = 0,
+	dodgeplanned = 0,
+	dodgesent = 0,
+	dodgemiss = 0,
 }
 local skips = {}
 local lastSkip = { reason = "-", at = -math.huge }
@@ -468,6 +525,11 @@ local function loadSpecs()
 		SR.TargetRadius = cs.TargetRadius or SR.TargetRadius
 		SR.HitHeight = cs.DefaultHitHeight or SR.HitHeight
 		SR.DefaultStyle = cs.DefaultStyle or SR.DefaultStyle
+		if type(cs.Dash) == "table" then
+			SR.Dash.IFrames = type(cs.Dash.IFrames) == "number" and cs.Dash.IFrames or SR.Dash.IFrames
+			SR.Dash.Duration = type(cs.Dash.Duration) == "number" and cs.Dash.Duration or SR.Dash.Duration
+			SR.Dash.Cooldown = type(cs.Dash.Cooldown) == "number" and cs.Dash.Cooldown or SR.Dash.Cooldown
+		end
 	end
 
 	local stat = tryRequire(gs:FindFirstChild("StatSettings"))
@@ -887,6 +949,9 @@ local function arbitrate(kind, hitAt, now)
 	for i = #pending, 1, -1 do
 		local p = pending[i]
 		local gap = math.abs(hitAt - p.hit)
+		if p.kind == "DODGE" and gap < 0.18 then
+			return "dup" -- iframe dodge yang udah dijadwalin nutup hit ini juga
+		end
 		if gap < CFG.ConflictWindow then
 			if kind == "M2" and p.kind == "M1" then
 				-- M2 = GuardBroken kalau nggak diparry, M1 cukup ke-Block -> M2 yang diprioritaskan
@@ -899,6 +964,189 @@ local function arbitrate(kind, hitAt, now)
 		end
 	end
 	return "ok"
+end
+
+----------------------------------------------------------------------
+-- DODGE (v4)
+-- Server: Dodge = Info "Dodge". Syarat: InCombat, TIDAK lagi Blocking, nggak stun, DodgeReadyAt lewat,
+-- nggak Busy. Dapat IFrames (0.26s default) mulai dari saat paket NYAMPE di server. Hit yang mendarat
+-- pas IFrames aktif = "Dodged" (nol damage, M2 juga). Cooldown dash 2.25s, Block ON ditolak selama Busy (0.4s).
+----------------------------------------------------------------------
+local function dashOf()
+	local d = { IFrames = SR.Dash.IFrames, Duration = SR.Dash.Duration, Cooldown = SR.Dash.Cooldown }
+	local char = LocalPlayer.Character
+	local style = char and styleOf(char)
+	local o = style and style.Dash
+	if type(o) == "table" then
+		d.IFrames = type(o.IFrames) == "number" and o.IFrames or d.IFrames
+		d.Duration = type(o.Duration) == "number" and o.Duration or d.Duration
+		d.Cooldown = type(o.Cooldown) == "number" and o.Cooldown or d.Cooldown
+	end
+	return d
+end
+
+local function dodgeLocal()
+	if not CFG.DodgeViaGame then
+		return nil
+	end
+	local h = getHandler()
+	local L = h and h.Local
+	if h and type(L) == "table" and type(h.TryDodge) == "function" then
+		return h, L
+	end
+	return nil
+end
+
+-- berapa detik lagi dodge baru bisa dikirim (0 = siap). forPlan = ikut hitung dodge yang udah dijadwalin
+local function dodgeWait(now, forPlan)
+	local w = math.max(dodgeReadyAt - now, dodgeBusyUntil - now, stunUntil - now, 0)
+	if forPlan then
+		w = math.max(w, dodgePlannedUntil - now)
+	end
+	local h, L = dodgeLocal()
+	if L then
+		local ok, res = pcall(function()
+			local sn = workspace:GetServerTimeNow()
+			local m = 0
+			for _, k in ipairs({ "DodgeReadyAt", "BusyUntil", "StunnedUntil" }) do
+				local v = L[k]
+				if type(v) == "number" and v > sn then
+					m = math.max(m, v - sn)
+				end
+			end
+			return m
+		end)
+		if ok and type(res) == "number" and res < 4 then
+			w = math.max(w, res)
+		end
+	end
+	return w
+end
+
+local function fireDodge()
+	local now = os.clock()
+	local char = LocalPlayer.Character
+	if not char then
+		return false
+	end
+	if dodgeWait(now) > 0.02 then
+		trace("dodge gagal: belum siap (cooldown/busy/stun)")
+		return false
+	end
+	if not blockHeld and char:GetAttribute("Blocking") == true then
+		trace("dodge gagal: lu lagi nahan block manual")
+		return false
+	end
+	local d = dashOf()
+
+	-- server nolak Dodge kalau masih Blocking -> lepas block kita dulu (OFF sampai duluan, urutan remote terjaga)
+	if blockHeld then
+		cancel(releaseHandle)
+		sendBlock(false)
+		blockHeld = false
+		readyAt = now + SR.BlockCooldown
+		counters.released += 1
+		trace("block dilepas buat dodge")
+	end
+
+	local fired = false
+	local h, L = dodgeLocal()
+	if h then
+		-- pakai fungsi dodge asli game: animasi + dorongan + state lokal ikut bener
+		local before = L.DodgeReadyAt
+		local ok, err = pcall(h.TryDodge, h)
+		if not ok then
+			trace("TryDodge error:", tostring(err))
+		elseif L.DodgeReadyAt ~= before then
+			fired = true
+		end
+	else
+		Combat:FireServer({ Info = "Dodge", Direction = CFG.DodgeDirection, T = workspace:GetServerTimeNow() })
+		fired = true
+	end
+
+	if not fired then
+		trace("dodge ditolak game lokal")
+		return false
+	end
+	dodgeSentAt = now
+	dodgeReadyAt = now + d.Cooldown - 0.05
+	dodgeBusyUntil = now + d.Duration
+	lockedUntil = math.max(lockedUntil, now + d.Duration) -- Block ON ditolak server selama Busy
+	counters.dodgesent += 1
+	trace((h and "DODGE dikirim (game TryDodge)" or "DODGE dikirim (remote langsung)"))
+	return true
+end
+
+-- jadwalin dodge supaya hit mendarat di tengah IFrames. true = urusan hit ini udah ditangani
+local function planDodge(attacker, plan, lead, now, rtt, fl, tag, why)
+	if not (alive and CFG.DodgeEnabled) then
+		return false
+	end
+	if plan.kind == "M2" and not CFG.DodgeForM2 then
+		return false
+	end
+	if plan.kind == "M1" and not CFG.DodgeForM1 then
+		return false
+	end
+	local d = dashOf()
+	local target = math.clamp(d.IFrames * CFG.DodgeAgeFrac, 0.04, math.max(d.IFrames - 0.06, 0.05))
+	local wait = dodgeWait(now, true)
+	local sendIn = lead - target - rtt - fl + (math.random() * 2 - 1) * CFG.Jitter
+	if sendIn < wait then
+		sendIn = wait
+	end
+	if sendIn < 0 then
+		sendIn = 0
+	end
+	local age = lead - rtt - fl - sendIn -- berapa lama IFrames udah jalan pas hit mendarat
+	if age < CFG.DodgeMinAge or age > d.IFrames - CFG.DodgeEdge then
+		trace(
+			("%s: dodge nggak mungkin (%s) age %.3f iframe %.2f tunggu %.2fs"):format(
+				tag, tostring(why), age, d.IFrames, wait
+			)
+		)
+		skip(age < CFG.DodgeMinAge and "dodge-late" or "dodge-early")
+		return false
+	end
+
+	local hitAt = now + lead
+	local verdict = arbitrate(plan.kind, hitAt, now)
+	if verdict ~= "ok" then
+		skip(verdict)
+		return true -- hit ini udah ditutup rencana lain
+	end
+
+	local tok = (planToken[attacker] or 0) + 1
+	planToken[attacker] = tok
+	counters.dodgeplanned += 1
+	dodgePlannedUntil = now + sendIn + d.Cooldown - 0.05
+	dodgeBlockUntil = math.max(dodgeBlockUntil, now + sendIn + d.Duration)
+	noteExpected(attacker, hitAt, now)
+	trace(
+		("%s dari %s: DODGE (%s) lead %.3f rtt %.3f -> kirim %.3fs lagi (umur iframe %.3f)"):format(
+			tag, attacker.Name, tostring(why), lead, rtt, sendIn, age
+		)
+	)
+	local rec = { kind = "DODGE", hit = hitAt, done = false }
+	pending[#pending + 1] = rec
+	rec.handle = schedule(now + sendIn, function()
+		rec.done = true
+		if not alive or not CFG.Enabled then
+			return
+		end
+		if planToken[attacker] ~= tok then
+			counters.cancelled += 1
+			dodgePlannedUntil = 0
+			dodgeBlockUntil = 0
+			return
+		end
+		if not fireDodge() then
+			dodgePlannedUntil = 0
+			dodgeBlockUntil = 0
+		end
+	end)
+	return true
 end
 
 ----------------------------------------------------------------------
@@ -917,6 +1165,106 @@ local function corrFor(attacker, plan)
 	return 0
 end
 
+-- block yang udah nyala dipertahanin sampai hit ini ketutup (block biasa / chain guard)
+local function guardExtend(attacker, plan, tag, lead, now, rtt, fl, ha, note)
+	local verdict = arbitrate(plan.kind, now + lead, now)
+	if verdict ~= "ok" then
+		return skip(verdict)
+	end
+	pending[#pending + 1] = { kind = plan.kind, hit = now + lead, done = false }
+	noteExpected(attacker, now + lead, now)
+	local coverTo = math.max(now + lead - rtt - fl + ha, now + lead + CFG.ResultPad)
+	if extendHoldTo(coverTo) then
+		counters.chained += 1
+		trace(("%s dari %s: block ditahan terus (%s), cover sampai +%.3fs"):format(tag, attacker.Name, note, coverTo - now))
+	else
+		trace(("%s dari %s: block udah lepas, nggak bisa ditahan lagi (%s)"):format(tag, attacker.Name, note))
+	end
+end
+
+-- Block ON baru dijadwalin. mode "parry" = ngincer window parry, "plain" = cukup block nyala pas hit
+local function scheduleBlock(attacker, plan, tag, lead, sendIn, age, ha, rtt, fl, now, mode)
+	local hitAt = now + lead
+	local verdict = arbitrate(plan.kind, hitAt, now)
+	if verdict ~= "ok" then
+		return skip(verdict)
+	end
+
+	local tok = (planToken[attacker] or 0) + 1
+	planToken[attacker] = tok
+	local resultAt = hitAt + CFG.ResultPad
+	local hold = math.max(age, 0) + ha
+	-- v4: hold minimal sampai event hasil hit nyampe, biar Blocked bisa disambung chain guard
+	-- (kalau hasilnya Parried, block langsung dilepas lagi di onHit)
+	if now + sendIn + hold < resultAt then
+		hold = resultAt - (now + sendIn)
+	end
+	local coverTo = math.max(now + lead - rtt - fl + ha, resultAt) -- block harus tetap nyala sampai jam ini biar hit ini ketutup
+	counters.planned += 1
+	noteExpected(attacker, hitAt, now)
+	if CFG.DebugPlan then
+		log(
+			("%s plan[%s]: lead %.3f rtt %.3f±%.3f fps %.0f sendIn %.3f age %.3f hold %.3f tune %+.3f"):format(
+				tag, mode, lead, rtt, net.var, frame.fps, sendIn, age, hold, tune[plan.kind]
+			)
+		)
+	end
+
+	trace(
+		("%s dari %s [%s]: lead %.3f rtt %.3f fps %.0f -> kirim %.3fs lagi (umur block %.3f)"):format(
+			tag, attacker.Name, mode, lead, rtt, frame.fps, sendIn, age
+		)
+	)
+	local rec = { kind = plan.kind, hit = hitAt, done = false }
+	pending[#pending + 1] = rec
+	rec.handle = schedule(now + sendIn, function()
+		rec.done = true
+		if not alive or not CFG.Enabled then
+			return
+		end
+		if planToken[attacker] ~= tok then
+			counters.cancelled += 1
+			return
+		end
+		if pressBlock(hold) then
+			pressMode = mode
+		elseif plan.kind == "M1" and CFG.ChainGuard and extendHoldTo(coverTo) then
+			-- block udah nyala (rencana sebelumnya / chain): M1 cukup ditutup pakai perpanjangan hold
+			counters.chained += 1
+		end
+	end)
+end
+
+-- terlalu mepet / kekunci: jalur lama v3.1 (LateMode)
+local function lateFallback(plan, tag, lead, rtt, fl, bound, wait)
+	if bound then
+		counters.locked += 1
+		skip("locked")
+		log(("%s kekunci cooldown block (sisa %.2fs, lead %.3f)"):format(tag, wait, lead))
+	else
+		counters.late += 1
+		skip("late")
+		log(("%s terlalu cepat buat di-react (lead %.3f <= rtt %.3f + frame %.3f)"):format(tag, lead, rtt, fl))
+	end
+	local mode = plan.kind == "M2" and CFG.LateModeM2 or CFG.LateModeM1
+	if mode == "block" then
+		if pressBlock(CFG.LateHold) then
+			pressMode = "plain"
+		elseif plan.kind == "M1" and CFG.ChainGuard then
+			extendHoldTo(os.clock() + CFG.LateHold)
+		end
+	end
+end
+
+--[[
+	Keputusan per hit (v4):
+	  M1: parry (block baru / block lama yang masih di window)
+		  -> kalau parry nggak mungkin (parry cd, unparryable, block lama): BLOCK BIASA, ditahan nyambung
+		  -> kalau block juga nggak sempat / kekunci: DODGE
+	  M2: parry
+		  -> kalau parry nggak mungkin (parry cd, unparryable, block lama, kekunci, kecepetan): DODGE
+		  -> (opsional) kalau parry M2 dari attacker itu sebelumnya miss: dodge DULUAN
+]]
 local function react(attacker, plan, tag)
 	if not alive or not CFG.Enabled or typeof(attacker) ~= "Instance" then
 		return
@@ -933,15 +1281,13 @@ local function react(attacker, plan, tag)
 	if ahum and ahum.Health <= 0 then
 		return
 	end
-	if plan.spec and plan.spec.Unparryable then
-		return skip("unparryable")
-	end
 
 	local now = os.clock()
 	sampleNet(now)
 	local rtt = net.rtt
 	local fl = frameLag()
 	local corr = corrFor(attacker, plan)
+	local unparry = (plan.spec and plan.spec.Unparryable) and true or false
 
 	local isThreat, dist = threatens(attacker, hrp, plan, plan.lead + corr)
 	if not isThreat then
@@ -955,95 +1301,111 @@ local function react(attacker, plan, tag)
 		lead = refineLead(plan, dist) + corr
 	end
 
-	-- parry masih cooldown: M2 (BreaksBlock) jadi GuardBroken kalau cuma ke-Block.
-	-- Block yang masih nyala dilepas sebelum M2 mendarat -> cuma kena hit biasa.
-	if plan.kind == "M2" and now + lead < parriedAt + SR.ParryCooldown - 0.02 then
-		if CFG.ReleaseBeforeHeavy then
-			releaseBefore(now + lead - rtt - fl - 0.03)
-		end
-		return skip("parrycd")
-	end
-
 	-- hit bakal mendarat pas lu masih iframe (abis dash) -> nggak perlu
 	local iu = char:GetAttribute("IFramesUntil")
 	if type(iu) == "number" and iu > workspace:GetServerTimeNow() + lead then
 		return skip("iframes")
 	end
 
-	-- Block yang dikirim sekarang nyampe di server ~rtt/2 lagi, hit nyampe di server lead - rtt/2 - (telat proses event)
-	-- dari sekarang, jadi umur block saat hit = lead - rtt - fl - sendIn.
-	local targetAge = (plan.kind == "M2") and CFG.TargetAgeM2 or CFG.TargetAgeM1
-	local sendIn = lead - targetAge - rtt - fl + tune[plan.kind] + (math.random() * 2 - 1) * CFG.Jitter
-	local earliest = math.max(readyAt, lockedUntil, gameLock() or -math.huge)
-	local wait = earliest - now
-	local bound = false
-	if sendIn < wait then
-		sendIn = wait
-		bound = true
-	end
-	if sendIn < 0 then
-		sendIn = 0
-	end
-	local age = lead - rtt - fl - sendIn
+	local isM2 = plan.kind == "M2"
+	local ha = holdAfter()
 
-	if age < -CFG.LateTolerance then
-		if bound then
-			counters.locked += 1
-			skip("locked")
-			log(("%s kekunci cooldown block (sisa %.2fs, lead %.3f)"):format(tag, wait, lead))
-		else
-			counters.late += 1
-			skip("late")
-			log(("%s terlalu cepat buat di-react (lead %.3f <= rtt %.3f + frame %.3f)"):format(tag, lead, rtt, fl))
+	-- parry masih cooldown pas hit mendarat?
+	local parryCd = now + lead < parriedAt + SR.ParryCooldown - 0.02
+	local reason = unparry and "unparryable" or (parryCd and "parrycd" or nil)
+
+	-- kapan paling cepat Block ON bisa diterima server
+	local earliest = math.max(readyAt, lockedUntil, dodgeBlockUntil, gameLock() or -math.huge)
+	local wait = earliest - now
+	local function calc(targetAge, tn)
+		local s = lead - targetAge - rtt - fl + tn + (math.random() * 2 - 1) * CFG.Jitter
+		local b = false
+		if s < wait then
+			s = wait
+			b = true
 		end
-		local mode = plan.kind == "M2" and CFG.LateModeM2 or CFG.LateModeM1
-		if mode == "block" then
-			if not pressBlock(CFG.LateHold) and plan.kind == "M1" and CFG.ChainGuard then
-				extendHoldTo(now + CFG.LateHold)
+		if s < 0 then
+			s = 0
+		end
+		return s, lead - rtt - fl - s, b
+	end
+
+	-- bisa diparry?
+	local canParry, mode = false, nil
+	local sendIn, age, bound = 0, 0, false
+	if not reason then
+		if blockHeld then
+			-- block yang lagi nyala cuma bisa nge-parry kalau umurnya pas hit masih di dalam window
+			local heldAge = (now - blockOnAt) + lead - rtt - fl
+			if heldAge >= 0 and heldAge <= SR.ParryWindow - 0.04 then
+				canParry, mode = true, "held"
+			else
+				reason = "heldold"
+			end
+		else
+			sendIn, age, bound = calc(isM2 and CFG.TargetAgeM2 or CFG.TargetAgeM1, tune[plan.kind])
+			if age >= -CFG.LateTolerance then
+				canParry, mode = true, "fresh"
+			else
+				reason = bound and "locked" or "late"
 			end
 		end
+	end
+
+	------------------------------------------------------------------
+	-- M2 (BreaksBlock): cuma parry yang nyelametin, block biasa = GuardBroken -> sisanya DODGE
+	------------------------------------------------------------------
+	if isM2 then
+		local dodgeFirst = CFG.DodgeFirstM2 or (CFG.DodgeAfterMiss and (m2Miss[attacker] or 0) > 0)
+		if dodgeFirst and planDodge(attacker, plan, lead, now, rtt, fl, tag, "M2 dodge duluan") then
+			return
+		end
+		if not canParry then
+			if planDodge(attacker, plan, lead, now, rtt, fl, tag, reason) then
+				return
+			end
+			-- dodge juga nggak bisa: seenggaknya jangan sampai GuardBroken (lepas block sebelum M2 mendarat)
+			if blockHeld and CFG.ReleaseBeforeHeavy then
+				releaseBefore(now + lead - rtt - fl - 0.03)
+			end
+			if reason == "late" or reason == "locked" then
+				return lateFallback(plan, tag, lead, rtt, fl, bound, wait)
+			end
+			return skip(reason == "heldold" and "heldold" or reason)
+		end
+		if mode == "held" then
+			return guardExtend(attacker, plan, tag, lead, now, rtt, fl, ha, "masih di window parry")
+		end
+		return scheduleBlock(attacker, plan, tag, lead, sendIn, age, ha, rtt, fl, now, "parry")
+	end
+
+	------------------------------------------------------------------
+	-- M1: parry kalau bisa, kalau nggak BLOCK BIASA (ditahan), kalau block juga nggak bisa DODGE
+	------------------------------------------------------------------
+	if canParry then
+		if mode == "held" then
+			return guardExtend(attacker, plan, tag, lead, now, rtt, fl, ha, "masih di window parry")
+		end
+		return scheduleBlock(attacker, plan, tag, lead, sendIn, age, ha, rtt, fl, now, "parry")
+	end
+
+	if blockHeld and CFG.ChainGuard then
+		return guardExtend(attacker, plan, tag, lead, now, rtt, fl, ha, "block biasa (" .. tostring(reason) .. ")")
+	end
+
+	if CFG.BlockFallback and not blockHeld then
+		local s2, a2, b2 = calc(CFG.BlockOnlyAge, 0)
+		if a2 >= -CFG.LateTolerance then
+			trace(("%s dari %s: parry nggak mungkin (%s) -> block biasa"):format(tag, attacker.Name, tostring(reason)))
+			return scheduleBlock(attacker, plan, tag, lead, s2, a2, ha, rtt, fl, now, "plain")
+		end
+		bound = b2
+	end
+
+	if planDodge(attacker, plan, lead, now, rtt, fl, tag, "block nggak sempat") then
 		return
 	end
-
-	local hitAt = now + lead
-	local verdict = arbitrate(plan.kind, hitAt, now)
-	if verdict ~= "ok" then
-		return skip(verdict)
-	end
-
-	local tok = (planToken[attacker] or 0) + 1
-	planToken[attacker] = tok
-	local ha = holdAfter()
-	local hold = math.max(age, 0) + ha
-	local coverTo = now + lead - rtt - fl + ha -- block harus tetap nyala sampai jam ini biar hit ini ketutup
-	counters.planned += 1
-	if CFG.DebugPlan then
-		log(
-			("%s plan: lead %.3f rtt %.3f±%.3f fps %.0f sendIn %.3f age %.3f hold %.3f tune %+.3f"):format(
-				tag, lead, rtt, net.var, frame.fps, sendIn, age, hold, tune[plan.kind]
-			)
-		)
-	end
-
-	trace(("%s dari %s: lead %.3f rtt %.3f fps %.0f -> kirim %.3fs lagi (umur block %.3f)"):format(tag, attacker.Name, lead, rtt, frame.fps, sendIn, age))
-	local rec = { kind = plan.kind, hit = hitAt, done = false }
-	pending[#pending + 1] = rec
-	rec.handle = schedule(now + sendIn, function()
-		rec.done = true
-		if not alive or not CFG.Enabled then
-			return
-		end
-		if planToken[attacker] ~= tok then
-			counters.cancelled += 1
-			return
-		end
-		if not pressBlock(hold) then
-			-- block udah nyala (rencana sebelumnya / chain): M1 cukup ditutup pakai perpanjangan hold
-			if plan.kind == "M1" and CFG.ChainGuard and extendHoldTo(coverTo) then
-				counters.chained += 1
-			end
-		end
-	end)
+	return lateFallback(plan, tag, lead, rtt, fl, bound, wait)
 end
 
 ----------------------------------------------------------------------
@@ -1132,9 +1494,19 @@ local function onHit(data)
 	end
 
 	local kind = data.Kind == "M2" and "M2" or "M1"
-	local sent = (now - blockOnAt) < 0.6 and lastRefusedAt < blockOnAt
+	local sent = (now - blockOnAt) < 0.6 and lastRefusedAt < blockOnAt and pressMode == "parry" and (now - dodgeSentAt) > 0.8
 	local res = data.Result
 	local inParryCd = (now - parriedAt) < SR.ParryCooldown
+
+	-- v4: parry M2 miss -> M2 berikutnya dari attacker ini dodge duluan
+	if kind == "M2" and typeof(attacker) == "Instance" then
+		if res == "Parried" then
+			m2Miss[attacker] = nil
+		elseif res == "GuardBroken" or res == "Hit" then
+			m2Miss[attacker] = (m2Miss[attacker] or 0) + 1
+			trace("parry M2 miss dari", attacker.Name, "x" .. m2Miss[attacker], "-> M2 berikutnya dodge duluan")
+		end
+	end
 
 	if res == "Parried" then
 		counters.parried += 1
@@ -1144,6 +1516,20 @@ local function onHit(data)
 		if typeof(attacker) == "Instance" then
 			combo[attacker] = nil -- attacker kena stun -> combo reset di server
 			planToken[attacker] = (planToken[attacker] or 0) + 1
+		end
+		-- v4: abis parry, lepas block biar cooldown-nya (0.75s) cepet beres buat parry berikutnya,
+		-- kecuali ada hit lain yang lagi ditunggu dalam <0.9s
+		if CFG.ReleaseOnParry and blockHeld then
+			local keep = false
+			for _, e in ipairs(expected) do
+				if e.atk ~= attacker and e.at > now + 0.12 and e.at < now + 0.9 then
+					keep = true
+					break
+				end
+			end
+			if not keep then
+				releaseBefore(now)
+			end
 		end
 		log(("PARRY  (%d parry / %d block / %d gb / %d hit)"):format(counters.parried, counters.blocked, counters.guardbroken, counters.hit))
 	elseif res == "Blocked" then
@@ -1166,8 +1552,13 @@ local function onHit(data)
 		log(("GUARD BREAK %s (tune M1 %+.3f M2 %+.3f%s)"):format(kind, tune.M1, tune.M2, inParryCd and ", parry cooldown" or ""))
 	elseif res == "Hit" then
 		counters.hit += 1
+		if (now - dodgeSentAt) < 0.9 then
+			counters.dodgemiss += 1
+			trace(("dodge nggak nutup hit ini (dodge dikirim %.2fs lalu)"):format(now - dodgeSentAt))
+		end
 		if type(data.Stun) == "number" then
 			lockedUntil = math.max(lockedUntil, now + data.Stun - net.rtt / 2)
+			stunUntil = math.max(stunUntil, now + data.Stun - net.rtt / 2)
 		end
 		-- kena padahal block udah dikirim = kelambatan -> kirim lebih cepat
 		if sent then
@@ -1181,6 +1572,7 @@ local function onHit(data)
 		)
 	elseif res == "Dodged" then
 		counters.dodged += 1
+		log(("DODGE sukses %s (%d dodge)"):format(kind, counters.dodged))
 	end
 end
 
@@ -1265,6 +1657,12 @@ local function report()
 	print("[AutoParry] hitung :", table.concat(c, " "))
 	print("[AutoParry] skip   :", #s > 0 and table.concat(s, " ") or "-")
 	print(("[AutoParry] parry rate %.0f%% dari %d hit yang nyampe ke lu"):format(rate, tot))
+	local dd = dashOf()
+	print(
+		("[AutoParry] dodge : siap dalam %.1fs | iframe %.2fs cd %.2fs | lewat %s"):format(
+			dodgeWait(os.clock()), dd.IFrames, dd.Cooldown, dodgeLocal() and "game TryDodge" or "remote langsung"
+		)
+	)
 	print(
 		("[AutoParry] tune M1 %+.3f | M2 %+.3f | rtt %.3f±%.3f | fps %.0f (p90 frame %.0fms) | style kebaca %d | game state %s"):format(
 			tune.M1, tune.M2, net.rtt, net.var, frame.fps, frame.p90 * 1000, Specs.count, gameLock() and "ya" or "nggak"
@@ -1361,5 +1759,5 @@ genv.__NyxAutoParry = {
 
 task.spawn(loadSpecs)
 
-notify("v3.1 loaded - tekan " .. CFG.ToggleKey.Name .. " buat toggle")
-log("loaded v3.1. toggle:", CFG.ToggleKey.Name, "| ngetik getgenv().__NyxAutoParry.Report() buat ringkasan")
+notify("v4.0 loaded - tekan " .. CFG.ToggleKey.Name .. " buat toggle")
+log("loaded v4.0. toggle:", CFG.ToggleKey.Name, "| ngetik getgenv().__NyxAutoParry.Report() buat ringkasan")
