@@ -146,6 +146,16 @@
 ]]
 
 --[[
+	v11.3 = v11.2 + LIVE di UI: tab Log punya kartu status live (block, tunggu, parry-cd, dodge, rtt, fps, kena terakhir, event terakhir;
+	  update ~4x/detik) dan tombol "Salin semua (live dump)" = ringkasan + status + semua hit yang lolos (+ alasan, style, jarak, event) +
+	  semua event + hitungan skip, satu klik ke clipboard (kalau clipboard nggak ada, dicetak ke console).
+]]
+--[[
+	v11.2 = v11.1 + (1) M2RecheckDist: M2 yang di-skip "range" pas telegraf dicek ULANG pas windup udah lewat separuh (attacker lari/nge-dash
+	  nutup jarak selama windup 0.5-0.9s -> dulu hit-nya lolos tanpa rencana), (2) Why() nambah style attacker, jarak, dan umur event swing
+	  terakhir yang kebaca (kalau "event: nggak ada" = move itu nggak ngirim telegraf Flash/Sound yang dikenal script).
+]]
+--[[
 	v11.1 = v11.0 + (1) Why() nandain hit yang masuk abis lu nge-parry / abis lu ke-parry, (2) kalau event Parried nyampe pas block
 	  udah keburu lepas (hold abis parry nggak sempat jalan), block dijadwalin ulang pas jendela hit lanjutan attacker (SK.postParryLate)
 	  dan di log keluar "parry masuk tapi block udah lepas Xms lalu".
@@ -345,6 +355,8 @@ local CFG = {
 	ParriedGuard = true, -- abis LU yang ke-parry musuh: Block ON pas stun lepas (nutup / parry hit lanjutan musuh)
 	ParriedGuardHold = 0.55, -- tahan block segini detik abis stun lepas (diperpanjang chain kalau ada hit)
 	ParriedGuardRange = 14, -- stud: musuh yang ngeparry lu harus sedeket ini
+	M2Recheck = true, -- v11.2: M2 yang kena skip "range" dicek ulang di tengah windup (attacker bisa nutup jarak)
+	M2RecheckSafety = 0.08, -- detik sisa lead minimal di luar (umur block + rtt + frame) biar recheck masih sempat parry/dodge
 }
 
 ----------------------------------------------------------------------
@@ -2015,6 +2027,12 @@ local function react(attacker, plan, tag)
 		end
 	end
 	if not isThreat then
+		if plan.kind == "M2" and CFG.M2Recheck and not plan.rechecked then
+			local okR, errR = pcall(SK.m2Recheck, attacker, plan, tag, now)
+			if not okR then
+				trace("m2Recheck error:", tostring(errR))
+			end
+		end
 		return skip("range")
 	end
 	reactSure = sure
@@ -2372,6 +2390,46 @@ function SK.postParry(attacker, data, now)
 	)
 end
 
+-- v11.2: jarak datar attacker ke lu (buat Why)
+function SK.flatDist(a)
+	if typeof(a) ~= "Instance" then
+		return nil
+	end
+	local _, hrp = myState()
+	local ah = a:FindFirstChild("HumanoidRootPart")
+	if not (hrp and ah) then
+		return nil
+	end
+	local d = hrp.Position - ah.Position
+	return Vector3.new(d.X, 0, d.Z).Magnitude
+end
+
+-- v11.2: M2 kena skip "range" pas telegraf. Windup M2 panjang (0.5-0.9s) dan attacker bisa lari / nge-dash nutup jarak, jadi
+-- cek ulang pakai posisi terbaru selama sisa lead masih cukup buat parry/dodge. Satu kali recheck per swing.
+function SK.m2Recheck(attacker, plan, tag, now)
+	if typeof(attacker) ~= "Instance" then
+		return
+	end
+	local need = targetAgeFor(true) + net.rtt + frameLag() + CFG.M2RecheckSafety
+	local delay = math.min(plan.lead - need, 0.30)
+	if delay < 0.05 then
+		return
+	end
+	local tok = planToken[attacker] or 0
+	schedule(now + delay, function()
+		if not alive or not CFG.Enabled or (planToken[attacker] or 0) ~= tok then
+			return -- EndFlash / parry / plan lain udah nge-reset swing ini
+		end
+		local p2 = {}
+		for k, v in pairs(plan) do
+			p2[k] = v
+		end
+		p2.lead = plan.lead - (os.clock() - now)
+		p2.rechecked = true
+		react(attacker, p2, tag)
+	end)
+end
+
 -- v11.1: event Parried nyampe pas block udah keburu lepas (BlockReadyAt = lepas + 0.75s). Jadwalin Block ON se-awal mungkin
 -- yang masih diterima server tapi sebelum hit lanjutan attacker mendarat. Kalau hit lanjutan mendarat sebelum block siap -> skip.
 function SK.postParryLate(attacker, data, now)
@@ -2726,6 +2784,9 @@ local function onHit(data)
 				held = blockHeld, locked = lockBefore, stun = type(data.Stun) == "number" and data.Stun or 0,
 				sent = sent and true or false, slack = stunSlack, combo = cvw and cvw.n or 1,
 				pa = now - parriedAt, bp = now - (SK.bpAt or -math.huge),
+				st = typeof(attacker) == "Instance" and tostring(attacker:GetAttribute("Style") or "?") or "?",
+				dist = SK.flatDist(attacker),
+				sw = (typeof(attacker) == "Instance" and lastSwingSeen[attacker]) and (now - lastSwingSeen[attacker]) or nil,
 			}
 			if #whyLog > 20 then
 				table.remove(whyLog, 1)
@@ -3092,8 +3153,13 @@ local function whyReport()
 			("[AutoParry:why] %.1fs lalu | %s dari %s (combo ke-%d) | alasan: %s | rtt %.0fms fps %.0f | block %s | kunci %.2fs | stun %.2fs | sent %s | slack %.2f%s"):format(
 				clk - w.t, w.kind, w.who, w.combo, tostring(w.why), w.rtt * 1000, w.fps,
 				w.held and "nyala" or "mati", w.locked, w.stun, tostring(w.sent), w.slack,
-				(w.pa and w.pa < 2.0) and (" | %.2fs abis LU parry"):format(w.pa)
-					or ((w.bp and w.bp < 2.0) and (" | %.2fs abis LU ke-parry"):format(w.bp) or "")
+				((w.pa and w.pa < 2.0) and (" | %.2fs abis LU parry"):format(w.pa)
+					or ((w.bp and w.bp < 2.0) and (" | %.2fs abis LU ke-parry"):format(w.bp) or ""))
+					.. (" | style %s jarak %s event %s"):format(
+						tostring(w.st or "?"),
+						w.dist and ("%.1f"):format(w.dist) or "?",
+						w.sw and ("%.2fs lalu"):format(w.sw) or "nggak ada"
+					)
 			)
 		)
 	end
@@ -3432,7 +3498,7 @@ local function summaryText()
     local rate = all > 0 and (c.parried + c.blocked + c.dodged) / all * 100 or 100
     local parryRate = landed > 0 and c.parried / landed * 100 or 0
     return table.concat({
-        ("AutoParry v11.1 | parry %d  block %d  dodge %d  kena %d  gb %d | aman %.0f%% | parry-rate %.0f%%"):format(
+        ("AutoParry v11.3 | parry %d  block %d  dodge %d  kena %d  gb %d | aman %.0f%% | parry-rate %.0f%%"):format(
             c.parried, c.blocked, c.dodged, c.hit, c.guardbroken, rate, parryRate
         ),
         ("rtt %.0fms (±%.0f) | fps %.0f (p90 %.0fms, spike %d) | cpu %.0fus/frame (max %.0fus)"):format(
@@ -3442,6 +3508,73 @@ local function summaryText()
             tune.M1, tune.M2, stunSlack, c.refused, c.late, c.locked, c.respawns, c.healed, c.recheck
         ),
     }, "\n")
+end
+
+-- v11.3: status live (4 baris teks) buat kartu di tab Log + header dump
+function SK.live(now)
+    local gl = gameLock()
+    local rdy = math.max(readyAt, lockedUntil, dodgeBlockUntil, gl or -math.huge) - now
+    local r1 = ("block %s · tunggu %.2fs · parry-cd %.2fs"):format(
+        blockHeld and "NYALA" or "mati", math.max(rdy, 0), math.max(parriedAt + SR.ParryCooldown - now, 0)
+    )
+    local r2 = ("dodge siap %.1fs · rtt %.0f±%.0fms · %.0ffps p90 %.0fms"):format(
+        dodgeWait(now), net.rtt * 1000, net.var * 1000, frame.fps, frame.p90 * 1000
+    )
+    local w = whyLog[#whyLog]
+    local r3 = "kena terakhir: belum ada"
+    if w then
+        r3 = ("kena %.0fs lalu: %s · %s · %s %s"):format(
+            now - w.t, w.kind, tostring(w.why), tostring(w.st or "?"), w.dist and ("%.0fst"):format(w.dist) or ""
+        )
+    end
+    local e = EV.count > 0 and EV.ring[(EV.head - 1) % EV.cap + 1] or nil
+    local r4 = e and ("event %.1fs lalu: %s · %s"):format(now - e.t, e.kind, e.text) or "event: -"
+    return r1, r2, r3, r4, (w and (now - w.t) < 3) and true or false
+end
+
+-- v11.3: semuanya jadi satu teks buat disalin
+function SK.dump()
+    local now = os.clock()
+    local out = {}
+    local function add(s)
+        out[#out + 1] = s
+    end
+    add("== AutoParry live dump · v11.3 ==")
+    add(summaryText())
+    local r1, r2 = SK.live(now)
+    add(r1)
+    add(r2)
+    add("-- KENA: " .. #whyLog .. " terakhir (paling baru di bawah) --")
+    for i = 1, #whyLog do
+        local w = whyLog[i]
+        add(
+            ("%.1fs lalu | %s dari %s combo %d | alasan: %s | style %s jarak %s event %s | rtt %.0fms fps %.0f | block %s kunci %.2fs stun %.2fs sent %s slack %.2f%s"):format(
+                now - w.t, w.kind, w.who, w.combo, tostring(w.why), tostring(w.st or "?"),
+                w.dist and ("%.1f"):format(w.dist) or "?", w.sw and ("%.2fs lalu"):format(w.sw) or "nggak ada",
+                w.rtt * 1000, w.fps, w.held and "nyala" or "mati", w.locked, w.stun, tostring(w.sent), w.slack,
+                (w.pa and w.pa < 2.0) and (" | %.2fs abis LU parry"):format(w.pa)
+                    or ((w.bp and w.bp < 2.0) and (" | %.2fs abis LU ke-parry"):format(w.bp) or "")
+            )
+        )
+    end
+    add("-- EVENT: " .. EV.count .. " terakhir (paling baru di bawah) --")
+    for age = EV.count - 1, 0, -1 do
+        local e = EV.ring[(EV.head - age - 1) % EV.cap + 1]
+        if e then
+            add(("%.1fs lalu | %s | %s"):format(now - e.t, e.kind, e.text))
+        end
+    end
+    local names = {}
+    for k in pairs(skips) do
+        names[#names + 1] = k
+    end
+    table.sort(names)
+    local parts = {}
+    for _, k in ipairs(names) do
+        parts[#parts + 1] = k .. "=" .. tostring(skips[k])
+    end
+    add("-- SKIP: " .. (#parts > 0 and table.concat(parts, " ") or "-"))
+    return table.concat(out, "\n")
 end
 
 ----------------------------------------------------------------------
@@ -3716,7 +3849,7 @@ local function buildUI()
     local dot = make("Frame", { Position = UDim2.fromOffset(14, 17), Size = UDim2.fromOffset(8, 8), BackgroundColor3 = T.good, BorderSizePixel = 0 }, titleBar)
     corner(dot, 4)
     text(titleBar, "Nyx AutoParry", 14, T.text, Enum.Font.GothamBold, { Position = UDim2.fromOffset(30, 0), Size = UDim2.new(0, 98, 1, 0) })
-    text(titleBar, "v11.1", 10, T.sub, Enum.Font.GothamMedium, { Position = UDim2.fromOffset(130, 0), Size = UDim2.new(0, 40, 1, 0) })
+    text(titleBar, "v11.3", 10, T.sub, Enum.Font.GothamMedium, { Position = UDim2.fromOffset(130, 0), Size = UDim2.new(0, 40, 1, 0) })
 
     local function iconBtn(sym, xFromRight, cb)
         local b = make("TextButton", {
@@ -4297,6 +4430,12 @@ local function buildUI()
     local P4, s4 = newPage("log")
     local FILTERS = { { "all", "Semua" }, { "parry", "Parry" }, { "block", "Block" }, { "dodge", "Dodge" }, { "hit", "Kena" }, { "other", "Lain" } }
     local filter, whyMode, forceLog = "all", false, true
+    -- v11.3: kartu status live
+    local cLive = card(s4)
+    local liveL = {}
+    for i = 1, 4 do
+        liveL[i] = text(cLive, "", 11, T.text, Enum.Font.Code, { Size = UDim2.new(1, 0, 0, 15), RichText = true, TextTruncate = Enum.TextTruncate.AtEnd })
+    end
     local cTop = card(s4)
     local chipsHost = rowHost(cTop, 26)
     local chips = {}
@@ -4325,6 +4464,26 @@ local function buildUI()
         forceLog = true
         refreshPage()
     end, { Size = UDim2.new(0.5, -3, 1, 0) })
+    -- v11.3: satu tombol salin semua
+    local copyRow = rowHost(cTop, 28)
+    make("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }, copyRow)
+    orderN[copyRow] = 0
+    button(copyRow, "Salin semua (live dump)", function()
+        local okD, txt = pcall(SK.dump)
+        if not okD then
+            UI.toast("Gagal bikin dump: " .. tostring(txt), "bad")
+            return
+        end
+        local okC = pcall(function()
+            local fn = setclipboard or toclipboard
+            fn(txt)
+        end)
+        if not okC then
+            print(txt)
+        end
+        local _, nl = txt:gsub("\n", "\n")
+        UI.toast(okC and ("Disalin · %d baris"):format(nl + 1) or "Clipboard nggak ada, dicetak ke console", okC and "ok" or "warn")
+    end, { Size = UDim2.new(1, 0, 1, 0) })
     local logBox = card(s4)
     local LOG_ROWS = 40
     local logRows = {}
@@ -4350,11 +4509,18 @@ local function buildUI()
         end
         whyBtn.BackgroundColor3 = whyMode and T.bad or T.cardHi
         local now = os.clock()
+        local l1, l2, l3, l4, fresh = SK.live(now)
+        setT(liveL[1], esc(l1))
+        setT(liveL[2], esc(l2))
+        setT(liveL[3], esc(l3))
+        setT(liveL[4], esc(l4))
+        liveL[1].TextColor3 = blockHeld and T.good or T.sub
+        liveL[3].TextColor3 = fresh and T.bad or T.sub
         local n = 0
         if whyMode then
             for i = #whyLog, 1, -1 do
                 local w = whyLog[i]
-                if n + 2 > LOG_ROWS then
+                if n + 3 > LOG_ROWS then
                     break
                 end
                 n += 1
@@ -4367,6 +4533,11 @@ local function buildUI()
                 n += 1
                 logRows[n].Text = ('<font color="%s">   %s · rtt %dms · %dfps · block %s · kunci %.2fs</font>'):format(
                     hex(T.warn), esc(w.why), math.floor(w.rtt * 1000 + 0.5), math.floor(w.fps + 0.5), w.held and "nyala" or "mati", w.locked
+                )
+                logRows[n].Visible = true
+                n += 1
+                logRows[n].Text = ('<font color="%s">   style %s · jarak %s · event %s</font>'):format(
+                    hex(T.sub), esc(tostring(w.st or "?")), w.dist and ("%.1f"):format(w.dist) or "?", w.sw and ("%.2fs lalu"):format(w.sw) or "nggak ada"
                 )
                 logRows[n].Visible = true
             end
@@ -4640,7 +4811,7 @@ end
 -- API + START
 ----------------------------------------------------------------------
 genv.__NyxAutoParry = {
-    Version = "11.1",
+    Version = "11.3",
     CFG = CFG,
     Counters = counters,
     Skips = skips,
@@ -4712,5 +4883,5 @@ if CFG.UI then
     end)
 end
 
-notify("v11.1 loaded - tekan " .. CFG.ToggleKey.Name .. " buat toggle")
-log("loaded v11.1. toggle:", CFG.ToggleKey.Name, "| UI:", CFG.UIKey.Name, "| getgenv().__NyxAutoParry.Summary() buat ringkasan")
+notify("v11.3 loaded - tekan " .. CFG.ToggleKey.Name .. " buat toggle")
+log("loaded v11.3. toggle:", CFG.ToggleKey.Name, "| UI:", CFG.UIKey.Name, "| getgenv().__NyxAutoParry.Summary() buat ringkasan")
