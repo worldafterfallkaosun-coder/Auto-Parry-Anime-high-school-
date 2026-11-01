@@ -122,6 +122,20 @@
 	  DIAG   : getgenv().__NyxAutoParry.Why() = 10 hit terakhir + alasannya (skip apa, rtt, fps, block nyala/nggak, kunci, stun).
 ]]
 
+--[[
+	v9.0 (= v8 + UI baru + fix kecil). Logika parry / block / dodge / combo v8 TIDAK diubah.
+	  UI    : panel 4 tab (Live / Timing / Log / Setup).
+	          Live   : kartu statistik, bar aman, grafik mini ping + fps (4Hz, cuma pas panel kebuka).
+	          Timing : slider target umur M1/M2, toleransi telat, hold, pad hasil, margin range.
+	                   Bisa diatur langsung tanpa restart. Ada tombol reset tune & default timing.
+	          Log    : 14 event terakhir + tombol ringkasan / why hit.
+	          Setup  : toggle fitur + reset stat.
+	  FIX   : toggle OFF pas block lagi nyala -> block dilepas langsung (dulu bisa nyangkut).
+	          Ping: kalau Stats belum siap, dicoba lagi tiap 2 detik (dulu gagal sekali = nyerah selamanya).
+	  LAG   : UI nggak update kecuali panel kebuka. Local tambahan di-scope biar nggak nambah batas local utama.
+	  CATAT : belum diuji di game. Kalau masih kena, buka tab Log > "Why hit" dan kirim hasilnya.
+]]
+
 local genv = (getgenv and getgenv()) or _G
 if genv.__NyxAutoParry then
 	pcall(genv.__NyxAutoParry.Stop)
@@ -330,7 +344,15 @@ local dodgeBlockUntil = 0 -- Block ON ditolak server sampai sini gara-gara dodge
 local dodgeSentAt = -math.huge
 local stunUntil = 0 -- stun dari hit (nge-blok dodge)
 local reactSure = true -- v5: ancaman yang lagi diproses masuk hitbox beneran (bukan cuma "deket")?
-local lastEvent = "-" -- v5: teks event terakhir buat panel UI
+-- v9: EV = teks event terakhir + riwayat 14 event (dipakai tab Log di UI)
+local EV = { feed = {}, last = "-" }
+function EV.push(text)
+	EV.last = text
+	table.insert(EV.feed, 1, text)
+	if #EV.feed > 14 then
+		table.remove(EV.feed)
+	end
+end
 
 local function nameOf(inst)
 	return typeof(inst) == "Instance" and inst.Name or "?"
@@ -473,12 +495,14 @@ local function stunComp()
 end
 
 local pingItem = nil
+local pingTryAt = -math.huge -- v9: kapan terakhir nyoba ambil Stats (retry tiap 2 detik kalau gagal)
 
 local function readPing()
 	if CFG.PingOverride then
 		return CFG.PingOverride
 	end
-	if pingItem == nil then
+	if not pingItem and os.clock() - pingTryAt > 2 then
+		pingTryAt = os.clock()
 		local okItem, item = pcall(function()
 			return Stats.Network.ServerStatsItem["Data Ping"]
 		end)
@@ -2130,7 +2154,7 @@ local function onHit(data)
 		if stunProbeAt == blockOnAt and lastRefusedAt < blockOnAt then
 			stunLearn(true)
 		end
-		lastEvent = "PARRY " .. kind .. " · " .. nameOf(attacker)
+		EV.push("PARRY " .. kind .. " · " .. nameOf(attacker))
 		parriedAt = now
 		streak[kind].n = 0
 		streak[kind].dir = 0
@@ -2177,7 +2201,7 @@ local function onHit(data)
 		if stunProbeAt == blockOnAt and lastRefusedAt < blockOnAt then
 			stunLearn(true)
 		end
-		lastEvent = "block " .. kind .. " · " .. nameOf(attacker)
+		EV.push("block " .. kind .. " · " .. nameOf(attacker))
 		-- ke-Block doang = umur block kegedean (kecepetan) -> kirim lebih lambat
 		if sent and not inParryCd then
 			tuneBy(kind, 1)
@@ -2188,7 +2212,7 @@ local function onHit(data)
 		if CFG.Debug then log(("block  %s (tune M1 %+.3f M2 %+.3f%s)"):format(kind, tune.M1, tune.M2, inParryCd and ", parry cooldown" or "")) end
 	elseif res == "GuardBroken" then
 		counters.guardbroken += 1
-		lastEvent = "GUARD BREAK " .. kind .. " · " .. nameOf(attacker)
+		EV.push("GUARD BREAK " .. kind .. " · " .. nameOf(attacker))
 		dropLocalBlock()
 		lockedUntil = math.max(lockedUntil, now + SR.GuardBreak - net.rtt / 2)
 		if sent and not inParryCd then
@@ -2198,7 +2222,7 @@ local function onHit(data)
 	elseif res == "Hit" then
 		counters.hit += 1
 		local lockBefore = math.max(lockedUntil - now, 0) -- v8: kondisi kunci SEBELUM stun hit ini masuk
-		lastEvent = "KENA " .. kind .. " · " .. nameOf(attacker)
+		EV.push("KENA " .. kind .. " · " .. nameOf(attacker))
 		if (now - dodgeSentAt) < 0.9 then
 			counters.dodgemiss += 1
 			if CFG.Trace then trace(("dodge nggak nutup hit ini (dodge dikirim %.2fs lalu)"):format(now - dodgeSentAt)) end
@@ -2233,7 +2257,7 @@ local function onHit(data)
 		) end
 	elseif res == "Dodged" then
 		counters.dodged += 1
-		lastEvent = "DODGE " .. kind .. " · " .. nameOf(attacker)
+		EV.push("DODGE " .. kind .. " · " .. nameOf(attacker))
 		if CFG.Debug then log(("DODGE sukses %s (%d dodge)"):format(kind, counters.dodged)) end
 	end
 
@@ -2567,6 +2591,9 @@ table.insert(
 		end
 		if input.KeyCode == CFG.ToggleKey then
 			CFG.Enabled = not CFG.Enabled
+			if not CFG.Enabled and blockHeld then
+				releaseBefore(os.clock()) -- v9: OFF pas block nyala -> block langsung dilepas
+			end
 			notify(CFG.Enabled and "ON" or "OFF")
 			log(CFG.Enabled and "ON" or "OFF")
 			if UI.refresh then
@@ -2583,351 +2610,931 @@ local function resetStats()
 		counters[k] = 0
 	end
 	table.clear(skips)
-	lastEvent = "stat direset"
+	EV.push("stat direset")
 end
+
 
 ----------------------------------------------------------------------
--- UI (v6): cuma tombol bulat kecil. Geser = pindahin, tap = buka/tutup panel. Warna: hijau ON / merah OFF
+-- UI v9: 4 tab (Live / Timing / Log / Setup) + tombol bulat
+-- semua local UI dibungkus do..end biar nggak nambah batas local di scope utama
 ----------------------------------------------------------------------
-local function make(class, props, parent)
-	local o = Instance.new(class)
-	for k, v in pairs(props) do
-		o[k] = v
-	end
-	o.Parent = parent
-	return o
-end
-
-local function skipText()
-	if os.clock() - lastSkip.at < 3 then
-		return " · skip:" .. lastSkip.reason
-	end
-	return ""
-end
-
-local function statsText()
-	local c = counters
-	local tot = c.parried + c.blocked + c.guardbroken + c.hit
-	local safeTot = tot + c.dodged
-	local safeRate = safeTot > 0 and math.floor((c.parried + c.blocked + c.dodged) / safeTot * 100 + 0.5) or 0
-	return string.format(
-		"Parry %d · Block %d · Dodge %d\nKena %d · GB %d · Aman %d%%\n%dms · %d fps\n%s",
-		c.parried, c.blocked, c.dodged, c.hit, c.guardbroken, safeRate,
-		math.floor(net.rtt * 1000 + 0.5), math.floor(frame.fps + 0.5), lastEvent .. skipText()
-	)
-end
-
-local function buildUI()
-	if not alive then
-		return
-	end
-	local GREEN, RED = Color3.fromRGB(46, 160, 100), Color3.fromRGB(200, 70, 70)
-	local DARK, MID = Color3.fromRGB(18, 18, 24), Color3.fromRGB(46, 46, 58)
-	local WHITE, GREY = Color3.fromRGB(240, 240, 245), Color3.fromRGB(170, 172, 185)
-
-	local gui = Instance.new("ScreenGui")
-	gui.Name = "NyxAutoParryUI"
-	gui.ResetOnSpawn = false
-	gui.IgnoreGuiInset = true
-	gui.DisplayOrder = 999
-	gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-	pcall(function()
-		if syn and syn.protect_gui then
-			syn.protect_gui(gui)
+do
+	local function make(class, props, parent)
+		local o = Instance.new(class)
+		for k, v in pairs(props) do
+			o[k] = v
 		end
-	end)
+		o.Parent = parent
+		return o
+	end
 
-	local targets = {}
-	local okH, hui = pcall(function()
-		return gethui and gethui()
-	end)
-	if okH and hui then
-		targets[#targets + 1] = hui
-	end
-	local okC, cg = pcall(game.GetService, game, "CoreGui")
-	if okC and cg then
-		targets[#targets + 1] = cg
-	end
-	targets[#targets + 1] = LocalPlayer:WaitForChild("PlayerGui")
-	if not alive then
-		return
-	end
-	for _, p in ipairs(targets) do
-		pcall(function()
-			local old = p:FindFirstChild("NyxAutoParryUI")
-			if old then
-				old:Destroy()
-			end
-		end)
-	end
-	for _, p in ipairs(targets) do
-		local okP = pcall(function()
-			gui.Parent = p
-		end)
-		if okP and gui.Parent == p then
-			break
+	local function setText(lbl, s)
+		if lbl.Text ~= s then
+			lbl.Text = s
 		end
 	end
-	UI.gui = gui
 
-	local SIZE, PW = CFG.ButtonSize, 196
-	local defs = {
+	local function corner(o, r)
+		make("UICorner", { CornerRadius = UDim.new(0, r) }, o)
+	end
+
+	local TH = {
+		BG = Color3.fromRGB(16, 17, 24),
+		CARD = Color3.fromRGB(28, 30, 42),
+		LINE = Color3.fromRGB(56, 60, 80),
+		TXT = Color3.fromRGB(236, 238, 246),
+		DIM = Color3.fromRGB(140, 145, 168),
+		ACC = Color3.fromRGB(124, 106, 255),
+		OK = Color3.fromRGB(60, 190, 124),
+		BAD = Color3.fromRGB(226, 80, 92),
+		WARN = Color3.fromRGB(238, 178, 66),
+	}
+
+	local TOGGLES = {
 		{ "Parry", "Enabled" },
 		{ "Block", "BlockFallback" },
 		{ "Dodge", "DodgeEnabled" },
 		{ "Pintar", "SmartMode" },
-		{ "M2 dodge", "DodgeFirstM2" },
 		{ "Prio block", "GuardPriority" },
 		{ "Prediksi", "PredictCombo" },
 		{ "Combo", "HitReflex" },
+		{ "Combo keep", "ComboKeep" },
 		{ "Unlock", "FastUnlock" },
 		{ "Raw block", "RawOnLocalRefuse" },
+		{ "M2 dodge", "DodgeFirstM2" },
 		{ "Log hit", "WhyHit" },
 	}
-	local rows = math.ceil(#defs / 2)
-	local statsY = 8 + rows * 28 + 2
-	local btnY = statsY + 56
-	local PH = btnY + 24 + 8
-	local CHIP_W = (PW - 16 - 4) / 2
 
-	local root = make("Frame", {
-		Name = "Root",
-		Size = UDim2.fromOffset(SIZE, SIZE),
-		Position = UDim2.new(0, 14, 0.35, 0),
-		BackgroundTransparency = 1,
-		BorderSizePixel = 0,
-	}, gui)
+	local SLIDERS = {
+		{ key = "TargetAgeM1", label = "Target umur M1", min = 0.05, max = 0.24, step = 0.005, unit = "ms" },
+		{ key = "TargetAgeM2", label = "Target umur M2", min = 0.05, max = 0.24, step = 0.005, unit = "ms" },
+		{ key = "LateTolerance", label = "Toleransi telat", min = 0, max = 0.08, step = 0.002, unit = "ms" },
+		{ key = "HoldAfterHit", label = "Hold setelah hit", min = 0.02, max = 0.14, step = 0.002, unit = "ms" },
+		{ key = "ResultPad", label = "Pad hasil", min = 0.02, max = 0.15, step = 0.002, unit = "ms" },
+		{ key = "RangeMargin", label = "Margin range", min = 0, max = 6, step = 0.1, unit = "st" },
+	}
 
-	local btn = make("TextButton", {
-		Name = "Toggle",
-		Size = UDim2.fromScale(1, 1),
-		BackgroundColor3 = GREEN,
-		BackgroundTransparency = 0.1,
-		BorderSizePixel = 0,
-		AutoButtonColor = false,
-		Text = "AP",
-		Font = Enum.Font.GothamBold,
-		TextSize = 12,
-		TextColor3 = WHITE,
-	}, root)
-	make("UICorner", { CornerRadius = UDim.new(1, 0) }, btn)
-	make("UIStroke", { Color = WHITE, Thickness = 1.5, Transparency = 0.55 }, btn)
+	local PW, PH = 268, 312
+	local TAB_Y, BODY_Y = 40, 70
+	local BODY_H = PH - BODY_Y - 8
+	local SPARK_N, SPARK_GAP = 30, 1
+	local SPARK_W = math.floor((PW - 24 - (SPARK_N - 1) * SPARK_GAP) / SPARK_N)
+	local sampRtt, sampFps = {}, {}
 
-	local panel = make("Frame", {
-		Name = "Panel",
-		Size = UDim2.fromOffset(PW, PH),
-		Position = UDim2.fromOffset(0, SIZE + 6),
-		BackgroundColor3 = DARK,
-		BackgroundTransparency = 0.06,
-		BorderSizePixel = 0,
-		Visible = false,
-	}, root)
-	make("UICorner", { CornerRadius = UDim.new(0, 10) }, panel)
-	make("UIStroke", { Color = Color3.fromRGB(70, 70, 90), Thickness = 1 }, panel)
-
-	local paints = {}
-	for i, d in ipairs(defs) do
-		local label, key = d[1], d[2]
-		local col, row = (i - 1) % 2, math.floor((i - 1) / 2)
-		local b = make("TextButton", {
-			Position = UDim2.fromOffset(8 + col * (CHIP_W + 4), 8 + row * 28),
-			Size = UDim2.fromOffset(CHIP_W, 24),
-			Font = Enum.Font.GothamMedium,
-			TextSize = 11,
-			TextColor3 = WHITE,
-			BorderSizePixel = 0,
-			AutoButtonColor = true,
-		}, panel)
-		make("UICorner", { CornerRadius = UDim.new(0, 7) }, b)
-		local function paint()
-			local on = CFG[key] and true or false
-			b.Text = label .. (on and "  ON" or "  OFF")
-			b.BackgroundColor3 = on and GREEN or MID
+	local function pushSpark(list, v)
+		list[#list + 1] = v
+		if #list > SPARK_N then
+			table.remove(list, 1)
 		end
-		b.Activated:Connect(function()
-			CFG[key] = not CFG[key]
-			UI.refresh()
-		end)
-		paints[#paints + 1] = paint
-		paint()
 	end
 
-	local stats = make("TextLabel", {
-		Position = UDim2.fromOffset(8, statsY),
-		Size = UDim2.fromOffset(PW - 16, 52),
-		BackgroundTransparency = 1,
-		Font = Enum.Font.Gotham,
-		TextSize = 11,
-		TextColor3 = GREY,
-		TextXAlignment = Enum.TextXAlignment.Left,
-		TextYAlignment = Enum.TextYAlignment.Top,
-		TextWrapped = true,
-		TextTruncate = Enum.TextTruncate.AtEnd,
-		Text = "",
-	}, panel)
+	local function setEnabled(on)
+		CFG.Enabled = on and true or false
+		if not CFG.Enabled and blockHeld then
+			releaseBefore(os.clock())
+		end
+		EV.push(CFG.Enabled and "script ON" or "script OFF")
+		notify(CFG.Enabled and "ON" or "OFF")
+	end
 
-	local function smallBtn(text, col, cb)
-		local b = make("TextButton", {
-			Text = text,
+	local function resetTune()
+		tune.M1, tune.M2 = 0, 0
+		streak.M1 = { dir = 0, n = 0 }
+		streak.M2 = { dir = 0, n = 0 }
+		stunSlack = CFG.StunSlackStart
+		EV.push("tune di-reset ke default")
+	end
+
+	local function skipText()
+		if os.clock() - lastSkip.at < 3 then
+			return "skip: " .. lastSkip.reason
+		end
+		return "-"
+	end
+
+	-- grafik mini: bar tumbuh dari bawah, bar paling kanan = sampel terbaru
+	local function makeSpark(parent, y, title)
+		local t = make("TextLabel", {
+			BackgroundTransparency = 1,
+			Position = UDim2.fromOffset(12, y),
+			Size = UDim2.new(1, -24, 0, 14),
 			Font = Enum.Font.GothamMedium,
-			TextSize = 11,
-			TextColor3 = WHITE,
-			BackgroundColor3 = MID,
+			TextSize = 10,
+			TextColor3 = TH.DIM,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			Text = title,
+		}, parent)
+		local box = make("Frame", {
+			Position = UDim2.fromOffset(12, y + 16),
+			Size = UDim2.new(1, -24, 0, 32),
+			BackgroundColor3 = TH.CARD,
 			BorderSizePixel = 0,
-			Position = UDim2.fromOffset(8 + col * (CHIP_W + 4), btnY),
-			Size = UDim2.fromOffset(CHIP_W, 24),
-		}, panel)
-		make("UICorner", { CornerRadius = UDim.new(0, 7) }, b)
-		b.Activated:Connect(cb)
+		}, parent)
+		corner(box, 6)
+		local bars = {}
+		for i = 1, SPARK_N do
+			bars[i] = make("Frame", {
+				AnchorPoint = Vector2.new(0, 1),
+				Position = UDim2.new(0, 2 + (i - 1) * (SPARK_W + SPARK_GAP), 1, -3),
+				Size = UDim2.new(0, SPARK_W, 0, 2),
+				BackgroundColor3 = TH.OK,
+				BorderSizePixel = 0,
+				Visible = false,
+			}, box)
+		end
+		local function set(list, norm, color)
+			local off = SPARK_N - #list
+			for i = 1, SPARK_N do
+				local v = list[i - off]
+				local b = bars[i]
+				if v ~= nil then
+					local f = math.clamp(norm(v), 0.05, 1)
+					b.Size = UDim2.new(0, SPARK_W, 0, math.floor(f * 26))
+					b.BackgroundColor3 = color(v)
+					b.Visible = true
+				else
+					b.Visible = false
+				end
+			end
+		end
+		return { title = t, set = set }
 	end
-	smallBtn("Reset stat", 0, function()
-		resetStats()
-		UI.refresh()
-	end)
-	smallBtn("Ringkasan", 1, function()
-		report()
-	end)
 
-	-- geser = pindah, tap (gerak < 6px) = buka/tutup panel
-	local dragging, moved, dragStart, startPos = false, false, nil, nil
-	btn.InputBegan:Connect(function(input)
-		local t = input.UserInputType
-		if t ~= Enum.UserInputType.MouseButton1 and t ~= Enum.UserInputType.Touch then
+	local function buildUI()
+		if not alive then
 			return
 		end
-		dragging, moved = true, false
-		dragStart, startPos = input.Position, root.Position
-		if UI.dragConn then
-			UI.dragConn:Disconnect()
+		local SIZE = CFG.ButtonSize
+		local DEFAULTS = {}
+		for _, d in ipairs(SLIDERS) do
+			DEFAULTS[d.key] = CFG[d.key]
 		end
-		UI.dragConn = UserInputService.InputChanged:Connect(function(i)
-			if not dragging then
+
+		local gui = Instance.new("ScreenGui")
+		gui.Name = "NyxAutoParryUI"
+		gui.ResetOnSpawn = false
+		gui.IgnoreGuiInset = true
+		gui.DisplayOrder = 999
+		gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+		pcall(function()
+			if syn and syn.protect_gui then
+				syn.protect_gui(gui)
+			end
+		end)
+
+		local targets = {}
+		local okH, hui = pcall(function()
+			return gethui and gethui()
+		end)
+		if okH and hui then
+			targets[#targets + 1] = hui
+		end
+		local okC, cg = pcall(game.GetService, game, "CoreGui")
+		if okC and cg then
+			targets[#targets + 1] = cg
+		end
+		targets[#targets + 1] = LocalPlayer:WaitForChild("PlayerGui")
+		if not alive then
+			return
+		end
+		for _, p in ipairs(targets) do
+			pcall(function()
+				local old = p:FindFirstChild("NyxAutoParryUI")
+				if old then
+					old:Destroy()
+				end
+			end)
+		end
+		for _, p in ipairs(targets) do
+			local okP = pcall(function()
+				gui.Parent = p
+			end)
+			if okP and gui.Parent == p then
+				break
+			end
+		end
+		UI.gui = gui
+
+		-- tombol bulat (geser = pindah, tap = buka/tutup panel)
+		local root = make("Frame", {
+			Name = "Root",
+			Size = UDim2.fromOffset(SIZE, SIZE),
+			Position = UDim2.new(0, 14, 0.35, 0),
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+		}, gui)
+		local btn = make("TextButton", {
+			Name = "Toggle",
+			Size = UDim2.fromScale(1, 1),
+			BackgroundColor3 = TH.OK,
+			BackgroundTransparency = 0.05,
+			BorderSizePixel = 0,
+			AutoButtonColor = false,
+			Text = "AP",
+			Font = Enum.Font.GothamBold,
+			TextSize = 12,
+			TextColor3 = TH.TXT,
+		}, root)
+		corner(btn, 99)
+		make("UIStroke", { Color = TH.TXT, Thickness = 1.5, Transparency = 0.5 }, btn)
+
+		-- panel utama
+		local panel = make("Frame", {
+			Name = "Panel",
+			Size = UDim2.fromOffset(PW, PH),
+			Position = UDim2.fromOffset(0, SIZE + 6),
+			BackgroundColor3 = TH.BG,
+			BackgroundTransparency = 0.03,
+			BorderSizePixel = 0,
+			Visible = false,
+			ClipsDescendants = true,
+		}, root)
+		corner(panel, 12)
+		make("UIStroke", { Color = TH.LINE, Thickness = 1 }, panel)
+
+		-- header: geser = pindah panel, pill = ON/OFF, "-" = tutup
+		local head = make("Frame", {
+			Size = UDim2.new(1, 0, 0, 34),
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+		}, panel)
+		make("TextLabel", {
+			BackgroundTransparency = 1,
+			Position = UDim2.fromOffset(12, 0),
+			Size = UDim2.fromOffset(84, 34),
+			Font = Enum.Font.GothamBold,
+			TextSize = 13,
+			TextColor3 = TH.TXT,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			Text = "AutoParry",
+		}, head)
+		make("TextLabel", {
+			BackgroundTransparency = 1,
+			Position = UDim2.fromOffset(94, 0),
+			Size = UDim2.fromOffset(40, 34),
+			Font = Enum.Font.Gotham,
+			TextSize = 10,
+			TextColor3 = TH.DIM,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			Text = "v9",
+		}, head)
+		local pill = make("TextButton", {
+			Position = UDim2.new(1, -92, 0, 7),
+			Size = UDim2.fromOffset(60, 20),
+			Font = Enum.Font.GothamBold,
+			TextSize = 10,
+			TextColor3 = TH.TXT,
+			BorderSizePixel = 0,
+			AutoButtonColor = false,
+			Text = "ON",
+		}, head)
+		corner(pill, 99)
+		local minBtn = make("TextButton", {
+			Position = UDim2.new(1, -26, 0, 8),
+			Size = UDim2.fromOffset(18, 18),
+			BackgroundColor3 = TH.CARD,
+			BorderSizePixel = 0,
+			AutoButtonColor = false,
+			Font = Enum.Font.GothamBold,
+			TextSize = 12,
+			TextColor3 = TH.DIM,
+			Text = "-",
+		}, head)
+		corner(minBtn, 6)
+		pill.Activated:Connect(function()
+			setEnabled(not CFG.Enabled)
+			UI.refresh()
+		end)
+		minBtn.Activated:Connect(function()
+			UI.togglePanel()
+		end)
+
+		local hDrag, hStart, hOrigin = false, nil, nil
+		head.InputBegan:Connect(function(input)
+			local t = input.UserInputType
+			if t == Enum.UserInputType.MouseButton1 or t == Enum.UserInputType.Touch then
+				hDrag, hStart, hOrigin = true, input.Position, root.Position
+			end
+		end)
+		table.insert(
+			connections,
+			UserInputService.InputChanged:Connect(function(input)
+				if not hDrag then
+					return
+				end
+				local t = input.UserInputType
+				if t == Enum.UserInputType.MouseMovement or t == Enum.UserInputType.Touch then
+					local d = input.Position - hStart
+					root.Position =
+						UDim2.new(hOrigin.X.Scale, hOrigin.X.Offset + d.X, hOrigin.Y.Scale, hOrigin.Y.Offset + d.Y)
+				end
+			end)
+		)
+		table.insert(
+			connections,
+			UserInputService.InputEnded:Connect(function(input)
+				local t = input.UserInputType
+				if t == Enum.UserInputType.MouseButton1 or t == Enum.UserInputType.Touch then
+					hDrag = false
+				end
+			end)
+		)
+
+		-- tab
+		local TAB_NAMES = { "Live", "Timing", "Log", "Setup" }
+		local TAB_W = math.floor((PW - 16 - 3 * 4) / 4)
+		local tabBtns, bodies = {}, {}
+		local activeTab = 1
+		local content = make("Frame", {
+			Position = UDim2.fromOffset(0, BODY_Y),
+			Size = UDim2.new(1, 0, 0, BODY_H),
+			BackgroundTransparency = 1,
+		}, panel)
+		for k, name in ipairs(TAB_NAMES) do
+			local b = make("TextButton", {
+				Position = UDim2.fromOffset(8 + (k - 1) * (TAB_W + 4), TAB_Y),
+				Size = UDim2.fromOffset(TAB_W, 22),
+				BackgroundColor3 = TH.CARD,
+				BorderSizePixel = 0,
+				AutoButtonColor = false,
+				Font = Enum.Font.GothamMedium,
+				TextSize = 11,
+				TextColor3 = TH.DIM,
+				Text = name,
+			}, panel)
+			corner(b, 7)
+			tabBtns[k] = b
+			bodies[k] = make("Frame", {
+				Size = UDim2.fromScale(1, 1),
+				BackgroundTransparency = 1,
+				Visible = false,
+			}, content)
+		end
+
+		local function selectTab(i)
+			activeTab = i
+			for k, b in ipairs(tabBtns) do
+				b.BackgroundColor3 = (k == i) and TH.ACC or TH.CARD
+				b.TextColor3 = (k == i) and TH.TXT or TH.DIM
+				bodies[k].Visible = (k == i)
+			end
+			UI.refresh()
+		end
+		for k, b in ipairs(tabBtns) do
+			b.Activated:Connect(function()
+				selectTab(k)
+			end)
+		end
+
+		local function smallBtn(parent, x, y, w, text, cb)
+			local b = make("TextButton", {
+				Position = UDim2.fromOffset(x, y),
+				Size = UDim2.fromOffset(w, 22),
+				BackgroundColor3 = TH.CARD,
+				BorderSizePixel = 0,
+				AutoButtonColor = false,
+				Font = Enum.Font.GothamMedium,
+				TextSize = 10,
+				TextColor3 = TH.TXT,
+				Text = text,
+			}, parent)
+			corner(b, 7)
+			b.Activated:Connect(cb)
+			return b
+		end
+
+		-- ===== TAB LIVE =====
+		local live = bodies[1]
+		local CARD_DEFS = {
+			{ "Parry", "parried", TH.OK },
+			{ "Block", "blocked", TH.ACC },
+			{ "Dodge", "dodged", TH.ACC },
+			{ "Kena", "hit", TH.BAD },
+			{ "GB", "guardbroken", TH.BAD },
+		}
+		local CARD_W = math.floor((PW - 20 - 4 * 5) / 5)
+		local cardRefs = {}
+		for i, d in ipairs(CARD_DEFS) do
+			local f = make("Frame", {
+				Position = UDim2.fromOffset(10 + (i - 1) * (CARD_W + 5), 4),
+				Size = UDim2.fromOffset(CARD_W, 40),
+				BackgroundColor3 = TH.CARD,
+				BorderSizePixel = 0,
+			}, live)
+			corner(f, 8)
+			local num = make("TextLabel", {
+				BackgroundTransparency = 1,
+				Position = UDim2.fromOffset(0, 3),
+				Size = UDim2.new(1, 0, 0, 20),
+				Font = Enum.Font.GothamBold,
+				TextSize = 16,
+				TextColor3 = d[3],
+				Text = "0",
+			}, f)
+			make("TextLabel", {
+				BackgroundTransparency = 1,
+				Position = UDim2.fromOffset(0, 22),
+				Size = UDim2.new(1, 0, 0, 14),
+				Font = Enum.Font.Gotham,
+				TextSize = 9,
+				TextColor3 = TH.DIM,
+				Text = d[1],
+			}, f)
+			cardRefs[i] = { label = num, key = d[2] }
+		end
+
+		local safeLbl = make("TextLabel", {
+			BackgroundTransparency = 1,
+			Position = UDim2.fromOffset(12, 50),
+			Size = UDim2.new(1, -24, 0, 14),
+			Font = Enum.Font.GothamMedium,
+			TextSize = 11,
+			TextColor3 = TH.TXT,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			Text = "Aman 0%",
+		}, live)
+		local safeBg = make("Frame", {
+			Position = UDim2.fromOffset(12, 66),
+			Size = UDim2.new(1, -24, 0, 6),
+			BackgroundColor3 = TH.LINE,
+			BorderSizePixel = 0,
+		}, live)
+		corner(safeBg, 3)
+		local safeFill = make("Frame", {
+			Size = UDim2.fromScale(0, 1),
+			BackgroundColor3 = TH.OK,
+			BorderSizePixel = 0,
+		}, safeBg)
+		corner(safeFill, 3)
+
+		local pingSpark = makeSpark(live, 84, "Ping")
+		local fpsSpark = makeSpark(live, 138, "Frame")
+		local evLbl = make("TextLabel", {
+			BackgroundTransparency = 1,
+			Position = UDim2.fromOffset(12, 194),
+			Size = UDim2.new(1, -24, 0, 14),
+			Font = Enum.Font.GothamMedium,
+			TextSize = 10,
+			TextColor3 = TH.TXT,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			TextTruncate = Enum.TextTruncate.AtEnd,
+			Text = "-",
+		}, live)
+		local skipLbl = make("TextLabel", {
+			BackgroundTransparency = 1,
+			Position = UDim2.fromOffset(12, 210),
+			Size = UDim2.new(1, -24, 0, 12),
+			Font = Enum.Font.Gotham,
+			TextSize = 9,
+			TextColor3 = TH.DIM,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			TextTruncate = Enum.TextTruncate.AtEnd,
+			Text = "-",
+		}, live)
+
+		local function liveUpdate()
+			local c = counters
+			for _, r in ipairs(cardRefs) do
+				setText(r.label, tostring(c[r.key] or 0))
+			end
+			local tot = c.parried + c.blocked + c.guardbroken + c.hit
+			local safeTot = tot + c.dodged
+			local safe = c.parried + c.blocked + c.dodged
+			local rate = safeTot > 0 and safe / safeTot or 0
+			local prate = tot > 0 and c.parried / tot or 0
+			setText(
+				safeLbl,
+				("Aman %d%%   ·   parry %d%% dari %d hit"):format(
+					math.floor(rate * 100 + 0.5),
+					math.floor(prate * 100 + 0.5),
+					tot
+				)
+			)
+			safeFill.Size = UDim2.fromScale(math.clamp(rate, 0, 1), 1)
+			setText(
+				pingSpark.title,
+				("Ping  %d ms   ·   jitter ±%d"):format(math.floor(net.rtt * 1000 + 0.5), math.floor(net.var * 1000 + 0.5))
+			)
+			setText(
+				fpsSpark.title,
+				("Frame  %d fps   ·   p90 %d ms"):format(
+					math.floor(frame.fps + 0.5),
+					math.floor(frame.p90 * 1000 + 0.5)
+				)
+			)
+			pingSpark.set(sampRtt, function(v)
+				return v / 0.3
+			end, function(v)
+				if v < 0.12 then
+					return TH.OK
+				elseif v < 0.2 then
+					return TH.WARN
+				end
+				return TH.BAD
+			end)
+			fpsSpark.set(sampFps, function(v)
+				return v / 144
+			end, function(v)
+				if v >= 55 then
+					return TH.OK
+				elseif v >= 30 then
+					return TH.WARN
+				end
+				return TH.BAD
+			end)
+			setText(evLbl, EV.last)
+			setText(skipLbl, skipText())
+		end
+
+		-- ===== TAB TIMING =====
+		local timing = bodies[2]
+		local sliderPaints = {}
+		local function makeSlider(y, def)
+			make("TextLabel", {
+				BackgroundTransparency = 1,
+				Position = UDim2.fromOffset(12, y),
+				Size = UDim2.new(1, -120, 0, 14),
+				Font = Enum.Font.GothamMedium,
+				TextSize = 11,
+				TextColor3 = TH.TXT,
+				TextXAlignment = Enum.TextXAlignment.Left,
+				Text = def.label,
+			}, timing)
+			local val = make("TextLabel", {
+				BackgroundTransparency = 1,
+				Position = UDim2.new(1, -108, 0, y),
+				Size = UDim2.fromOffset(96, 14),
+				Font = Enum.Font.Code,
+				TextSize = 11,
+				TextColor3 = TH.ACC,
+				TextXAlignment = Enum.TextXAlignment.Right,
+				Text = "",
+			}, timing)
+			local track = make("Frame", {
+				Position = UDim2.fromOffset(12, y + 18),
+				Size = UDim2.new(1, -24, 0, 6),
+				BackgroundColor3 = TH.LINE,
+				BorderSizePixel = 0,
+			}, timing)
+			corner(track, 3)
+			local fill = make("Frame", {
+				Size = UDim2.fromScale(0, 1),
+				BackgroundColor3 = TH.ACC,
+				BorderSizePixel = 0,
+			}, track)
+			corner(fill, 3)
+			local knob = make("Frame", {
+				AnchorPoint = Vector2.new(0.5, 0.5),
+				Position = UDim2.fromScale(0, 0.5),
+				Size = UDim2.fromOffset(12, 12),
+				BackgroundColor3 = TH.TXT,
+				BorderSizePixel = 0,
+			}, track)
+			corner(knob, 6)
+			local hit = make("TextButton", {
+				BackgroundTransparency = 1,
+				Text = "",
+				AutoButtonColor = false,
+				Position = UDim2.fromOffset(0, -8),
+				Size = UDim2.new(1, 0, 0, 22),
+			}, track)
+
+			local function paint()
+				local v = CFG[def.key]
+				if type(v) ~= "number" then
+					v = def.min
+				end
+				local a = math.clamp((v - def.min) / (def.max - def.min), 0, 1)
+				fill.Size = UDim2.fromScale(a, 1)
+				knob.Position = UDim2.fromScale(a, 0.5)
+				if def.unit == "ms" then
+					setText(val, ("%d ms"):format(math.floor(v * 1000 + 0.5)))
+				else
+					setText(val, ("%.1f st"):format(v))
+				end
+			end
+
+			local dragging = false
+			local function setFrom(x)
+				local rel = math.clamp((x - track.AbsolutePosition.X) / math.max(track.AbsoluteSize.X, 1), 0, 1)
+				local v = def.min + rel * (def.max - def.min)
+				v = math.floor(v / def.step + 0.5) * def.step
+				CFG[def.key] = math.clamp(v, def.min, def.max)
+				paint()
+			end
+			hit.InputBegan:Connect(function(input)
+				local t = input.UserInputType
+				if t == Enum.UserInputType.MouseButton1 or t == Enum.UserInputType.Touch then
+					dragging = true
+					setFrom(input.Position.X)
+				end
+			end)
+			table.insert(
+				connections,
+				UserInputService.InputChanged:Connect(function(input)
+					if not dragging then
+						return
+					end
+					local t = input.UserInputType
+					if t == Enum.UserInputType.MouseMovement or t == Enum.UserInputType.Touch then
+						setFrom(input.Position.X)
+					end
+				end)
+			)
+			table.insert(
+				connections,
+				UserInputService.InputEnded:Connect(function(input)
+					local t = input.UserInputType
+					if t == Enum.UserInputType.MouseButton1 or t == Enum.UserInputType.Touch then
+						dragging = false
+					end
+				end)
+			)
+			sliderPaints[#sliderPaints + 1] = paint
+			paint()
+		end
+		for i, def in ipairs(SLIDERS) do
+			makeSlider(6 + (i - 1) * 30, def)
+		end
+
+		local tuneLbl = make("TextLabel", {
+			BackgroundTransparency = 1,
+			Position = UDim2.fromOffset(12, 194),
+			Size = UDim2.new(1, -24, 0, 14),
+			Font = Enum.Font.Code,
+			TextSize = 10,
+			TextColor3 = TH.DIM,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			Text = "",
+		}, timing)
+		smallBtn(timing, 12, 212, 118, "Reset tune", function()
+			resetTune()
+			UI.refresh()
+		end)
+		smallBtn(timing, 138, 212, 118, "Default timing", function()
+			for key, v in pairs(DEFAULTS) do
+				CFG[key] = v
+			end
+			EV.push("timing dikembalikan ke default")
+			UI.refresh()
+		end)
+
+		local function timingUpdate()
+			setText(tuneLbl, ("tune M1 %+.3f · M2 %+.3f · slack %.2f"):format(tune.M1, tune.M2, stunSlack))
+		end
+
+		-- ===== TAB LOG =====
+		local logBody = bodies[3]
+		local logLbl = make("TextLabel", {
+			BackgroundColor3 = TH.CARD,
+			BorderSizePixel = 0,
+			Position = UDim2.fromOffset(10, 6),
+			Size = UDim2.new(1, -20, 0, 180),
+			Font = Enum.Font.Code,
+			TextSize = 10,
+			TextColor3 = TH.TXT,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			TextYAlignment = Enum.TextYAlignment.Top,
+			TextWrapped = true,
+			Text = "",
+		}, logBody)
+		corner(logLbl, 8)
+		make("UIPadding", {
+			PaddingLeft = UDim.new(0, 8),
+			PaddingRight = UDim.new(0, 6),
+			PaddingTop = UDim.new(0, 6),
+		}, logLbl)
+		smallBtn(logBody, 10, 194, 80, "Ringkasan", function()
+			report()
+		end)
+		smallBtn(logBody, 94, 194, 80, "Why hit", function()
+			whyReport()
+		end)
+		smallBtn(logBody, 178, 194, 80, "Bersihkan", function()
+			table.clear(EV.feed)
+			EV.push("log dibersihkan")
+		end)
+
+		local function logUpdate()
+			local out = {}
+			for i = 1, #EV.feed do
+				out[i] = EV.feed[i]
+			end
+			setText(logLbl, #out > 0 and table.concat(out, "\n") or "belum ada event")
+		end
+
+		-- ===== TAB SETUP =====
+		local setup = bodies[4]
+		local togglePaints = {}
+		local COL_W = math.floor((PW - 20 - 6) / 2)
+		for i, d in ipairs(TOGGLES) do
+			local col, row = (i - 1) % 2, math.floor((i - 1) / 2)
+			local label, key = d[1], d[2]
+			local b = make("TextButton", {
+				Position = UDim2.fromOffset(10 + col * (COL_W + 6), 6 + row * 26),
+				Size = UDim2.fromOffset(COL_W, 22),
+				BorderSizePixel = 0,
+				AutoButtonColor = false,
+				Font = Enum.Font.GothamMedium,
+				TextSize = 10,
+				TextColor3 = TH.TXT,
+				Text = "",
+			}, setup)
+			corner(b, 7)
+			local function paint()
+				local on = CFG[key] and true or false
+				setText(b, (on and "●  " or "○  ") .. label)
+				b.BackgroundColor3 = on and TH.OK or TH.CARD
+			end
+			b.Activated:Connect(function()
+				if key == "Enabled" then
+					setEnabled(not CFG.Enabled)
+				else
+					CFG[key] = not CFG[key]
+				end
+				UI.refresh()
+			end)
+			togglePaints[#togglePaints + 1] = paint
+			paint()
+		end
+		smallBtn(setup, 10, 170, COL_W, "Reset stat", function()
+			resetStats()
+			UI.refresh()
+		end)
+		make("TextLabel", {
+			BackgroundTransparency = 1,
+			Position = UDim2.fromOffset(12, 200),
+			Size = UDim2.new(1, -24, 0, 24),
+			Font = Enum.Font.Gotham,
+			TextSize = 9,
+			TextColor3 = TH.DIM,
+			TextWrapped = true,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			TextYAlignment = Enum.TextYAlignment.Top,
+			Text = "P = on/off · RShift = sembunyiin · geser header = pindah panel",
+		}, setup)
+
+		-- ===== REFRESH / STATUS =====
+		local function syncHead()
+			local col = CFG.Enabled and TH.OK or TH.BAD
+			btn.BackgroundColor3 = col
+			pill.BackgroundColor3 = col
+			setText(pill, CFG.Enabled and "ON" or "OFF")
+		end
+
+		local function updateVisible()
+			if activeTab == 1 then
+				liveUpdate()
+			elseif activeTab == 2 then
+				timingUpdate()
+			elseif activeTab == 3 then
+				logUpdate()
+			end
+		end
+
+		UI.refresh = function()
+			for _, p in ipairs(sliderPaints) do
+				p()
+			end
+			for _, p in ipairs(togglePaints) do
+				p()
+			end
+			syncHead()
+			if panel.Visible then
+				updateVisible()
+			end
+		end
+
+		UI.togglePanel = function()
+			local open = not panel.Visible
+			if open then
+				local vs, ap = gui.AbsoluteSize, root.AbsolutePosition
+				local x = (ap.X + PW > vs.X - 4) and (SIZE - PW) or 0
+				local y = (ap.Y + SIZE + 6 + PH > vs.Y - 4) and -(PH + 6) or (SIZE + 6)
+				panel.Position = UDim2.fromOffset(x, y)
+				panel.Visible = true
+				UI.refresh()
+			else
+				panel.Visible = false
+			end
+		end
+		UI.setVisible = function()
+			gui.Enabled = not gui.Enabled
+		end
+
+		-- tombol bulat: geser = pindah, tap = buka/tutup panel
+		local dragging, moved, dragStart, startPos = false, false, nil, nil
+		btn.InputBegan:Connect(function(input)
+			local t = input.UserInputType
+			if t ~= Enum.UserInputType.MouseButton1 and t ~= Enum.UserInputType.Touch then
 				return
 			end
-			local tt = i.UserInputType
-			if tt == Enum.UserInputType.MouseMovement or tt == Enum.UserInputType.Touch then
-				local d = i.Position - dragStart
-				if not moved and d.Magnitude > 6 then
-					moved = true
-				end
-				if moved then
-					root.Position =
-						UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
-				end
+			dragging, moved = true, false
+			dragStart, startPos = input.Position, root.Position
+			if UI.dragConn then
+				UI.dragConn:Disconnect()
 			end
-		end)
-		input.Changed:Connect(function()
-			if input.UserInputState == Enum.UserInputState.End then
-				dragging = false
-				if UI.dragConn then
-					UI.dragConn:Disconnect()
-					UI.dragConn = nil
+			UI.dragConn = UserInputService.InputChanged:Connect(function(i)
+				if not dragging then
+					return
 				end
-				if not moved then
-					UI.togglePanel()
+				local tt = i.UserInputType
+				if tt == Enum.UserInputType.MouseMovement or tt == Enum.UserInputType.Touch then
+					local d = i.Position - dragStart
+					if not moved and d.Magnitude > 6 then
+						moved = true
+					end
+					if moved then
+						root.Position =
+							UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+					end
 				end
-			end
-		end)
-	end)
-
-	local lastStats, lastOn = "", nil
-	UI.refresh = function()
-		for _, p in ipairs(paints) do
-			p()
-		end
-		local on = CFG.Enabled and true or false
-		if on ~= lastOn then
-			lastOn = on
-			btn.BackgroundColor3 = on and GREEN or RED
-		end
-		if panel.Visible then
-			local s = statsText()
-			if s ~= lastStats then
-				lastStats = s
-				stats.Text = s
-			end
-		end
-	end
-	UI.togglePanel = function()
-		local open = not panel.Visible
-		if open then
-			-- panel nggak boleh keluar layar
-			local vs, ap = gui.AbsoluteSize, root.AbsolutePosition
-			local x = (ap.X + PW > vs.X - 4) and (SIZE - PW) or 0
-			local y = (ap.Y + SIZE + 6 + PH > vs.Y - 4) and -(PH + 6) or (SIZE + 6)
-			panel.Position = UDim2.fromOffset(x, y)
-			UI.refresh()
-		end
-		panel.Visible = open
-	end
-	UI.setVisible = function()
-		gui.Enabled = not gui.Enabled
-	end
-	UI.refresh()
-
-	-- panel tutup = nol update. Kebuka = 2x per detik, itu pun cuma kalau teksnya berubah
-	task.spawn(function()
-		while alive and gui.Parent do
-			task.wait(0.5)
-			if gui.Enabled and (panel.Visible or (CFG.Enabled and true or false) ~= lastOn) then
-				pcall(UI.refresh)
-			end
-		end
-	end)
-end
-
-genv.__NyxAutoParry = {
-	CFG = CFG,
-	Counters = counters,
-	Skips = skips,
-	Net = net,
-	Frame = frame,
-	Report = report,
-	Why = whyReport,
-	Reset = resetStats,
-	UI = UI,
-	Stop = function()
-		alive = false
-		pcall(uninstallSwingHook)
-		if blockHeld then
-			pcall(sendBlock, false)
-			blockHeld = false
-		end
-		for _, c in ipairs(connections) do
-			c:Disconnect()
-		end
-		table.clear(queue)
-		if UI.dragConn then
-			UI.dragConn:Disconnect()
-			UI.dragConn = nil
-		end
-		if UI.gui then
-			pcall(function()
-				UI.gui:Destroy()
 			end)
-			UI.gui = nil
-		end
-	end,
-}
+			input.Changed:Connect(function()
+				if input.UserInputState == Enum.UserInputState.End then
+					dragging = false
+					if UI.dragConn then
+						UI.dragConn:Disconnect()
+						UI.dragConn = nil
+					end
+					if not moved then
+						UI.togglePanel()
+					end
+				end
+			end)
+		end)
 
-task.spawn(loadSpecs)
-task.spawn(function()
-	for _ = 1, 60 do
-		if not alive or installSwingHook() then
-			return
-		end
-		task.wait(0.5)
+		selectTab(1)
+
+		-- panel tutup = nol update. Kebuka = 4x per detik (grafik + teks), tombol bulat ikut warna ON/OFF
+		task.spawn(function()
+			while alive and gui.Parent do
+				task.wait(0.25)
+				if gui.Enabled then
+					if panel.Visible then
+						pushSpark(sampRtt, net.rtt)
+						pushSpark(sampFps, frame.fps)
+						pcall(updateVisible)
+					end
+					pcall(syncHead)
+				end
+			end
+		end)
 	end
-end)
 
-if CFG.UI then
+	genv.__NyxAutoParry = {
+		CFG = CFG,
+		Counters = counters,
+		Skips = skips,
+		Net = net,
+		Frame = frame,
+		Report = report,
+		Why = whyReport,
+		Reset = resetStats,
+		UI = UI,
+		Stop = function()
+			alive = false
+			pcall(uninstallSwingHook)
+			if blockHeld then
+				pcall(sendBlock, false)
+				blockHeld = false
+			end
+			for _, c in ipairs(connections) do
+				c:Disconnect()
+			end
+			table.clear(queue)
+			if UI.dragConn then
+				UI.dragConn:Disconnect()
+				UI.dragConn = nil
+			end
+			if UI.gui then
+				pcall(function()
+					UI.gui:Destroy()
+				end)
+				UI.gui = nil
+			end
+		end,
+	}
+
+	task.spawn(loadSpecs)
 	task.spawn(function()
-		local okUI, errUI = pcall(buildUI)
-		if not okUI then
-			print("[AutoParry] UI gagal dibuat:", errUI)
+		for _ = 1, 60 do
+			if not alive or installSwingHook() then
+				return
+			end
+			task.wait(0.5)
 		end
 	end)
-end
 
-notify("v8.0 loaded - tekan " .. CFG.ToggleKey.Name .. " buat toggle")
-log("loaded v8.0. toggle:", CFG.ToggleKey.Name, "| panel:", CFG.UIKey.Name, "| getgenv().__NyxAutoParry.Report() buat ringkasan")
+	if CFG.UI then
+		task.spawn(function()
+			local okUI, errUI = pcall(buildUI)
+			if not okUI then
+				print("[AutoParry] UI gagal dibuat:", errUI)
+			end
+		end)
+	end
+
+	notify("v9.0 loaded - tekan " .. CFG.ToggleKey.Name .. " buat toggle")
+	log("loaded v9.0. toggle:", CFG.ToggleKey.Name, "| panel:", CFG.UIKey.Name, "| getgenv().__NyxAutoParry.Report() buat ringkasan")
+end
