@@ -146,6 +146,35 @@
 ]]
 
 --[[
+	v11.5 = v11.4 + (abis kena 1 hit langsung guard/parry, attacker yang ngebut/muter/dash, anti-lag UI)
+	  HITGUARD : abis KENA hit (stun), Block ON dikirim TEPAT pas stun lepas (bukan nunggu waktu hit lanjutan yang ditebak). Hit lanjutan
+	             yang mendarat 0.05-0.3s abis unlock = kena window parry (umur block 0..0.25s), yang lebih telat tetap ke-block (0 damage).
+	             Dicoba ulang (rearm) sampai kunci beneran kebuka, jadi hit counter yang nambah stun nggak bikin guard nyerah.
+	             Kalau hit lanjutan diperkirakan masih jauh abis unlock (> HitGuardEarly), guard jadi jaring pengaman: dikirim supaya umur
+	             block ~0.2s pas hit tebakan mendarat (rencana M1r tetap yang utama; guard cuma nutup kalau M1r gagal).
+	  GAPLEARN : interval hit->hit combo (Endlag+Windup) dipelajari per attacker. Dump: prediksi M1r meleset ~0.14s (hit mendarat lebih
+	             awal dari tebakan -> block belum nyala = kena). Koreksi sisa (di luar leadCorr) dipakai buat rencana berikutnya.
+	             ReflexAge: rencana refleks target umur block-nya digeser lebih awal (toleransi hit yang datang lebih cepat dari tebakan).
+	  MOBILE   : attacker yang lagi ngebut (dash kanan-kiri) atau muter cepat tetap dianggap ancaman (parry/block, bukan "range")
+	             sampai MobileRange stud. Cek hitbox dari posisi/hadap sekarang nggak bisa dipercaya pas dia lagi gerak.
+	  RETRY    : retry abis block ditolak boleh dicoba walau hit yang ditunggu tinggal 0.04s lagi (dulu minimal 0.15s -> hit lolos).
+	  ANTILAG  : refresh UI di-pause selama ada attacker aktif di deket lu (CombatUIPause) -> nggak ada update teks / grafik / simpan
+	             config pas lagi tarung. CPU script sendiri cuma ~46us/frame; hitch UI (layout teks, sparkline) yang dihindarin.
+]]
+--[[
+	v11.4 = v11.3 + (dari live dump: abis LU ke-parry masih sering kena, M2 hampir selalu di-dodge)
+	  GUARD  : ParriedGuard sekarang di-REARM. Dulu cuma 3x coba tiap 0.03s lalu nyerah, padahal abis ke-parry lu kena stun parry 0.75s
+	           dan hit counter musuh yang mendarat di dalam stun nambah stun hit (+0.5s) -> kunci geser, guard keburu nyerah. Sekarang dicoba
+	           lagi tepat pas kunci beneran kebuka (sampai ParriedGuardWindow), dan kalau server nolak (BlockRefused) otomatis dijadwal ulang.
+	           Token guard dipisah dari planToken, jadi swing/plan musuh nggak lagi ngebatalin guard ini diam-diam.
+	  M2     : (1) "parry M2 miss" cuma dihitung kalau parry-nya beneran dikirim (dulu dodge yang gagal ikut dihitung -> M2 attacker itu
+	           di-dodge terus, padahal dodge cd 2.25s), butuh M2MissNeed miss berturut-turut + memori 12s. (2) dodge M2 nggak dibatalin
+	           recheck kalau attacker masih dalam DodgeRecheckDist. (3) switch parry->dodge lebih ketat (DodgeMinConf 0.70, gap 0.25).
+	           (4) telegraf M2 dari attacker yang madep ke lu sampai M2CloseAlways stud tetap dianggap ancaman -> parry (bukan "range").
+	  DIAG   : skip "locked" dipecah per sumber: locked/cd, locked/stun, locked/ke-parry, locked/dodge, locked/busy, locked/game
+	           (kelihatan di baris SKIP dump + di "alasan:" tiap hit). Ini yang nentuin apa yang ngunci block pas hit lolos.
+]]
+--[[
 	v11.3 = v11.2 + LIVE di UI: tab Log punya kartu status live (block, tunggu, parry-cd, dodge, rtt, fps, kena terakhir, event terakhir;
 	  update ~4x/detik) dan tombol "Salin semua (live dump)" = ringkasan + status + semua hit yang lolos (+ alasan, style, jarak, event) +
 	  semua event + hitungan skip, satu klik ke clipboard (kalau clipboard nggak ada, dicetak ke console).
@@ -276,8 +305,8 @@ local CFG = {
 	UI = true, -- panel kecil di layar (header = geser, "-" = minimize)
 	UIKey = Enum.KeyCode.RightShift, -- sembunyiin / munculin panel
 	SmartMode = true, -- pilih parry vs dodge pakai peluang sukses + geser target umur block sesuai noise
-	DodgeMinConf = 0.55, -- dodge dipilih duluan kalau peluangnya >= ini DAN lebih tinggi dari parry (selisih DodgeSwitchGap)
-	DodgeSwitchGap = 0.12,
+	DodgeMinConf = 0.70, -- dodge dipilih duluan kalau peluangnya >= ini DAN lebih tinggi dari parry (selisih DodgeSwitchGap) [v11.4: 0.55 -> 0.70, parry-first]
+	DodgeSwitchGap = 0.25, -- [v11.4: 0.12 -> 0.25]
 	CloseAlways = 11, -- stud: attacker sedeket ini tetap dianggap ancaman buat BLOCK/PARRY (dodge tetap butuh ancaman pasti)
 	AttackerVelPredict = true, -- ikut hitung gerak attacker selama windup (maju / lunge)
 	MaxTrackDist = 60, -- swing dari attacker lebih jauh dari ini diabaikan (hemat CPU)
@@ -325,7 +354,7 @@ local CFG = {
 	TuneByAttacker = true, -- tune cuma belajar dari block yang dikirim buat attacker yang barusan ngenain lu
 	SpikeGuard = true, -- hitch frame (>2.5x rata-rata) dipotong sebelum masuk ke rata-rata frame time
 	FramePump3 = true, -- antrean dicek juga di PreSimulation (selain PreRender + Heartbeat)
-	M2MissMemory = 25, -- detik: "parry M2 dari attacker ini miss" dilupain setelah segini
+	M2MissMemory = 12, -- detik: "parry M2 dari attacker ini miss" dilupain setelah segini [v11.4: 25 -> 12]
 	Accent = 1, -- warna aksen UI (1..4)
 	UIScale = 1,
 	Toasts = true,
@@ -357,6 +386,30 @@ local CFG = {
 	ParriedGuardRange = 14, -- stud: musuh yang ngeparry lu harus sedeket ini
 	M2Recheck = true, -- v11.2: M2 yang kena skip "range" dicek ulang di tengah windup (attacker bisa nutup jarak)
 	M2RecheckSafety = 0.08, -- detik sisa lead minimal di luar (umur block + rtt + frame) biar recheck masih sempat parry/dodge
+
+	-- ===== v11.4 =====
+	MigratedTo = 0, -- penanda migrasi default config lama (jangan diubah)
+	ParriedGuardRearm = true, -- abis LU ke-parry: guard dicoba ulang tepat pas kunci (stun parry + stun hit) kebuka, bukan nyerah setelah 3x
+	ParriedGuardWindow = 1.8, -- detik sejak ke-parry guard masih boleh dicoba ulang
+	M2MissNeed = 2, -- parry M2 yang BENERAN dikirim harus miss segini kali berturut-turut sebelum M2 attacker itu di-dodge duluan
+	DodgeRecheckDist = 22, -- stud: recheck dodge M2 cuma batalin kalau attacker udah sejauh ini (dulu: cek hitbox sempit -> M2 lolos tanpa apa-apa)
+	M2CloseAlways = 20, -- stud: telegraf M2 dari attacker yang MADEP ke lu dan sedeket ini tetap dianggap ancaman (parry, bukan skip "range")
+
+	-- ===== v11.5 =====
+	HitGuard = true, -- abis KENA hit: Block ON tepat pas stun lepas (parry kalau hit lanjutan mendarat di window, kalau nggak ke-block)
+	HitGuardM2 = true, -- guard yang sama abis kena M2 / guard break
+	HitGuardHold = 0.55, -- detik block ditahan abis guard (diperpanjang chain kalau ada hit / parry)
+	HitGuardRange = 14, -- stud: attacker harus sedeket ini
+	HitGuardWindow = 1.0, -- detik sejak unlock guard masih boleh dicoba ulang
+	HitGuardEarly = 0.30, -- hit lanjutan diperkirakan mendarat <= segini abis unlock: guard langsung pas unlock; lebih jauh: guard jadi jaring pengaman M1r
+	GapLearn = true, -- belajar interval hit->hit combo per attacker (koreksi tebakan M1r)
+	ReflexAge = 0.16, -- umur block target buat rencana M1r (lebih awal dari TargetAgeM1 = toleransi hit yang datang lebih cepat dari tebakan)
+	MobileThreat = true, -- attacker ngebut / muter cepat tetap ancaman walau hitbox dari posisi sekarang meleset
+	MobileSpeed = 16, -- stud/detik kecepatan datar attacker
+	MobileSpin = 4, -- rad/detik putaran attacker
+	MobileRange = 15, -- stud
+	RetryNear = 0.04, -- retry abis block ditolak boleh kalau hit yang ditunggu masih > segini detik lagi
+	CombatUIPause = true, -- UI nggak di-refresh / config nggak disimpan selama ada attacker aktif di deket lu (anti hitch)
 }
 
 ----------------------------------------------------------------------
@@ -479,6 +532,7 @@ local counters = {
 	recheck = 0,
 	barrage = 0,
 	behind = 0,
+	hitguard = 0,
 }
 local skips = {}
 local lastSkip = { reason = "-", at = -math.huge }
@@ -536,6 +590,13 @@ local function skip(reason)
 	skips[reason] = (skips[reason] or 0) + 1
 	lastSkip.reason = reason
 	lastSkip.at = os.clock()
+	lastSkip.src = nil
+	-- v11.4: "locked" dipecah per sumber kunci (cd / stun / ke-parry / dodge / busy / game) biar kelihatan apa yang beneran ngunci block
+	if reason == "locked" and SK.lockWhy then
+		lastSkip.src = SK.lockWhy
+		local k = "locked/" .. SK.lockWhy
+		skips[k] = (skips[k] or 0) + 1
+	end
 	if CFG.LogEvents and SKIP_LOG[reason] then
 		pushEv("skip", "skip: " .. reason)
 	end
@@ -1526,6 +1587,27 @@ local function threatens(attacker, myHrp, plan, lead)
 	if CFG.CloseAlways > 0 and math.abs(d.Y) < 8 and dist <= CFG.CloseAlways * (plan.reach or 1) + boost then
 		return true, dist, false
 	end
+	-- v11.5: attacker lagi ngebut (dash kanan-kiri) atau muter cepat -> hitbox dari posisi/hadap sekarang nggak bisa dipercaya.
+	-- sure=false: yang dipilih parry/block (dodge tetap butuh ancaman pasti)
+	if CFG.MobileThreat and math.abs(d.Y) < 8 then
+		local av = ahrp.AssemblyLinearVelocity
+		local sp = math.sqrt(av.X * av.X + av.Z * av.Z)
+		local w = math.abs(ahrp.AssemblyAngularVelocity.Y)
+		if (sp >= CFG.MobileSpeed or w >= CFG.MobileSpin) and dist <= CFG.MobileRange * (plan.reach or 1) + boost then
+			return true, dist, false
+		end
+	end
+	-- v11.4: telegraf M2 dari attacker yang MADEP ke lu di jarak jauh (M2 Reaper 14-24 stud dulu kebaca "range" -> lolos tanpa rencana).
+	-- sure=false, jadi yang dipilih parry (dodge tetap butuh ancaman pasti)
+	if plan.kind == "M2" and CFG.M2CloseAlways > CFG.CloseAlways and math.abs(d.Y) < 8
+		and dist <= CFG.M2CloseAlways * (plan.reach or 1) + boost then
+		local look = ahrp.CFrame.LookVector
+		local lk = Vector3.new(look.X, 0, look.Z)
+		local flat = Vector3.new(d.X, 0, d.Z)
+		if lk.Magnitude > 0.01 and flat.Magnitude > 0.5 and lk.Unit:Dot(flat.Unit) > 0.35 then
+			return true, dist, false
+		end
+	end
 	return false, dist, false
 end
 
@@ -1768,12 +1850,17 @@ local function planDodge(attacker, plan, lead, now, rtt, fl, tag, why)
 		-- v5: cek ulang sebelum buang jatah dodge: attacker masih ngincer lu?
 		if CFG.SmartMode then
 			local c2, h2 = myState()
-			if c2 and h2 and not threatens(attacker, h2, plan, math.max(hitAt - os.clock(), 0)) then
-				counters.cancelled += 1
-				dodgePlannedUntil = 0
-				dodgeBlockUntil = 0
-				skip("dodge-recheck")
-				return
+			if c2 and h2 then
+				-- v11.4: batalin dodge cuma kalau attacker beneran udah jauh. Dulu cek hitbox sempit -> M2 yang tetap mendarat
+				-- (dump: "dodge-recheck" lalu KENA M2 Toji) lolos tanpa dodge DAN tanpa parry.
+				local okT, dT = threatens(attacker, h2, plan, math.max(hitAt - os.clock(), 0))
+				if not okT and dT > CFG.DodgeRecheckDist then
+					counters.cancelled += 1
+					dodgePlannedUntil = 0
+					dodgeBlockUntil = 0
+					skip("dodge-recheck")
+					return
+				end
 			end
 		end
 		if not fireDodge() then
@@ -1967,6 +2054,27 @@ local function lateFallback(plan, tag, lead, rtt, fl, bound, wait)
 	end
 end
 
+-- v11.4: sumber kunci block yang lagi paling nahan (buat dump: locked/cd, locked/ke-parry, locked/busy, dst)
+function SK.whyLock(now, earliest)
+	if earliest == readyAt then
+		return "cd" -- BlockCooldown abis Block OFF (block dilepas / ke-lepas)
+	elseif earliest == dodgeBlockUntil then
+		return "dodge"
+	elseif earliest == lockedUntil then
+		return (now - (SK.bpAt or -math.huge) < 1.0) and "ke-parry" or "stun"
+	end
+	local busy = false
+	local h = getHandler()
+	local L = h and h.Local
+	if type(L) == "table" and type(L.BusyUntil) == "number" then
+		local okS, sn = pcall(function()
+			return workspace:GetServerTimeNow()
+		end)
+		busy = okS and L.BusyUntil > sn + 0.02
+	end
+	return busy and "busy" or "game"
+end
+
 -- v10: sama persis kayak CombatHandler.FromBehind (server): penyerang di belakang lu = block lu dipecahin + damage penuh
 function SK.behind(attacker, hrp, angleDeg)
 	local ahrp = attacker:FindFirstChild("HumanoidRootPart")
@@ -2070,8 +2178,10 @@ local function react(attacker, plan, tag)
 	local reason = unparry and "unparryable" or (parryCd and "parrycd" or nil)
 
 	-- kapan paling cepat Block ON bisa diterima server
-	local earliest = math.max(readyAt, lockedUntil, dodgeBlockUntil, gameLock() or -math.huge)
+	local glk = gameLock()
+	local earliest = math.max(readyAt, lockedUntil, dodgeBlockUntil, glk or -math.huge)
 	local wait = earliest - now
+	SK.lockWhy = (wait > 0.005) and SK.whyLock(now, earliest) or nil
 	local function calc(targetAge, tn)
 		local s = lead - targetAge - rtt - fl + tn + (math.random() * 2 - 1) * CFG.Jitter
 		local b = false
@@ -2100,7 +2210,12 @@ local function react(attacker, plan, tag)
 				reason = "heldold"
 			end
 		else
-			sendIn, age, bound = calc(targetAgeFor(isM2), tune[plan.kind])
+			-- v11.5: rencana M1r itu tebakan -> target umur block digeser lebih awal (hit yang datang lebih cepat dari tebakan tetap ketutup)
+			local tAge = targetAgeFor(isM2)
+			if plan.reflex and plan.idx and not isM2 then
+				tAge = math.clamp(math.max(tAge, CFG.ReflexAge), 0.06, SR.ParryWindow - 0.07)
+			end
+			sendIn, age, bound = calc(tAge, tune[plan.kind])
 			if age >= -CFG.LateTolerance then
 				canParry, mode = true, "fresh"
 				parryConf = confWindow(age, SR.ParryWindow, sigma)
@@ -2115,7 +2230,7 @@ local function react(attacker, plan, tag)
 	------------------------------------------------------------------
 	if isM2 then
 		local dodgeFirst = CFG.DodgeFirstM2
-			or (CFG.DodgeAfterMiss and (m2Miss[attacker] or 0) > 0 and now - (m2MissAt[attacker] or -math.huge) < CFG.M2MissMemory)
+			or (CFG.DodgeAfterMiss and (m2Miss[attacker] or 0) >= CFG.M2MissNeed and now - (m2MissAt[attacker] or -math.huge) < CFG.M2MissMemory)
 		local dodgeWhy = "M2 dodge duluan"
 		-- v5: bandingin peluang sukses parry vs dodge, ambil yang lebih tinggi
 		if not dodgeFirst and canParry and CFG.SmartMode and CFG.DodgeEnabled and CFG.DodgeForM2 and sure then
@@ -2233,6 +2348,52 @@ local function predictFollowUp(attacker, plan, now)
 	}, "M1*")
 end
 
+-- v11.5: belajar interval hit->hit combo. rf = tebakan M1r terakhir per attacker, gapCorr = koreksi sisa per nama attacker.
+-- Dihitung dari DUA event Hit yang sama-sama kena delay jaringan, jadi selisihnya = interval asli di server (nggak kena ping).
+SK.rf = SK.rf or setmetatable({}, weak)
+SK.gapCorr = SK.gapCorr or {}
+
+function SK.gapLearn(attacker, now, kind)
+	local rf = SK.rf[attacker]
+	if not rf then
+		return
+	end
+	SK.rf[attacker] = nil
+	if kind ~= "M1" or not CFG.GapLearn then
+		return
+	end
+	local errTotal = (now - rf.t0) - rf.base
+	if math.abs(errTotal) > 0.4 then
+		return -- combo putus / hit ini bukan lanjutannya
+	end
+	-- leadCorr (belajar dari Sound->Hit) udah nanggung sebagian error; yang disimpan di sini cuma sisanya
+	local target = errTotal - corrFor(attacker, { key = rf.key, kind = "M1" })
+	local cur = SK.gapCorr[attacker.Name] or 0
+	SK.gapCorr[attacker.Name] = math.clamp(cur + (target - cur) * 0.4, -0.25, 0.25)
+end
+
+-- v11.5: perkiraan hit lanjutan combo dari event hit ini (detik dari sekarang). nil = nggak tau, false = swing terakhir combo
+function SK.predLead(attacker)
+	local style = styleOf(attacker)
+	local swings = style and style.M1 and style.M1.Swings
+	local st = combo[attacker]
+	if type(swings) ~= "table" or not st or type(st.idx) ~= "number" then
+		return nil
+	end
+	local spec, nxt = swings[st.idx], swings[st.idx + 1]
+	if type(spec) ~= "table" then
+		return nil
+	end
+	if type(nxt) ~= "table" then
+		return false
+	end
+	local k1 = timeScale(attacker, style, spec)
+	local k2 = timeScale(attacker, style, nxt)
+	local base = (spec.Endlag or 0.45) * k1 + (nxt.Windup or CFG.DefaultM1Lead) * k2
+	local key = attacker.Name .. ":" .. (st.idx + 1)
+	return base + (CFG.GapLearn and SK.gapCorr[attacker.Name] or 0) + corrFor(attacker, { key = key, kind = "M1" })
+end
+
 -- v8: M1 dari attacker barusan nyampe ke lu (kena / ke-block) -> hit combo berikutnya mendarat Endlag_i*k + Windup_(i+1)*k setelah
 -- hit itu (swing berikutnya mulai pas busy abis, sama kayak predictFollowUp). Bedanya: dihitung dari event HIT yang beneran nyampe
 -- dan dijalanin SETELAH stun/lock ke-update, jadi react nunda Block ON sampai kunci kebuka lalu kirim tepat waktu (parry kalau
@@ -2260,9 +2421,14 @@ local function hitReflex(attacker, now)
 	local k1 = timeScale(attacker, style, spec)
 	local k2 = timeScale(attacker, style, nxt)
 	counters.reflex += 1
+	-- v11.5: interval hit->hit yang dipelajari (koreksi sisa di luar leadCorr), dicatat buat belajar di hit berikutnya
+	local baseLead = (spec.Endlag or 0.45) * k1 + (nxt.Windup or CFG.DefaultM1Lead) * k2
+	if CFG.GapLearn then
+		SK.rf[attacker] = { t0 = now, base = baseLead, key = attacker.Name .. ":" .. (idx + 1) }
+	end
 	react(attacker, {
 		kind = "M1",
-		lead = (spec.Endlag or 0.45) * k1 + (nxt.Windup or CFG.DefaultM1Lead) * k2,
+		lead = baseLead + (CFG.GapLearn and SK.gapCorr[attacker.Name] or 0),
 		reach = reachOf(attacker, style),
 		spec = nxt,
 		height = nxt.Height or style.M1.Height,
@@ -2485,18 +2651,22 @@ function SK.parriedGuard(enemy, now, unlockAt)
 	if not (alive and CFG.Enabled and CFG.ParriedGuard and typeof(enemy) == "Instance") then
 		return
 	end
-	local tok = (planToken[enemy] or 0) + 1
-	planToken[enemy] = tok
+	-- v11.4: token sendiri. Dulu pakai planToken[enemy] -> swing musuh berikutnya (plan apa pun lewat scheduleBlock) ngebatalin guard ini diam-diam
+	SK.pgTok = (SK.pgTok or 0) + 1
+	local tok = SK.pgTok
+	local deadline = now + CFG.ParriedGuardWindow
 	local tries = 0
-	local function attempt()
-		if not alive or not CFG.Enabled or planToken[enemy] ~= tok then
+	local attempt
+	attempt = function()
+		if not alive or not CFG.Enabled or SK.pgTok ~= tok then
 			return
 		end
+		local t = os.clock()
 		if blockHeld then
-			extendHoldTo(os.clock() + CFG.ParriedGuardHold)
+			extendHoldTo(t + CFG.ParriedGuardHold)
 			return
 		end
-		if attackerGone(enemy) then
+		if t > deadline or attackerGone(enemy) then
 			return
 		end
 		local _, hrp = myState()
@@ -2508,12 +2678,98 @@ function SK.parriedGuard(enemy, now, unlockAt)
 			pressMode = "plain" -- waktunya ditentuin stun lepas, bukan lead swing -> jangan ikut ngegeser tune parry
 			blockFor = nil
 			evt("info", "guard pas stun lepas")
-		elseif tries < 3 then
+		elseif CFG.ParriedGuardRearm and tries < 40 then
+			-- v11.4: masih kekunci (hit counter musuh nambah stun, cooldown, busy) -> coba lagi TEPAT pas kunci kebuka, bukan 3x lalu nyerah
 			tries += 1
-			schedule(os.clock() + 0.03, attempt)
+			local gl = gameLock()
+			local at = math.max(lockedUntil, readyAt, dodgeBlockUntil, gl or -math.huge, t) + 0.012
+			schedule(math.max(at, t + 0.03) + frame.avg * CFG.FireEarly, attempt)
 		end
 	end
+	SK.pgRe = { tok = tok, key = "pgTok", deadline = deadline, attempt = attempt }
 	schedule(unlockAt + 0.012 + frame.avg * CFG.FireEarly, attempt)
+end
+
+-- v11.5: LU kena hit (stun) -> Block ON dikirim TEPAT pas stun lepas. Dulu abis kena cuma ada rencana M1r yang nebak waktu hit
+-- lanjutan dan ngirim block pas umurnya "pas" -> kalau tebakan meleset sedikit (dump: ~0.14s lebih cepat) block belum nyala = kena lagi.
+-- Block yang nyala dari unlock nutup dua kemungkinan: hit mendarat 0..0.25s abis unlock = PARRY, lebih telat = ke-block (0 damage).
+-- Rearm sama kayak parriedGuard: kalau masih kekunci (stun nambah, cooldown, busy) dicoba lagi tepat pas kunci kebuka.
+function SK.hitGuard(attacker, now, kind, res)
+	if not (alive and CFG.Enabled and CFG.HitGuard and CFG.BlockFallback and typeof(attacker) == "Instance") then
+		return
+	end
+	if (kind == "M2" or res == "GuardBroken") and not CFG.HitGuardM2 then
+		return
+	end
+	local _, hrp0 = myState()
+	local eh0 = attacker:FindFirstChild("HumanoidRootPart")
+	if not (hrp0 and eh0) or (eh0.Position - hrp0.Position).Magnitude > CFG.HitGuardRange then
+		return
+	end
+	local unlock = math.max(lockedUntil, readyAt, now)
+	if unlock - now > 2.5 then
+		return -- stun gede (knockdown / ragdoll): bukan urusan guard
+	end
+	-- hit lanjutan diperkirakan kapan? (cuma buat combo M1; M2 / guard break nggak punya pola yang bisa ditebak)
+	local hitAbs = nil
+	local startAt = unlock
+	if kind == "M1" and res == "Hit" then
+		local pl = SK.predLead(attacker)
+		if pl == false then
+			return -- swing terakhir combo: abis ini ada ChainCooldown
+		end
+		if pl then
+			hitAbs = now + pl
+			if pl - (unlock - now) > CFG.HitGuardEarly then
+				-- hit lanjutan masih jauh abis unlock: block dari unlock cuma kelamaan nyala (umur > window = ke-block doang).
+				-- Jaring pengaman: dikirim supaya umurnya ~(window - 0.05) pas hit tebakan mendarat. Rencana M1r yang normalnya
+				-- ngurus ini; kalau M1r gagal (ditolak / diganti plan lain / kunci geser) guard ini yang nutup (parry kalau tebakan
+				-- akurat, kalau meleset lebih telat tetap ke-block).
+				startAt = math.max(unlock, hitAbs - (SR.ParryWindow - 0.05) - net.rtt * 0.5 - frameLag())
+			end
+		end
+	end
+	SK.hgTok = (SK.hgTok or 0) + 1
+	local tok = SK.hgTok
+	local deadline = (hitAbs and math.max(hitAbs + 0.4, unlock) or unlock) + CFG.HitGuardWindow
+	local tries = 0
+	local attempt
+	attempt = function()
+		if not alive or not CFG.Enabled or SK.hgTok ~= tok then
+			return
+		end
+		local t = os.clock()
+		if blockHeld then
+			extendHoldTo(t + CFG.HitGuardHold)
+			return
+		end
+		if t > deadline or attackerGone(attacker) then
+			return
+		end
+		local _, hrp = myState()
+		local eh = attacker:FindFirstChild("HumanoidRootPart")
+		if not (hrp and eh) or (eh.Position - hrp.Position).Magnitude > CFG.HitGuardRange then
+			return
+		end
+		-- hit lanjutan udah ketebak: cukup tahan sampai dia mendarat + hasilnya nyampe (chain / parry yang nyambungin sisanya)
+		local hold = CFG.HitGuardHold
+		if hitAbs then
+			hold = math.clamp(hitAbs - t + CFG.ResultPad + SK.resPad() + 0.12, 0.25, CFG.HitGuardHold)
+		end
+		if pressBlock(hold + holdAfter() + SK.lagPad()) then
+			pressMode = "plain" -- waktunya ditentuin stun lepas, bukan lead swing -> jangan ikut ngegeser tune parry
+			blockFor = nil
+			counters.hitguard += 1
+			evt("info", "guard abis kena")
+		elseif CFG.ParriedGuardRearm and tries < 40 then
+			tries += 1
+			local gl = gameLock()
+			local at = math.max(lockedUntil, readyAt, dodgeBlockUntil, gl or -math.huge, t) + 0.012
+			schedule(math.max(at, t + 0.03) + frame.avg * CFG.FireEarly, attempt)
+		end
+	end
+	SK.hgRe = { tok = tok, key = "hgTok", deadline = deadline, attempt = attempt }
+	schedule(startAt + 0.012 + frame.avg * CFG.FireEarly, attempt)
 end
 
 -- v8: belajar seberapa awal block boleh dikirim pas stun lepas. accepted = block yang dikirim pas unlock diterima server.
@@ -2633,6 +2889,13 @@ local function onHit(data)
 		SK.seen[data.Kind] = true
 		evt("info", "Hit Kind lain: " .. data.Kind)
 	end
+	-- v11.5: hit ini lanjutan combo yang ditebak M1r terakhir? -> pelajari selisih interval aslinya
+	if not isSK and typeof(attacker) == "Instance" then
+		local okG, errG = pcall(SK.gapLearn, attacker, now, kind)
+		if not okG then
+			trace("gapLearn error:", tostring(errG))
+		end
+	end
 	local sent = (now - blockOnAt) < 0.6 and lastRefusedAt < blockOnAt and pressMode == "parry" and (now - dodgeSentAt) > 0.8
 		and (not CFG.TuneByAttacker or blockFor == attacker) and not isSK
 	local res = data.Result
@@ -2658,7 +2921,9 @@ local function onHit(data)
 	if kind == "M2" and typeof(attacker) == "Instance" then
 		if res == "Parried" then
 			m2Miss[attacker] = nil
-		elseif res == "GuardBroken" or res == "Hit" then
+		elseif (res == "GuardBroken" or res == "Hit") and sent then
+			-- v11.4: cuma dihitung kalau parry M2 beneran dikirim buat attacker ini. Dulu dodge yang gagal / M2 tanpa rencana
+			-- ikut dihitung -> semua M2 attacker itu di-dodge terus (dodge cd 2.25s) padahal parry-nya nggak pernah dicoba.
 			m2Miss[attacker] = (m2Miss[attacker] or 0) + 1
 				m2MissAt[attacker] = now
 			trace("parry M2 miss dari", attacker.Name, "x" .. m2Miss[attacker], "-> M2 berikutnya dodge duluan")
@@ -2777,6 +3042,9 @@ local function onHit(data)
 			tuneBy(kind, -1)
 		end
 		local reason = (now - lastSkip.at) < 1.2 and lastSkip.reason or (sent and "block telat" or "nggak ada rencana")
+		if reason == "locked" and lastSkip.src then
+			reason = "locked/" .. lastSkip.src -- v11.4: cd / stun / ke-parry / dodge / busy / game
+		end
 		if CFG.WhyHit then
 			local cvw = typeof(attacker) == "Instance" and comboVictim[attacker]
 			whyLog[#whyLog + 1] = {
@@ -2803,6 +3071,13 @@ local function onHit(data)
 		if CFG.Debug then log(("DODGE sukses %s (%d dodge)"):format(kind, counters.dodged)) end
 	end
 
+	-- v11.5: abis KENA (stun / guard break) -> guard tepat pas stun lepas (stun/lock udah ke-update di atas)
+	if (res == "Hit" or res == "GuardBroken") and not isSK and typeof(attacker) == "Instance" then
+		local okH, errH = pcall(SK.hitGuard, attacker, now, kind, res)
+		if not okH then
+			trace("hitGuard error:", tostring(errH))
+		end
+	end
 	-- v8: abis kena / ke-block M1 -> langsung rencanain hit combo berikutnya (stun/lock udah ke-update di atas)
 	if isSK and typeof(attacker) == "Instance" then
 		if res == "Parried" then
@@ -2841,7 +3116,7 @@ local function retryGuard()
 	local now = os.clock()
 	local target = nil
 	for _, e in ipairs(expected) do
-		if e.kind == "M1" and e.at > now + 0.15 and e.at < now + 1.0 and (not target or e.at > target) then
+		if e.kind == "M1" and e.at > now + CFG.RetryNear and e.at < now + 1.0 and (not target or e.at > target) then
 			target = e.at
 		end
 	end
@@ -2955,6 +3230,18 @@ local function onCombat(data)
 		if CFG.GuardRetryOnRefuse then
 			retryGuard()
 		end
+		evt("info", ("block ditolak server (sisa %.2fs)"):format(math.max(lockedUntil - os.clock(), 0)))
+		-- v11.4/v11.5: guard abis ke-parry / abis kena ditolak server (stun hit nambah dll) -> coba lagi begitu kunci beneran kebuka
+		if CFG.ParriedGuardRearm then
+			for _, pr in ipairs({ SK.pgRe or false, SK.hgRe or false }) do
+				if pr and pr.tok == SK[pr.key] and os.clock() < pr.deadline then
+					local tNow = os.clock()
+					local gl2 = gameLock()
+					local at2 = math.max(lockedUntil, readyAt, gl2 or -math.huge, tNow) + 0.012
+					schedule(math.max(at2, tNow + 0.03) + frame.avg * CFG.FireEarly, pr.attempt)
+				end
+			end
+		end
 	end
 end
 
@@ -2989,6 +3276,11 @@ local function resetCombatState(why)
 	table.clear(lastSwingSeen)
 	table.clear(comboVictim)
 	table.clear(SK.barr)
+	SK.pgTok = (SK.pgTok or 0) + 1 -- v11.4: guard abis ke-parry yang lagi nunggu dibatalin
+	SK.pgRe = nil
+	SK.hgTok = (SK.hgTok or 0) + 1 -- v11.5: guard abis kena
+	SK.hgRe = nil
+	table.clear(SK.rf)
 	hCount, histOwner = 0, nil
 	lastRetryAt, retryWindowAt, retryCount = -math.huge, -math.huge, 0
 	-- Local.Blocking milik game jangan nyangkut true: SetLocalBlocking(true) berikutnya jadi no-op (nggak ngirim paket apa-apa)
@@ -3498,14 +3790,14 @@ local function summaryText()
     local rate = all > 0 and (c.parried + c.blocked + c.dodged) / all * 100 or 100
     local parryRate = landed > 0 and c.parried / landed * 100 or 0
     return table.concat({
-        ("AutoParry v11.3 | parry %d  block %d  dodge %d  kena %d  gb %d | aman %.0f%% | parry-rate %.0f%%"):format(
+        ("AutoParry v11.5 | parry %d  block %d  dodge %d  kena %d  gb %d | aman %.0f%% | parry-rate %.0f%%"):format(
             c.parried, c.blocked, c.dodged, c.hit, c.guardbroken, rate, parryRate
         ),
         ("rtt %.0fms (±%.0f) | fps %.0f (p90 %.0fms, spike %d) | cpu %.0fus/frame (max %.0fus)"):format(
             net.rtt * 1000, net.var * 1000, frame.fps, frame.p90 * 1000, frame.spikes, frame.cpu * 1e6, frame.cpuMax * 1e6
         ),
-        ("tune M1 %+.3f M2 %+.3f | stunSlack %.2f | refused %d late %d locked %d | respawn %d healed %d recheck %d"):format(
-            tune.M1, tune.M2, stunSlack, c.refused, c.late, c.locked, c.respawns, c.healed, c.recheck
+        ("tune M1 %+.3f M2 %+.3f | stunSlack %.2f | refused %d late %d locked %d | respawn %d healed %d recheck %d | hitguard %d"):format(
+            tune.M1, tune.M2, stunSlack, c.refused, c.late, c.locked, c.respawns, c.healed, c.recheck, c.hitguard or 0
         ),
     }, "\n")
 end
@@ -3539,7 +3831,7 @@ function SK.dump()
     local function add(s)
         out[#out + 1] = s
     end
-    add("== AutoParry live dump · v11.3 ==")
+    add("== AutoParry live dump · v11.5 ==")
     add(summaryText())
     local r1, r2 = SK.live(now)
     add(r1)
@@ -3849,7 +4141,7 @@ local function buildUI()
     local dot = make("Frame", { Position = UDim2.fromOffset(14, 17), Size = UDim2.fromOffset(8, 8), BackgroundColor3 = T.good, BorderSizePixel = 0 }, titleBar)
     corner(dot, 4)
     text(titleBar, "Nyx AutoParry", 14, T.text, Enum.Font.GothamBold, { Position = UDim2.fromOffset(30, 0), Size = UDim2.new(0, 98, 1, 0) })
-    text(titleBar, "v11.3", 10, T.sub, Enum.Font.GothamMedium, { Position = UDim2.fromOffset(130, 0), Size = UDim2.new(0, 40, 1, 0) })
+    text(titleBar, "v11.5", 10, T.sub, Enum.Font.GothamMedium, { Position = UDim2.fromOffset(130, 0), Size = UDim2.new(0, 40, 1, 0) })
 
     local function iconBtn(sym, xFromRight, cb)
         local b = make("TextButton", {
@@ -4336,6 +4628,13 @@ local function buildUI()
         { "Guard abis kena parry", "ParriedGuard", "block pas stun lepas kalau LU yang ke-parry" },
         { "Pad ping / fps", "LagAdaptive", "hold & chain melebar kalau ping tinggi / fps rendah" },
     })
+    group("Abis kena & ngebut (v11.5)", {
+        { "Guard abis kena", "HitGuard", "block ON tepat pas stun lepas -> hit lanjutan ke-parry / ke-block" },
+        { "Guard abis kena M2/GB", "HitGuardM2", "guard yang sama abis kena M2 / guard break" },
+        { "Belajar interval combo", "GapLearn", "tebakan hit lanjutan dikoreksi dari interval asli attacker" },
+        { "Attacker ngebut = ancaman", "MobileThreat", "dash kanan-kiri / muter cepat tetap di-parry (bukan skip range)" },
+        { "Pause UI pas tarung", "CombatUIPause", "anti hitch: UI & simpan config nunggu fight selesai" },
+    })
 
     ------------------------------------------------------------------
     -- Halaman 3: Timing
@@ -4782,6 +5081,7 @@ local function buildUI()
         local lastLite = -math.huge
         while alive and gui.Parent do
             local visible = win.Visible and not collapsed
+            local fighting = CFG.CombatUIPause and SK.hot(os.clock()) -- v11.5: lagi tarung -> UI nggak disentuh sama sekali
             local wantLite = CFG.AutoLite and (frame.fps < CFG.LiteFps or frame.cpu > 0.0015)
             if wantLite then
                 lastLite = os.clock()
@@ -4791,13 +5091,17 @@ local function buildUI()
             if not (alive and gui.Parent) then
                 break
             end
-            pcall(refreshOrb)
-            if visible then
-                pcall(refreshFooter)
-                refreshPage()
-            end
-            if Store.dirtyAt and os.clock() - Store.dirtyAt > 1.2 then
-                Store.save()
+            -- v11.5: abis tunggu, cek lagi (attacker bisa baru mulai ngayun); pas tarung nggak ada update teks / grafik / writefile
+            fighting = fighting or (CFG.CombatUIPause and SK.hot(os.clock()))
+            if not fighting then
+                pcall(refreshOrb)
+                if visible then
+                    pcall(refreshFooter)
+                    refreshPage()
+                end
+                if Store.dirtyAt and os.clock() - Store.dirtyAt > 1.2 then
+                    Store.save()
+                end
             end
         end
     end)
@@ -4811,7 +5115,7 @@ end
 -- API + START
 ----------------------------------------------------------------------
 genv.__NyxAutoParry = {
-    Version = "11.3",
+    Version = "11.5",
     CFG = CFG,
     Counters = counters,
     Skips = skips,
@@ -4864,6 +5168,14 @@ genv.__NyxAutoParry = {
 if CFG.SaveConfig then
     pcall(Store.load)
 end
+-- v11.4: default yang berubah (M2 parry-first) ditimpa SEKALI ke config lama biar kepakai; abis itu nilai lu sendiri dihormati
+if (CFG.MigratedTo or 0) < 4 then
+    CFG.DodgeMinConf = 0.70
+    CFG.DodgeSwitchGap = 0.25
+    CFG.M2MissMemory = 12
+    CFG.MigratedTo = 4
+    Store.touch()
+end
 task.spawn(loadSpecs)
 task.spawn(function()
     for _ = 1, 60 do
@@ -4883,5 +5195,5 @@ if CFG.UI then
     end)
 end
 
-notify("v11.3 loaded - tekan " .. CFG.ToggleKey.Name .. " buat toggle")
-log("loaded v11.3. toggle:", CFG.ToggleKey.Name, "| UI:", CFG.UIKey.Name, "| getgenv().__NyxAutoParry.Summary() buat ringkasan")
+notify("v11.5 loaded - tekan " .. CFG.ToggleKey.Name .. " buat toggle")
+log("loaded v11.5. toggle:", CFG.ToggleKey.Name, "| UI:", CFG.UIKey.Name, "| getgenv().__NyxAutoParry.Summary() buat ringkasan")
