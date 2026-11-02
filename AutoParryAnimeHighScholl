@@ -207,6 +207,26 @@
 	           tail abis parry, hold guard.
 ]]
 
+--[[
+	v12.0 = v11.5 + (style lebih pintar, dodge ikut arah, otak M2). Logika timing parry inti v11.5 NGGAK diubah.
+	  STYLE  : (1) nama style dicocokin longgar (huruf besar/kecil, spasi, underscore, "Boxing Style" -> "Boxing") dan hasilnya di-cache.
+	           (2) VERIFIKASI SUARA: suara swing yang kebaca dicocokin ke daftar suara tiap style di FightingStyles. Kalau suara itu cuma
+	           milik SATU style lain (2x beruntun) -> atribut Style attacker dianggap basi / salah, script pakai style dari suaranya.
+	           (3) profil style (jumlah swing, total combo, bentuk M2: throw/pull/teleport/dash/projectile/sweep/lunge/multi, unparryable).
+	           (4) PRIOR PER STYLE: attacker baru dari style yang sama langsung dapat koreksi lead rata-rata (cuma kalau konsisten, std < 30ms).
+	  DODGE  : arah dodge sekarang DIPILIH, bukan maju doang.
+	           Smart  = ikut arah gerak lu (WASD / stick) kalau lagi nahan arah; kalau diem, pilih arah terbaik dari bentuk serangan
+	                    (lunge/dash -> sidestep, sweep/multi -> mundur, projectile -> samping), minus tembok / jurang / musuh lain.
+	           Input / Away / Side / Fixed = mode lain (CFG.DodgeDirMode).
+	           Arah dihitung PAS dodge dikirim (bukan pas telegraf), jadi ikut posisi terbaru.
+	           Cara ngasih arah ke TryDodge ada 3 (move = hum:Move sebelum TryDodge, name = TryDodge(h, "Left"), plain = bawaan game).
+	           Script KALIBRASI SENDIRI: abis tiap dodge diukur badan lu beneran gerak ke arah yang diminta atau nggak; metode yang
+	           meleset dimatiin, yang kena dipakai terus. getgenv().__NyxAutoParry.DodgeProbe() / DodgeTest("Left") / DodgeInfo() buat ngecek.
+	  M2     : OTAK M2. Parry vs dodge dipilih pakai peluang timing + hasil belajar per style (parry / dodge M2 lu yang berhasil vs miss)
+	           + bonus parry (stun attacker) + bonus dodge buat M2 yang bentuknya throw/pull/teleport/dash/projectile + penalti M2 multi-hit
+	           (parry nge-cancel sisa hit). Waktu kirim dodge dikoreksi dari hasil (dodge kecepetan / telat -> geser otomatis).
+]]
+
 local genv = (getgenv and getgenv()) or _G
 if genv.__NyxAutoParry then
 	pcall(genv.__NyxAutoParry.Stop)
@@ -410,6 +430,22 @@ local CFG = {
 	MobileRange = 15, -- stud
 	RetryNear = 0.04, -- retry abis block ditolak boleh kalau hit yang ditunggu masih > segini detik lagi
 	CombatUIPause = true, -- UI nggak di-refresh / config nggak disimpan selama ada attacker aktif di deket lu (anti hitch)
+
+	-- ===== v12: style pintar + dodge ikut arah + otak M2 =====
+	StyleIntel = true, -- nama style longgar + verifikasi dari suara swing + profil style
+	StylePrior = true, -- attacker baru dari style yang sama dapat koreksi lead rata-rata (cuma kalau konsisten)
+	DodgeDirMode = "Smart", -- "Smart" ikut input gerak lu / pilih arah terbaik | "Input" cuma ikut input | "Away" menjauh | "Side" sidestep | "Fixed" bawaan game
+	DodgeFollowInput = true, -- lu lagi nahan arah (WASD / stick) -> dodge ke arah itu
+	DodgeInputMin = 0.25, -- MoveDirection minimal dianggap "lagi nahan arah"
+	DodgeInputW = 1.4, -- bobot ikut arah input di mode Smart (makin gede makin nurut sama arah lu)
+	DodgeSafety = true, -- cek tembok / jurang / musuh lain di arah dodge
+	DodgeDashDist = 16, -- perkiraan jarak dash (stud) buat cek keamanan arah
+	DodgeDirFrame = "Char", -- nama arah (Left/Right/dst) dihitung relatif ke "Char" atau "Camera" (cuma metode name / remote)
+	DodgeArgMode = "auto", -- "auto" kalibrasi sendiri | "move" | "name" | "none" (bawaan game)
+	M2Brain = true, -- parry vs dodge buat M2 pakai profil style + hasil belajar
+	M2ParryBonus = 0.05, -- parry dapet bonus (attacker kena stun, peluang counter); dodge makan jatah 2.25s
+	M2LearnWeight = 0.35, -- seberapa besar hasil belajar per style ngegeser peluang
+	M2DodgeOnlyShapes = true, -- M2 throw/pull/teleport/dash/projectile: dodge diutamain kalau peluangnya layak
 }
 
 ----------------------------------------------------------------------
@@ -435,7 +471,49 @@ local Specs = {
 	count = 0,
 	swingSound = { Swing = true },
 	reachInfl = nil,
+	soundOwner = {}, -- v12: [nama sound swing] = { style yang pakai sound itu }
+	alias = {}, -- v12: cache pencocokan nama style longgar
+	aliasN = -1,
+	norm = nil, -- v12: [nama dinormalisasi] = nama style asli
+	infer = setmetatable({}, { __mode = "k" }), -- v12: [attacker] = style hasil verifikasi suara
+	heard = setmetatable({}, { __mode = "k" }), -- v12: [attacker] = { name, n } sound yang nggak cocok sama style tercatat
 }
+
+-- v12: style EFEKTIF attacker (atribut Style, dicocokin longgar, ditimpa hasil verifikasi suara kalau atributnya basi)
+function Specs.resolve(char)
+	if CFG.StyleIntel then
+		local ov = Specs.infer[char]
+		if ov and Specs.styles[ov] then
+			return ov
+		end
+	end
+	local name = char:GetAttribute("Style")
+	if type(name) ~= "string" then
+		return SR.DefaultStyle
+	end
+	if Specs.styles[name] or not (CFG.StyleIntel and Specs.norm) then
+		return name
+	end
+	if Specs.aliasN ~= Specs.count then
+		Specs.alias, Specs.aliasN = {}, Specs.count
+	end
+	local hit = Specs.alias[name]
+	if hit == nil then
+		local key = (string.lower(name):gsub("[%s_%-%.]", ""))
+		local found = Specs.norm[key]
+		if not found and #key >= 3 then
+			for nk, real in pairs(Specs.norm) do
+				if #nk >= 3 and (string.find(key, nk, 1, true) or string.find(nk, key, 1, true)) then
+					found = real
+					break
+				end
+			end
+		end
+		hit = found or false
+		Specs.alias[name] = hit
+	end
+	return hit or name
+end
 
 ----------------------------------------------------------------------
 -- STATE
@@ -911,11 +989,24 @@ local function loadSpecs()
 					for _, s in ipairs(sw) do
 						if type(s) == "table" and type(s.Sound) == "string" then
 							Specs.swingSound[s.Sound] = true
+							local own = Specs.soundOwner[s.Sound]
+							if not own then
+								own = {}
+								Specs.soundOwner[s.Sound] = own
+							end
+							if not table.find(own, child.Name) then
+								own[#own + 1] = child.Name
+							end
 						end
 					end
 				end
 			end
 		end
+	end
+	-- v12: indeks nama style dinormalisasi (huruf kecil, tanpa spasi / underscore / strip) buat pencocokan longgar
+	Specs.norm, Specs.alias, Specs.aliasN = {}, {}, -1
+	for name in pairs(Specs.styles) do
+		Specs.norm[(string.lower(name):gsub("[%s_%-%.]", ""))] = name
 	end
 	-- v10: skill multi-hit (barrage). Stats.Hits / Stats.Interval / Stats.RequiredStyle / Stats.BreaksBlock
 	if CFG.SkillAware then
@@ -939,11 +1030,8 @@ local function loadSpecs()
 end
 
 local function styleOf(char)
-	local name = char:GetAttribute("Style")
-	if type(name) ~= "string" then
-		name = SR.DefaultStyle
-	end
-	return Specs.styles[name] or Specs.styles[SR.DefaultStyle]
+	-- v12: Specs.resolve = nama longgar + verifikasi suara swing (kalau StyleIntel mati, sama persis kayak dulu)
+	return Specs.styles[Specs.resolve(char)] or Specs.styles[SR.DefaultStyle]
 end
 
 ----------------------------------------------------------------------
@@ -1704,7 +1792,7 @@ local function dodgeWait(now, forPlan)
 	return w
 end
 
-local function fireDodge()
+local function fireDodge(attacker, plan)
 	local now = os.clock()
 	local char = LocalPlayer.Character
 	if not char then
@@ -1732,18 +1820,39 @@ local function fireDodge()
 
 	local fired = false
 	local h, L = dodgeLocal()
+	-- v12: arah dodge dipilih PAS dikirim (posisi attacker / lu paling baru), bukan pas telegraf
+	local pick = nil
+	if CFG.DodgeDirMode ~= "Fixed" then
+		local okP, rP = pcall(SK.V12.pickDir, attacker, plan, (not h) and "name" or nil)
+		if okP then
+			pick = rP
+		else
+			trace("pickDir error:", tostring(rP))
+		end
+	end
 	if h then
 		-- pakai fungsi dodge asli game: animasi + dorongan + state lokal ikut bener
 		local before = L.DodgeReadyAt
-		local ok, err = pcall(h.TryDodge, h)
+		local ok, err
+		if pick then
+			ok, err = pcall(SK.V12.invoke, h, pick)
+		else
+			ok, err = pcall(h.TryDodge, h)
+		end
 		if not ok then
 			trace("TryDodge error:", tostring(err))
 		elseif L.DodgeReadyAt ~= before then
 			fired = true
+			if pick then
+				pcall(SK.V12.afterFire, pick, now)
+			end
 		end
 	else
-		Combat:FireServer({ Info = "Dodge", Direction = CFG.DodgeDirection, T = workspace:GetServerTimeNow() })
+		Combat:FireServer({ Info = "Dodge", Direction = pick and pick.name or CFG.DodgeDirection, T = workspace:GetServerTimeNow() })
 		fired = true
+		if pick then
+			SK.V12.last = { at = now, pick = pick }
+		end
 	end
 
 	if not fired then
@@ -1764,7 +1873,7 @@ local function dodgeProbe(lead, now, rtt, fl)
 	local d = dashOf()
 	local target = math.clamp(d.IFrames * CFG.DodgeAgeFrac, 0.04, math.max(d.IFrames - 0.06, 0.05))
 	local wait = dodgeWait(now, true)
-	local sendIn = lead - target - rtt - fl + (math.random() * 2 - 1) * CFG.Jitter
+	local sendIn = lead - target - rtt - fl + (SK.V12 and SK.V12.dtune or 0) + (math.random() * 2 - 1) * CFG.Jitter -- v12: dtune = koreksi hasil belajar
 	if sendIn < wait then
 		sendIn = wait
 	end
@@ -1863,13 +1972,688 @@ local function planDodge(attacker, plan, lead, now, rtt, fl, tag, why)
 				end
 			end
 		end
-		if not fireDodge() then
+		if not fireDodge(attacker, plan) then
 			dodgePlannedUntil = 0
 			dodgeBlockUntil = 0
 		end
 	end)
 	return true
 end
+
+----------------------------------------------------------------------
+-- v12: PROFIL STYLE + ARAH DODGE + OTAK M2
+-- Semua lewat SK.V12 (bukan local baru / upvalue baru di fungsi gede) biar nggak nabrak batas Luau.
+----------------------------------------------------------------------
+local V12 = {
+	prof = {}, -- [style] = profil turunan dari spec
+	stat = {}, -- ["style:M2"] = { pn, pok, dn, dok } hasil parry / dodge M2 lu per style
+	sLead = {}, -- ["style:swing"] = { v, var, n } koreksi lead rata-rata per style
+	dtune = 0, -- koreksi waktu kirim dodge hasil belajar (detik, + = kirim lebih lambat)
+	ms = (genv.__NyxAPcal and genv.__NyxAPcal.ms)
+		or { move = { ok = 0, bad = 0 }, name = { ok = 0, bad = 0 }, plain = { ok = 0, bad = 0 } },
+	names = { Forward = "Forward", Back = "Back", Left = "Left", Right = "Right" },
+	nParams = nil, -- jumlah parameter TryDodge (termasuk self), nil = nggak kebaca
+	last = nil, -- pick dodge terakhir
+	lastCal = "-",
+	order = { "move", "name", "plain" },
+	dodgeShape = { throw = true, pull = true, teleport = true, dash = true, projectile = true },
+	-- bobot arah per bentuk serangan: away = menjauh dari attacker, side = geser ke samping jalur serangan
+	dirW = {
+		melee = { away = 0.55, side = 0.45 },
+		multi = { away = 0.80, side = 0.20 },
+		sweep = { away = 0.80, side = 0.20 },
+		lunge = { away = 0.25, side = 0.75 },
+		dash = { away = 0.20, side = 0.80 },
+		teleport = { away = 0.35, side = 0.65 },
+		projectile = { away = 0.10, side = 0.90 },
+		pull = { away = 0.30, side = 0.70 },
+		throw = { away = 0.30, side = 0.70 },
+		_away = { away = 1, side = 0 },
+		_side = { away = 0, side = 1 },
+	},
+	DIAG = 0.70710678,
+	UP = Vector3.new(0, 1, 0),
+}
+genv.__NyxAPcal = { ms = V12.ms } -- kalibrasi arah kebawa kalau script di-execute ulang
+SK.V12 = V12
+
+-- style efektif attacker (atribut + pencocokan longgar + verifikasi suara)
+function V12.nameOf(char)
+	return Specs.resolve(char)
+end
+
+-- bentuk serangan dari spec M2
+function V12.shapeOfSpec(s)
+	if type(s) ~= "table" then
+		return "melee"
+	end
+	if s.Projectile then
+		return "projectile"
+	end
+	if s.Throw then
+		return "throw"
+	end
+	if s.Pull then
+		return "pull"
+	end
+	if s.Teleport then
+		return "teleport"
+	end
+	if s.Dash then
+		return "dash"
+	end
+	if s.Sweep then
+		return "sweep"
+	end
+	if type(s.Lunge) == "table" and (s.Lunge.Speed or 0) > 0 then
+		return "lunge"
+	end
+	if type(s.FollowUps) == "table" and #s.FollowUps > 0 then
+		return "multi"
+	end
+	return "melee"
+end
+
+-- profil style (di-cache per spec; kalau spec ke-reload otomatis dihitung ulang)
+function V12.profile(char)
+	local style = styleOf(char)
+	if type(style) ~= "table" then
+		return nil
+	end
+	local name = V12.nameOf(char)
+	local p = V12.prof[name]
+	if p and p.src == style then
+		return p
+	end
+	p = { name = name, src = style, m1n = 0, m1total = 0, shape = "melee", unparry = false, multi = false, windup = 0, range = 0 }
+	local m1 = style.M1
+	local sw = type(m1) == "table" and m1.Swings
+	if type(sw) == "table" then
+		p.m1n = #sw
+		for _, sp in ipairs(sw) do
+			if type(sp) == "table" then
+				p.m1total += (sp.Windup or 0.2) + (sp.Endlag or 0.45)
+			end
+		end
+	end
+	local m2 = style.M2
+	if type(m2) == "table" then
+		p.shape = V12.shapeOfSpec(m2)
+		p.unparry = m2.Unparryable == true
+		p.multi = type(m2.FollowUps) == "table" and #m2.FollowUps > 0
+		p.windup = m2.Windup or 0
+		p.range = m2.Range or 0
+	end
+	V12.prof[name] = p
+	return p
+end
+
+-- verifikasi suara: sound swing yang kebaca dicocokin ke style yang tercatat
+function V12.hearSound(a, kind)
+	if not CFG.StyleIntel or type(kind) ~= "string" then
+		return
+	end
+	local owners = Specs.soundOwner[kind]
+	if not owners then
+		return
+	end
+	local cur = Specs.resolve(a)
+	if table.find(owners, cur) then
+		Specs.infer[a] = nil
+		Specs.heard[a] = nil
+		return
+	end
+	if #owners ~= 1 then
+		return -- sound dipakai banyak style, nggak bisa nentuin
+	end
+	local m = Specs.heard[a]
+	if not (m and m.name == owners[1]) then
+		m = { name = owners[1], n = 0 }
+		Specs.heard[a] = m
+	end
+	m.n += 1
+	if m.n >= 2 and Specs.infer[a] ~= owners[1] then
+		Specs.infer[a] = owners[1]
+		if CFG.LogEvents then
+			pushEv("info", ("style %s dikoreksi dari suara: %s"):format(nameOf(a), owners[1]))
+		end
+	end
+end
+
+----------------------------------------------------------------------
+-- prior lead per style
+----------------------------------------------------------------------
+function V12.styleKey(attacker, key)
+	return V12.nameOf(attacker) .. ":" .. (string.match(key, ":([^:]+)$") or key)
+end
+
+function V12.leadLearn(attacker, key, err)
+	if not CFG.StylePrior then
+		return
+	end
+	local sk = V12.styleKey(attacker, key)
+	local e = V12.sLead[sk]
+	if not e then
+		e = { v = err, var = 0.0004, n = 0 }
+		V12.sLead[sk] = e
+	end
+	local g = math.max(0.2, 1 / (e.n + 1.5))
+	local dev = err - e.v
+	e.v = math.clamp(e.v + dev * g, -0.1, 0.1)
+	e.var = e.var * (1 - g) + dev * dev * g
+	e.n += 1
+end
+
+-- koreksi lead rata-rata style ini, cuma kalau sampelnya cukup dan konsisten (std < 30ms)
+function V12.priorFor(attacker, key)
+	local e = V12.sLead[V12.styleKey(attacker, key)]
+	if e and e.n >= 4 and e.var < 0.0009 then
+		return e.v * 0.7
+	end
+	return nil
+end
+
+----------------------------------------------------------------------
+-- otak M2: parry vs dodge
+----------------------------------------------------------------------
+function V12.m2Decide(attacker, plan, lead, now, rtt, fl, sigma, parryConf, sure, afterMiss)
+	if not sure then
+		return "parry"
+	end
+	local dOK, _, dAge, _, dd = dodgeProbe(lead, now, rtt, fl)
+	if not dOK then
+		return "parry"
+	end
+	local pD = confWindow(dAge, dd.IFrames, sigma)
+	local pP = parryConf
+	local st = V12.stat[V12.nameOf(attacker) .. ":M2"]
+	local w = CFG.M2LearnWeight
+	if st then
+		if st.pn >= 2 then
+			local k = w * math.min(st.pn / 6, 1)
+			pP = pP * (1 - k) + (st.pok / st.pn) * k
+		end
+		if st.dn >= 2 then
+			local k = w * math.min(st.dn / 6, 1)
+			pD = pD * (1 - k) + (st.dok / st.dn) * k
+		end
+	end
+	if afterMiss then
+		pP *= 0.6
+	end
+	local shape = V12.shapeOfSpec(plan.spec)
+	local sP = pP + CFG.M2ParryBonus
+	local sD = pD - 0.04 -- dodge = jatah langka (cd 2.25s)
+	if plan.multi then
+		sD -= 0.10 -- parry nge-cancel sisa hit, dodge cuma nutup hit pertama
+	end
+	if CFG.M2DodgeOnlyShapes and V12.dodgeShape[shape] then
+		sD += 0.12
+	end
+	if pD >= 0.5 and sD > sP then
+		return "dodge", ("M2 %s: dodge %.0f%% > parry %.0f%%"):format(shape, pD * 100, pP * 100)
+	end
+	return "parry"
+end
+
+-- belajar hasil M2 / dodge (dipanggil dari onHit)
+function V12.learn(attacker, kind, res, sent, now)
+	local key = V12.nameOf(attacker) .. ":M2"
+	local st = V12.stat[key]
+	if not st then
+		st = { pn = 0, pok = 0, dn = 0, dok = 0 }
+		V12.stat[key] = st
+	end
+	local dsent = now - dodgeSentAt
+	if dsent >= 0 and dsent < 0.7 then
+		-- hit ini datang pas dodge lu lagi jalan: umur iframe pas hit mendarat ~ (selisih waktu) - rtt
+		local d = dashOf()
+		local age = dsent - net.rtt
+		local err = age - d.IFrames * CFG.DodgeAgeFrac
+		if res == "Dodged" then
+			if kind == "M2" then
+				st.dn += 1
+				st.dok += 1
+			end
+			V12.dtune = math.clamp(V12.dtune + 0.10 * err, -0.06, 0.06)
+		elseif (res == "Hit" or res == "GuardBroken") and age > -0.15 and age < d.IFrames + 0.15 then
+			if kind == "M2" then
+				st.dn += 1
+			end
+			V12.dtune = math.clamp(V12.dtune + 0.35 * err, -0.06, 0.06)
+		end
+	elseif sent and kind == "M2" then
+		if res == "Parried" then
+			st.pn += 1
+			st.pok += 1
+		elseif res == "GuardBroken" or res == "Hit" then
+			st.pn += 1
+		end
+	end
+	if st.pn > 30 then
+		st.pn *= 0.8
+		st.pok *= 0.8
+	end
+	if st.dn > 30 then
+		st.dn *= 0.8
+		st.dok *= 0.8
+	end
+end
+
+----------------------------------------------------------------------
+-- ARAH DODGE
+----------------------------------------------------------------------
+function V12.flat(v)
+	local f = Vector3.new(v.X, 0, v.Z)
+	if f.Magnitude < 0.0001 then
+		return nil
+	end
+	return f.Unit
+end
+
+-- metode ngasih arah ke TryDodge: yang terbukti (ok - 1.5 * bad) paling tinggi; urutan awal move -> name -> plain
+function V12.method()
+	local mode = CFG.DodgeArgMode
+	if mode == "name" or mode == "move" then
+		return mode
+	elseif mode == "none" then
+		return "plain"
+	end
+	local best, bestS = "plain", -1e9
+	for i = 1, 3 do
+		local m = V12.order[i]
+		local s = V12.ms[m]
+		local dead = (s.bad >= 3 and s.ok == 0)
+		if m == "name" and V12.nParams and V12.nParams < 2 then
+			dead = true -- TryDodge nggak nerima argumen
+		end
+		if m == "plain" then
+			dead = false
+		end
+		if not dead then
+			local val = (s.ok - 1.5 * s.bad) - i * 0.01
+			if val > bestS then
+				best, bestS = m, val
+			end
+		end
+	end
+	return best
+end
+
+function V12.frameVecs(hrp)
+	local look = V12.flat(hrp.CFrame.LookVector)
+	if CFG.DodgeDirFrame == "Camera" then
+		local cam = workspace.CurrentCamera
+		local cl = cam and V12.flat(cam.CFrame.LookVector)
+		if cl then
+			look = cl
+		end
+	end
+	look = look or Vector3.new(0, 0, -1)
+	return look, look:Cross(V12.UP)
+end
+
+function V12.nameFor(v, fwd, rgt)
+	local f, r = v:Dot(fwd), v:Dot(rgt)
+	local n = V12.names
+	if math.abs(f) >= math.abs(r) then
+		return f >= 0 and n.Forward or n.Back
+	end
+	return r >= 0 and n.Right or n.Left
+end
+
+function V12.params(attacker)
+	local p = V12.rp
+	if not p then
+		p = RaycastParams.new()
+		p.FilterType = Enum.RaycastFilterType.Exclude
+		pcall(function()
+			p.RespectCanCollide = true
+		end)
+		pcall(function()
+			p.IgnoreWater = true
+		end)
+		V12.rp = p
+	end
+	local list = {}
+	for _, pl in ipairs(Players:GetPlayers()) do
+		if pl.Character then
+			list[#list + 1] = pl.Character
+		end
+	end
+	if typeof(attacker) == "Instance" then
+		list[#list + 1] = attacker
+	end
+	p.FilterDescendantsInstances = list
+	return p
+end
+
+-- posisi karakter lain (selain lu dan attacker) buat cek crowd
+function V12.others(char, attacker)
+	local out = {}
+	for _, pl in ipairs(Players:GetPlayers()) do
+		local c = pl.Character
+		if c and c ~= char and c ~= attacker then
+			local r = c:FindFirstChild("HumanoidRootPart")
+			local hm = c:FindFirstChildOfClass("Humanoid")
+			if r and hm and hm.Health > 0 then
+				out[#out + 1] = r.Position
+			end
+		end
+	end
+	return out
+end
+
+-- penalti keamanan arah v: tembok dekat, jurang / turunan tinggi di titik tujuan, musuh lain di titik tujuan
+function V12.safety(hrp, v, dist, others, params)
+	local pen = 0
+	local origin = hrp.Position + Vector3.new(0, 1, 0)
+	local hit = workspace:Raycast(origin, v * (dist + 2), params)
+	if hit then
+		local d = (hit.Position - origin).Magnitude
+		pen += math.clamp(1 - d / dist, 0, 1) * 0.9
+	end
+	local endP = origin + v * dist
+	local below = workspace:Raycast(endP, Vector3.new(0, -45, 0), params)
+	if not below then
+		pen += 1.6
+	elseif origin.Y - below.Position.Y > 16 then
+		pen += 0.7
+	end
+	for i = 1, #others do
+		if (others[i] - endP).Magnitude < 9 then
+			pen += 0.35
+		end
+	end
+	return pen
+end
+
+-- pilih arah dodge. return { v, name, method, inp, score, shape } atau nil (= pakai TryDodge bawaan game apa adanya)
+function V12.pickDir(attacker, plan, forceMethod)
+	local char, hrp = myState()
+	if not (char and hrp) then
+		return nil
+	end
+	local mode = CFG.DodgeDirMode
+	if mode == "Fixed" then
+		return nil
+	end
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	local inp = nil
+	if CFG.DodgeFollowInput and hum then
+		local md = hum.MoveDirection
+		if md.Magnitude >= CFG.DodgeInputMin then
+			inp = V12.flat(md)
+		end
+	end
+	if mode == "Input" and not inp then
+		return nil
+	end
+	local method = forceMethod or V12.method()
+	if method == "plain" then
+		return nil -- game nggak bisa disetir -> arah bawaan game
+	end
+	local fwd, rgt = V12.frameVecs(hrp)
+
+	if mode == "Input" then
+		return { v = inp, name = V12.nameFor(inp, fwd, rgt), method = method, inp = true, score = 0, shape = "input" }
+	end
+
+	local cands = { fwd, -fwd, rgt, -rgt }
+	if method ~= "name" then
+		local d = V12.DIAG
+		cands[5] = (fwd + rgt) * d
+		cands[6] = (fwd - rgt) * d
+		cands[7] = (-fwd + rgt) * d
+		cands[8] = (-fwd - rgt) * d
+		if inp then
+			cands[9] = inp -- arah lu persis, nggak dibulatin
+		end
+	end
+
+	local ahrp = typeof(attacker) == "Instance" and attacker:FindFirstChild("HumanoidRootPart") or nil
+	local axis = (ahrp and V12.flat(hrp.Position - ahrp.Position)) or V12.flat(-hrp.CFrame.LookVector) or Vector3.new(0, 0, 1)
+	local perp = Vector3.new(-axis.Z, 0, axis.X)
+	local shape = (plan and plan.kind == "M2") and V12.shapeOfSpec(plan.spec) or "melee"
+	local w
+	if mode == "Away" then
+		w = V12.dirW._away
+	elseif mode == "Side" then
+		w = V12.dirW._side
+	else
+		w = V12.dirW[shape] or V12.dirW.melee
+	end
+
+	local aflat = nil
+	if ahrp then
+		local av = ahrp.AssemblyLinearVelocity
+		local fv = Vector3.new(av.X, 0, av.Z)
+		if fv.Magnitude > 5 then
+			aflat = fv.Unit
+		end
+	end
+	local dist = CFG.DodgeDashDist
+	local others, params = nil, nil
+	if CFG.DodgeSafety then
+		others = V12.others(char, attacker)
+		params = V12.params(attacker)
+	end
+
+	local best, bestSc = nil, -1e9
+	for i = 1, #cands do
+		local v = cands[i]
+		local sc = w.away * v:Dot(axis) + w.side * math.abs(v:Dot(perp))
+		if aflat then
+			sc -= 0.15 * math.max(v:Dot(aflat), 0) -- jangan lari searah gerak attacker (dia ngejar)
+		end
+		if inp then
+			sc += CFG.DodgeInputW * v:Dot(inp) -- ikut arah yang lagi lu tahan
+		end
+		if params then
+			sc -= V12.safety(hrp, v, dist, others, params)
+		end
+		if sc > bestSc then
+			best, bestSc = v, sc
+		end
+	end
+	if not best then
+		return nil
+	end
+	return {
+		v = best,
+		name = V12.nameFor(best, fwd, rgt),
+		method = method,
+		inp = inp ~= nil and best:Dot(inp) > 0.9,
+		score = bestSc,
+		shape = shape,
+	}
+end
+
+-- eksekusi dodge dengan arah pilihan. dipanggil di dalam pcall
+function V12.invoke(h, pick)
+	local m = pick.method
+	if m == "move" then
+		local char = LocalPlayer.Character
+		local hum = char and char:FindFirstChildOfClass("Humanoid")
+		if hum then
+			pcall(hum.Move, hum, pick.v, false)
+			if not pick.inp then
+				-- kalau control script game lagi mati, arah ini bisa nyangkut -> balikin ke diem sebentar lagi
+				task.delay(0.15, function()
+					if hum.Parent and (hum.MoveDirection - pick.v).Magnitude < 0.05 then
+						pcall(hum.Move, hum, Vector3.zero, false)
+					end
+				end)
+			end
+		end
+		return h.TryDodge(h)
+	elseif m == "name" then
+		return h.TryDodge(h, pick.name)
+	end
+	return h.TryDodge(h)
+end
+
+-- abis dodge dikirim: catat posisi awal, 0.3 detik kemudian ukur badan lu beneran ke arah yang diminta atau nggak
+function V12.afterFire(pick, now)
+	V12.last = { at = now, pick = pick }
+	local _, hrp = myState()
+	if not hrp then
+		return
+	end
+	local rec = { start = hrp.Position, v = pick.v, method = pick.method, name = pick.name }
+	task.delay(0.3, V12.calCheck, rec)
+end
+
+function V12.calCheck(rec)
+	if not alive then
+		return
+	end
+	local _, hrp = myState()
+	if not hrp then
+		return
+	end
+	local s = V12.ms[rec.method]
+	if not s then
+		return
+	end
+	local d = Vector3.new(hrp.Position.X - rec.start.X, 0, hrp.Position.Z - rec.start.Z)
+	if d.Magnitude < 3 then
+		V12.lastCal = ("%s: badan nggak gerak (%.1f stud), nggak dihitung"):format(rec.method, d.Magnitude)
+		return
+	end
+	local dot = d.Unit:Dot(rec.v)
+	if dot > 0.55 then
+		s.ok += 1
+	else
+		s.bad += 1
+	end
+	V12.lastCal = ("%s: mau %s, hasil dot %.2f (%s) | ok %d bad %d"):format(
+		rec.method, rec.name, dot, dot > 0.55 and "KENA" or "MELESET", s.ok, s.bad
+	)
+end
+
+-- baca TryDodge game: jumlah parameter + nama arah yang dipakai (butuh debug.info / getconstants dari executor, kalau nggak ada ya dilewat)
+function V12.probeDodge(quiet)
+	local h = getHandler()
+	local f = h and h.TryDodge
+	if type(f) ~= "function" then
+		if not quiet then
+			print("[AutoParry:dodge] TryDodge game nggak kebaca -> dodge lewat remote langsung, arah:", tostring(CFG.DodgeDirection))
+		end
+		return
+	end
+	local okI, np = pcall(function()
+		local n = debug.info(f, "a")
+		return n
+	end)
+	if okI and type(np) == "number" then
+		V12.nParams = np
+	end
+	local consts, have = {}, {}
+	local gc = (debug and debug.getconstants) or getconstants
+	if type(gc) == "function" then
+		local okC, cs = pcall(gc, f)
+		if okC and type(cs) == "table" then
+			for _, c in pairs(cs) do
+				if type(c) == "string" and #c <= 24 then
+					consts[#consts + 1] = c
+					have[c] = true
+				end
+			end
+		end
+	end
+	if have.Front and not have.Forward then
+		V12.names.Forward = "Front"
+	end
+	if have.Backward and not have.Back then
+		V12.names.Back = "Backward"
+	end
+	if not quiet then
+		print(("[AutoParry:dodge] TryDodge: parameter %s | konstanta string: %s"):format(
+			tostring(V12.nParams), #consts > 0 and table.concat(consts, ", ") or "(nggak kebaca)"
+		))
+		print(("[AutoParry:dodge] nama arah dipakai: %s / %s / %s / %s | metode sekarang: %s"):format(
+			V12.names.Forward, V12.names.Back, V12.names.Left, V12.names.Right, V12.method()
+		))
+	end
+end
+
+-- tes manual: DodgeTest("Left") / DodgeTest("Back", "name") -> dodge ke arah itu lalu lapor beneran gerak ke sana atau nggak
+function V12.test(dirName, method)
+	local char, hrp = myState()
+	if not (char and hrp) then
+		print("[AutoParry:dodge] karakter belum siap")
+		return
+	end
+	local h = getHandler()
+	if not (h and type(h.TryDodge) == "function") then
+		print("[AutoParry:dodge] TryDodge game nggak kebaca, nggak bisa dites")
+		return
+	end
+	local fwd, rgt = V12.frameVecs(hrp)
+	local map = { forward = fwd, front = fwd, back = -fwd, backward = -fwd, left = -rgt, right = rgt }
+	local v = map[string.lower(tostring(dirName or "back"))]
+	if not v then
+		print("[AutoParry:dodge] pakai: DodgeTest('Forward' | 'Back' | 'Left' | 'Right', optional 'move' | 'name' | 'plain')")
+		return
+	end
+	local m = method or V12.method()
+	local pick = { v = v, name = V12.nameFor(v, fwd, rgt), method = m, inp = false, score = 0, shape = "tes" }
+	local ok, err = pcall(V12.invoke, h, pick)
+	if not ok then
+		print("[AutoParry:dodge] tes error:", tostring(err))
+		return
+	end
+	print(("[AutoParry:dodge] tes: dodge %s lewat metode %s (nggak lewat scheduler script, cd dodge game tetap berlaku)"):format(pick.name, m))
+	if m ~= "plain" then
+		V12.afterFire(pick, os.clock())
+	end
+	task.delay(0.45, function()
+		print("[AutoParry:dodge] hasil kalibrasi:", V12.lastCal)
+	end)
+end
+
+function V12.dump()
+	local ms = V12.ms
+	print(("[AutoParry:dodge] metode | move ok %d / bad %d | name ok %d / bad %d | dipilih: %s | param TryDodge: %s | mode arah: %s"):format(
+		ms.move.ok, ms.move.bad, ms.name.ok, ms.name.bad, V12.method(), tostring(V12.nParams), tostring(CFG.DodgeDirMode)
+	))
+	print("[AutoParry:dodge] kalibrasi terakhir:", V12.lastCal)
+	local l = V12.last
+	if l and l.pick then
+		local p = l.pick
+		print(("[AutoParry:dodge] pick terakhir: %s via %s | skor %.2f | bentuk %s | %s"):format(
+			tostring(p.name), tostring(p.method), p.score or 0, tostring(p.shape), p.inp and "ikut arah lu" or "pilihan script"
+		))
+	end
+	print(("[AutoParry:dodge] koreksi waktu dodge hasil belajar: %+.0f ms"):format(V12.dtune * 1000))
+	for k, st in pairs(V12.stat) do
+		print(("[AutoParry:dodge] %s | parry %d/%d | dodge %d/%d"):format(
+			k, math.floor(st.pok + 0.5), math.floor(st.pn + 0.5), math.floor(st.dok + 0.5), math.floor(st.dn + 0.5)
+		))
+	end
+end
+
+-- daftar style player di sekitar + profil + hasil belajar
+function V12.styleReport()
+	for _, pl in ipairs(Players:GetPlayers()) do
+		local c = pl.Character
+		if c and c ~= LocalPlayer.Character then
+			local raw = c:GetAttribute("Style")
+			local eff = V12.nameOf(c)
+			local p = V12.profile(c)
+			local note = (tostring(raw) ~= eff) and (" (atribut: " .. tostring(raw) .. ")") or ""
+			if p then
+				print(("[AutoParry:style] %s -> %s%s | M1 x%d (combo %.2fs) | M2 %s%s%s"):format(
+					pl.Name, eff, note, p.m1n, p.m1total, p.shape, p.unparry and " unparryable" or "", p.multi and " multi-hit" or ""
+				))
+			else
+				print(("[AutoParry:style] %s -> %s%s | spec nggak ketemu (pakai timing bawaan + belajar)"):format(pl.Name, eff, note))
+			end
+		end
+	end
+end
+
 
 ----------------------------------------------------------------------
 -- REACT
@@ -1882,6 +2666,13 @@ local function corrFor(attacker, plan)
 		local c = leadCorr[plan.key]
 		if c then
 			return c
+		end
+		-- v12: attacker ini belum pernah dipelajari -> pakai koreksi rata-rata style-nya (kalau konsisten)
+		if CFG.StylePrior then
+			local pr = SK.V12.priorFor(attacker, plan.key)
+			if pr then
+				return pr
+			end
 		end
 	end
 	if plan.kind == "M1" then
@@ -2232,8 +3023,25 @@ local function react(attacker, plan, tag)
 		local dodgeFirst = CFG.DodgeFirstM2
 			or (CFG.DodgeAfterMiss and (m2Miss[attacker] or 0) >= CFG.M2MissNeed and now - (m2MissAt[attacker] or -math.huge) < CFG.M2MissMemory)
 		local dodgeWhy = "M2 dodge duluan"
+		-- v12: otak M2 = peluang timing + hasil belajar per style + bentuk M2 (menggantikan aturan switch v5 kalau nyala)
+		local brainRan = false
+		if CFG.M2Brain and not CFG.DodgeFirstM2 and canParry and CFG.DodgeEnabled and CFG.DodgeForM2 then
+			local afterMiss = CFG.DodgeAfterMiss
+				and (m2Miss[attacker] or 0) >= CFG.M2MissNeed
+				and now - (m2MissAt[attacker] or -math.huge) < CFG.M2MissMemory
+			local okB, verdict, whyB = pcall(SK.V12.m2Decide, attacker, plan, lead, now, rtt, fl, sigma, parryConf, sure, afterMiss)
+			if okB and verdict then
+				brainRan = true
+				dodgeFirst = (verdict == "dodge")
+				if dodgeFirst then
+					dodgeWhy = whyB or dodgeWhy
+				end
+			elseif not okB then
+				trace("m2Decide error:", tostring(verdict))
+			end
+		end
 		-- v5: bandingin peluang sukses parry vs dodge, ambil yang lebih tinggi
-		if not dodgeFirst and canParry and CFG.SmartMode and CFG.DodgeEnabled and CFG.DodgeForM2 and sure then
+		if not brainRan and not dodgeFirst and canParry and CFG.SmartMode and CFG.DodgeEnabled and CFG.DodgeForM2 and sure then
 			local dOK, _, dAge, _, dd = dodgeProbe(lead, now, rtt, fl)
 			if dOK then
 				local dc = confWindow(dAge, dd.IFrames, sigma)
@@ -2845,6 +3653,7 @@ local function learnLead(attacker, kind, now)
 		local cur = leadCorr[rec.key] or 0
 		leadCorr[rec.key] = math.clamp(cur * (1 - g) + err * g, -0.1, 0.1)
 		leadN[rec.key] = n + 1
+		pcall(SK.V12.leadLearn, attacker, rec.key, err) -- v12: prior per style
 	end
 	if kind == "M1" then
 		local cur = leadAll[attacker.Name] or 0
@@ -2914,6 +3723,14 @@ local function onHit(data)
 			cv.at = now
 		elseif res == "Parried" or res == "Dodged" then
 			comboVictim[attacker] = nil
+		end
+	end
+
+	-- v12: belajar hasil parry / dodge M2 per style + koreksi waktu kirim dodge
+	if not isSK and typeof(attacker) == "Instance" then
+		local okL, errL = pcall(SK.V12.learn, attacker, kind, res, sent, now)
+		if not okL then
+			trace("v12 learn error:", tostring(errL))
 		end
 	end
 
@@ -3184,6 +4001,7 @@ local function onCombat(data)
 			end
 		elseif Specs.swingSound[kind] then
 			local now = os.clock()
+			pcall(SK.V12.hearSound, a, kind) -- v12: cocokin suara swing ke style (style basi / salah -> dikoreksi)
 			trace("swing M1 kebaca dari", a.Name, "sound:", tostring(kind))
 			local plan = m1Plan(a, now)
 			swingAt[a] = { t = now, lead = plan.lead, kind = "M1", key = plan.key, learn = plan.learn }
@@ -4628,6 +5446,14 @@ local function buildUI()
         { "Guard abis kena parry", "ParriedGuard", "block pas stun lepas kalau LU yang ke-parry" },
         { "Pad ping / fps", "LagAdaptive", "hold & chain melebar kalau ping tinggi / fps rendah" },
     })
+    group("Style & dodge arah (v12)", {
+        { "Kenali style pintar", "StyleIntel", "nama longgar + verifikasi dari suara swing" },
+        { "Prior per style", "StylePrior", "attacker baru langsung dapet koreksi lead style-nya" },
+        { "Dodge ikut arah gerak", "DodgeFollowInput", "nahan arah (WASD / stick) = dodge ke arah itu" },
+        { "Cek tembok / jurang", "DodgeSafety", "arah dodge nggak ke tembok, jurang, atau musuh lain" },
+        { "Otak M2", "M2Brain", "parry vs dodge dari peluang + hasil belajar per style" },
+        { "M2 throw/dash: dodge", "M2DodgeOnlyShapes", "bentuk M2 yang susah diparry diutamain dodge" },
+    })
     group("Abis kena & ngebut (v11.5)", {
         { "Guard abis kena", "HitGuard", "block ON tepat pas stun lepas -> hit lanjutan ke-parry / ke-block" },
         { "Guard abis kena M2/GB", "HitGuardM2", "guard yang sama abis kena M2 / guard break" },
@@ -5115,7 +5941,7 @@ end
 -- API + START
 ----------------------------------------------------------------------
 genv.__NyxAutoParry = {
-    Version = "11.5",
+    Version = "12.0",
     CFG = CFG,
     Counters = counters,
     Skips = skips,
@@ -5133,6 +5959,18 @@ genv.__NyxAutoParry = {
         }
     end,
     Why = whyReport,
+    DodgeProbe = function()
+        return SK.V12.probeDodge(false)
+    end,
+    DodgeTest = function(...)
+        return SK.V12.test(...)
+    end,
+    DodgeInfo = function()
+        return SK.V12.dump()
+    end,
+    Style = function()
+        return SK.V12.styleReport()
+    end,
     Reset = resetStats,
     Save = Store.save,
     Load = Store.load,
@@ -5178,6 +6016,10 @@ if (CFG.MigratedTo or 0) < 4 then
 end
 task.spawn(loadSpecs)
 task.spawn(function()
+    task.wait(2)
+    pcall(SK.V12.probeDodge, true) -- v12: baca TryDodge game (jumlah parameter, nama arah) tanpa print
+end)
+task.spawn(function()
     for _ = 1, 60 do
         if not alive or installSwingHook() then
             return
@@ -5195,5 +6037,5 @@ if CFG.UI then
     end)
 end
 
-notify("v11.5 loaded - tekan " .. CFG.ToggleKey.Name .. " buat toggle")
-log("loaded v11.5. toggle:", CFG.ToggleKey.Name, "| UI:", CFG.UIKey.Name, "| getgenv().__NyxAutoParry.Summary() buat ringkasan")
+notify("v12.0 loaded - tekan " .. CFG.ToggleKey.Name .. " buat toggle")
+log("loaded v12.0. toggle:", CFG.ToggleKey.Name, "| UI:", CFG.UIKey.Name, "| getgenv().__NyxAutoParry.Summary() buat ringkasan")
