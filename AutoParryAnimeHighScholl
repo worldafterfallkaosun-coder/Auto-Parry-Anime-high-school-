@@ -220,6 +220,20 @@
 	           tail abis parry, hold guard.
 ]]
 
+--[[
+	v13.0 = v12 + (TeleLearn: telegraf skill/move yang belum dikenal dipelajari sendiri, LearnStore: hasil belajar disimpan antar sesi,
+	        barrage interval dari selisih hit asli, Doctor: diagnosa dari data sesi lu). Logika timing inti v12 NGGAK diubah; semua tambahan bisa dimatiin lewat CFG.
+	  Celah yang ketemu pas baca v12:
+	  TELEGRAF : cuma Sound swing M1 + Flash Heavy M2 yang dipahami. Skill / move lain (event Sound / Flash / Info lain) diabaikan, jadi hit pertama dari
+	             move itu selalu lolos dan tiap skill baru harus ditambahin manual. TeleLearn: tiap event yang belum dikenal dicatat, selisih ke hit yang
+	             nyampe dipelajari (kalau event bawa Hold, yang dipelajari selisih delay - Hold). Kalau konsisten + sering diikuti hit ke lu,
+	             event itu otomatis jadi telegraf (parry / block / dodge lewat react() yang sama). Noise (event yang nggak pernah diikuti hit) dibuang sendiri.
+	  BELAJAR  : semua hasil belajar (tune, stunSlack, prior style, statistik M2) hilang tiap sesi. LearnStore nyimpen ke file: yang tergantung ping dimuat cuma
+	             kalau ping sekarang mirip dan dikecilin, yang nggak tergantung ping dimuat selalu, dan dibuang kalau spec game berubah (sidik jari windup).
+	  BARRAGE  : interval hit lanjutan dulu diambil dari angka spec / default 0.2s. Sekarang dari rata-rata selisih hit yang beneran nyampe (BarrageGapLearn).
+	  DIAG     : getgenv().__NyxAutoParry.Doctor() = ringkasan hasil + saran konkret dari data sesi; TeleLearn() = telegraf yang lagi dipelajari / aktif.
+]]
+
 local genv = (getgenv and getgenv()) or _G
 if genv.__NyxAutoParry then
 	pcall(genv.__NyxAutoParry.Stop)
@@ -442,6 +456,22 @@ local CFG = {
 	DodgeLateBias = 0.6, -- target iframe digeser ke belakang sebanding noise (paket telat lebih sering daripada kecepetan)
 	M2Learn = true, -- statistik parry vs dodge M2 per style: yang lebih sering berhasil dikasih bobot lebih
 	M2BiasMax = 0.35, -- batas pengaruh statistik (0.35 = peluang maks digeser +-35%)
+
+	-- ===== v13.0 =====
+	TeleLearn = true, -- belajar sendiri telegraf (event Sound / Flash / dll yang belum dikenal) yang ngedahuluin hit; kalau udah konsisten dipakai buat parry / block / dodge
+	TeleMinN = 3, -- sampel minimal sebelum sebuah telegraf dipercaya
+	TeleMaxStd = 0.03, -- simpangan maksimal (detik) selisih telegraf -> hit (otomatis melebar kalau ping goyang, maks 0.06)
+	TeleMinRatio = 0.5, -- minimal (hit ke lu / kemunculan event di deket lu) biar event dianggap telegraf serangan, bukan efek suara biasa
+	TeleOccRange = 18, -- stud: kemunculan event cuma dihitung kalau attacker sedeket ini DAN menghadap lu
+	TeleActRange = 26, -- stud: telegraf yang udah kebelajar cuma diproses kalau attacker sedeket ini (threat check react() tetap jalan)
+	TeleMinLead = 0.10, -- detik: telegraf dengan lead lebih pendek dari ini nggak ada gunanya (nggak mungkin di-react)
+	TeleMaxDelay = 1.6, -- detik: batas selisih event -> hit yang masih dianggap berhubungan
+	TeleMaxKeys = 80, -- batas jumlah jenis event yang dipantau
+	TeleNoiseOcc = 40, -- event yang muncul segini kali di deket lu (menghadap lu) tapi nggak pernah diikuti hit = dianggap noise, dibuang
+	BarrageGapLearn = true, -- interval barrage dipakai dari selisih hit yang beneran nyampe (bukan cuma angka spec / default)
+	LearnStore = true, -- simpan / muat hasil belajar (tune, prior style, statistik M2, telegraf) biar nggak mulai dari nol tiap sesi
+	LearnFile = "NyxAutoParry_learn_v13.json",
+	LearnSaveEvery = 30, -- detik minimal antar penyimpanan (cuma pas lagi nggak tarung)
 }
 
 ----------------------------------------------------------------------
@@ -3290,13 +3320,22 @@ function SK.reflex(attacker, now, res)
 	end
 	local b0 = SK.barr[attacker]
 	local n, spec
+	local gapEst = nil -- v13: rata-rata selisih hit barrage yang beneran nyampe (hit-ke-hit, jalur jaringan sama = akurat)
 	if b0 and (now - b0.at) <= b0.spec.interval * CFG.BarrageWindow then
 		n = b0.n + 1
 		spec = (n == 2) and SK.spec(attacker, now - b0.at) or b0.spec
+		if CFG.BarrageGapLearn then
+			local g = now - b0.at
+			if g >= 0.06 and g <= spec.interval * 1.5 then
+				gapEst = b0.gap and (b0.gap * 0.5 + g * 0.5) or g
+			else
+				gapEst = b0.gap
+			end
+		end
 	else
 		n, spec = 1, SK.spec(attacker, nil)
 	end
-	SK.barr[attacker] = { n = n, at = now, spec = spec }
+	SK.barr[attacker] = { n = n, at = now, spec = spec, gap = gapEst }
 
 	-- attacker yang lagi nge-barrage lu tetap ancaman walau cek hitbox meleset (sama kayak combo M1)
 	local cv = comboVictim[attacker]
@@ -3319,7 +3358,7 @@ function SK.reflex(attacker, now, res)
 	counters.barrage += 1
 	react(attacker, {
 		kind = spec.breaks and "M2" or "M1",
-		lead = spec.interval,
+		lead = gapEst and math.clamp(gapEst, spec.interval * 0.6, spec.interval * 1.4) or spec.interval,
 		reach = numAttr(attacker, "ReachFactor", 1),
 		key = "SK:" .. attacker.Name,
 		learn = false,
@@ -3757,6 +3796,10 @@ local function onHit(data)
 		SK.seen[data.Kind] = true
 		evt("info", "Hit Kind lain: " .. data.Kind)
 	end
+	-- v13: TeleLearn belajar dari hit ini (event apa yang ngedahuluin, selisih waktunya berapa)
+	if CFG.TeleLearn and not SK.tl.off then
+		SK.tlSafe(SK.tlHit, data, attacker, isSK, now)
+	end
 	-- v11.5: hit ini lanjutan combo yang ditebak M1r terakhir? -> pelajari selisih interval aslinya
 	if not isSK and typeof(attacker) == "Instance" then
 		local okG, errG = pcall(SK.gapLearn, attacker, now, kind)
@@ -4029,6 +4072,548 @@ local function retryGuard()
 	end)
 end
 
+----------------------------------------------------------------------
+-- v13: TELELEARN -- belajar sendiri telegraf serangan yang belum dikenal script
+-- v12 cuma ngerti Sound swing M1 + Flash Heavy M2. Skill / move lain yang ngirim event lain (Sound / Flash / Info baru)
+-- dulu diabaikan (cuma kelihatan di log "Hit Kind lain"), jadi hit pertamanya selalu lolos.
+-- Sekarang tiap event yang belum dikenal dari attacker dicatat. Pas hit ke lu nyampe, selisih waktunya dihitung per jenis event.
+-- Kalau satu jenis event konsisten ngedahuluin hit (>= TeleMinN sampel, simpangan kecil, sering diikuti hit ke lu),
+-- event itu dianggap telegraf dan langsung dipakai buat parry / block / dodge lewat react() yang sama.
+-- Semua lewat pcall (SK.tlSafe): kalau error berulang, TeleLearn mati sendiri dan jalur v12 tetap jalan.
+----------------------------------------------------------------------
+SK.tl = {
+	keys = {},
+	nkeys = 0,
+	learned = 0,
+	acted = 0,
+	errs = 0,
+	off = false,
+	recent = setmetatable({}, weak), -- [attacker] = daftar sinyal event terakhir { key, t, dist, hold, used }
+	lastAct = setmetatable({}, weak),
+}
+
+function SK.fin(x)
+	return type(x) == "number" and x == x and x > -1e9 and x < 1e9
+end
+
+function SK.tlSafe(fn, ...)
+	local ok, err = pcall(fn, ...)
+	if not ok then
+		local T = SK.tl
+		T.errs += 1
+		if T.errs <= 3 then
+			print("[AutoParry] TeleLearn error:", tostring(err))
+		end
+		if T.errs >= 12 then
+			T.off = true
+			print("[AutoParry] TeleLearn dimatiin: error berulang")
+		end
+	end
+end
+
+-- (attacker menghadap lu?, jarak datar attacker -> lu)
+function SK.tlFacing(a)
+	local _, hrp = myState()
+	local ah = a:FindFirstChild("HumanoidRootPart")
+	if not (hrp and ah) then
+		return false, math.huge
+	end
+	local d = (hrp.Position - ah.Position) * Vector3.new(1, 0, 1)
+	local m = d.Magnitude
+	if m < 0.5 then
+		return true, m
+	end
+	local lk = ah.CFrame.LookVector * Vector3.new(1, 0, 1)
+	if lk.Magnitude < 0.01 then
+		return true, m
+	end
+	return lk.Unit:Dot(d.Unit) > 0.2, m
+end
+
+-- block biasa nggak nyelametin (GuardBroken / hit Kind M2 mendominasi) -> perlakukan kayak M2 (parry atau dodge)
+function SK.tlBreaks(e)
+	return (e.nG >= 1 and e.nB == 0) or e.k2 * 2 > e.hits
+end
+
+function SK.tlMature(e)
+	if e.n < CFG.TeleMinN then
+		return false
+	end
+	local lim = math.min(math.max(CFG.TeleMaxStd, net.var * 1.2), 0.06)
+	if math.sqrt(e.var) > lim then
+		return false
+	end
+	return e.hits / math.max(e.occ, e.hits, 1) >= CFG.TeleMinRatio
+end
+
+-- dipanggil dari onCombat buat SETIAP event. Event yang udah dipahami v12 (swing M1, Flash Heavy) dan event hasil (Hit dll) dilewat.
+function SK.tlEvent(data, info, kind)
+	if info == nil or info == "Hit" or info == "BlockRefused" or info == "EndFlash" then
+		return
+	end
+	local a = data.Character
+	if typeof(a) ~= "Instance" or a == LocalPlayer.Character then
+		return
+	end
+	if (info == "Sound" and (kind == "HeavySwing" or Specs.swingSound[kind])) or (info == "Flash" and kind == "Heavy") then
+		return -- udah ditangani jalur v12
+	end
+	if isFar(a) then
+		return
+	end
+	local T = SK.tl
+	local now = os.clock()
+	local key = "E:" .. tostring(info) .. ":" .. tostring(kind)
+	local e = T.keys[key]
+	if not e then
+		if T.nkeys >= CFG.TeleMaxKeys then
+			return
+		end
+		e = { n = 0, mean = 0, var = 0.0016, occ = 0, hits = 0, dmax = 0, nB = 0, nG = 0, nP = 0, nH = 0, nD = 0, k2 = 0 }
+		T.keys[key] = e
+		T.nkeys += 1
+	end
+	local facing, dist = SK.tlFacing(a)
+	if facing and dist <= CFG.TeleOccRange then
+		e.occ += 1
+		if e.hits == 0 and e.occ >= CFG.TeleNoiseOcc then
+			T.keys[key] = nil -- sering muncul di deket lu tapi nggak pernah diikuti hit = bukan telegraf serangan
+			T.nkeys -= 1
+			return
+		end
+		if e.occ > 90 then
+			e.occ, e.hits = e.occ * 0.5, e.hits * 0.5
+		end
+	end
+	-- Flash biasanya bawa Hold (lama windup). Yang dipelajari selisih (delay - Hold), jadi skill yang Hold-nya berubah-ubah tetap kebaca.
+	local hold = (type(data.Hold) == "number" and data.Hold >= 0 and data.Hold < 4) and data.Hold or 0
+	local list = T.recent[a]
+	if not list then
+		list = {}
+		T.recent[a] = list
+	end
+	for i = #list, 1, -1 do
+		if now - list[i].t > 2.5 + list[i].hold then
+			table.remove(list, i)
+		end
+	end
+	if #list >= 10 then
+		table.remove(list, 1)
+	end
+	list[#list + 1] = { key = key, t = now, dist = dist, hold = hold, used = false }
+
+	if CFG.Enabled and dist <= CFG.TeleActRange and SK.tlMature(e) and e.mean + hold >= CFG.TeleMinLead then
+		if now - (T.lastAct[a] or -math.huge) >= 0.12 then
+			T.lastAct[a] = now
+			lastSwingSeen[a] = now
+			T.acted += 1
+			counters.tele = (counters.tele or 0) + 1
+			local breaks = SK.tlBreaks(e)
+			react(a, {
+				kind = breaks and "M2" or "M1",
+				lead = e.mean + hold,
+				reach = math.clamp(((e.dmax > 0 and e.dmax or CFG.FallbackRange) + 2) / CFG.FallbackRange, 0.7, 3),
+				learn = false,
+				nocorr = true,
+				tele = key,
+			}, breaks and "M2" or "M1")
+		end
+	end
+end
+
+-- dipanggil dari onHit (hit yang kena ke lu): hitung selisih tiap sinyal event terbaru -> hit ini
+function SK.tlHit(data, attacker, isSK, now)
+	if typeof(attacker) ~= "Instance" then
+		return
+	end
+	local T = SK.tl
+	local list = T.recent[attacker]
+	if not list or #list == 0 then
+		return
+	end
+	-- M1/M2 yang telegrafnya udah dikenal script dipelajari jalur v12 (learnLead), bukan di sini
+	if not isSK and now - (lastSwingSeen[attacker] or -math.huge) < 1.2 then
+		return
+	end
+	local res = data.Result
+	local isM2 = data.Kind == "M2"
+	local seen = {}
+	for i = #list, 1, -1 do
+		local s = list[i]
+		local d = now - s.t
+		if not s.used and d >= 0.04 and d <= CFG.TeleMaxDelay + s.hold then
+			s.used = true
+			local r = d - s.hold
+			local e = T.keys[s.key]
+			if e and not seen[s.key] and r >= -0.4 and r <= CFG.TeleMaxDelay then
+				seen[s.key] = true
+				local n = e.n
+				if n == 0 then
+					e.mean = r
+				else
+					local g = math.max(0.12, 1 / (n + 1))
+					local diff = r - e.mean
+					e.mean += diff * g
+					e.var = (1 - g) * (e.var + g * diff * diff)
+				end
+				e.n = n + 1
+				e.hits += 1
+				if isM2 then
+					e.k2 += 1
+				end
+				if res == "GuardBroken" then
+					e.nG += 1
+				elseif res == "Blocked" then
+					e.nB += 1
+				elseif res == "Parried" then
+					e.nP += 1
+				elseif res == "Dodged" then
+					e.nD += 1
+				elseif res == "Hit" then
+					e.nH += 1
+				end
+				local _, dist = SK.tlFacing(attacker)
+				if dist < 200 then
+					e.dmax = math.max(dist, e.dmax * 0.96)
+				end
+				T.learned += 1
+			end
+		end
+	end
+end
+
+-- getgenv().__NyxAutoParry.TeleLearn(): telegraf baru yang lagi dipelajari / udah aktif
+function SK.tlReport()
+	local T = SK.tl
+	local rows = {}
+	for key, e in pairs(T.keys) do
+		if e.n > 0 then
+			rows[#rows + 1] = { key, e }
+		end
+	end
+	table.sort(rows, function(x, y)
+		return x[2].n > y[2].n
+	end)
+	if #rows == 0 then
+		print("[AutoParry:tele] belum ada telegraf baru yang kebaca (butuh hit dari skill / move yang script belum kenal)")
+	end
+	for i = 1, math.min(#rows, 25) do
+		local key, e = rows[i][1], rows[i][2]
+		print(("[AutoParry:tele] %s | n %.0f | lead %.3fs +-%.3f | muncul %.0f, kena %.0f | jarak maks %.0f | %s | %s"):format(
+			key, e.n, e.mean, math.sqrt(e.var), e.occ, e.hits, e.dmax,
+			SK.tlBreaks(e) and "break-block" or "block-able", SK.tlMature(e) and "AKTIF" or "belajar"
+		))
+	end
+	print(("[AutoParry:tele] aksi %.0f | sampel %.0f | jenis event %.0f | error %.0f%s"):format(T.acted, T.learned, T.nkeys, T.errs, T.off and " | OFF" or ""))
+end
+
+----------------------------------------------------------------------
+-- v13: LEARNSTORE -- hasil belajar disimpen ke file, jadi nggak mulai dari nol tiap sesi
+-- v12 sengaja nggak nyimpen hasil belajar karena tergantung ping. Sekarang dipisah:
+--   * yang tergantung jaringan (tune M1/M2, stunSlack, statistik M2) cuma dimuat kalau ping sekarang mirip ping pas disimpan,
+--     itupun dikecilin (70%) biar masih adaptif;
+--   * yang nggak tergantung ping (prior per style, telegraf TeleLearn) dimuat selalu, jumlah sampel dibatasi biar tetap adaptif;
+--   * semuanya dibuang otomatis kalau sidik jari spec game (windup / style) beda = game di-update.
+----------------------------------------------------------------------
+SK.ls = { at = -math.huge, fp = "", ready = false }
+
+function SK.lsSig()
+	if Specs.count == 0 then
+		return nil
+	end
+	local names = {}
+	for name in pairs(Specs.styles) do
+		names[#names + 1] = name
+	end
+	table.sort(names)
+	local parts = {}
+	for _, name in ipairs(names) do
+		local def = Specs.styles[name]
+		parts[#parts + 1] = name
+		local sw = type(def.M1) == "table" and def.M1.Swings
+		if type(sw) == "table" then
+			for _, s in ipairs(sw) do
+				if type(s) == "table" then
+					parts[#parts + 1] = ("%.3f/%.3f"):format(s.Windup or 0, s.Endlag or 0)
+				end
+			end
+		end
+		if type(def.M2) == "table" then
+			parts[#parts + 1] = ("m%.3f"):format(def.M2.Windup or 0)
+		end
+	end
+	local s = table.concat(parts, "|")
+	local h = 5381
+	for i = 1, #s do
+		h = (h * 33 + string.byte(s, i)) % 4294967291
+	end
+	return Specs.count .. ":" .. #s .. ":" .. tostring(h)
+end
+
+function SK.lsFp()
+	return ("%.4f|%.4f|%.3f|%.0f|%.0f"):format(tune.M1, tune.M2, stunSlack, SK.tl.learned, counters.parried + counters.blocked + counters.dodged)
+end
+
+function SK.lsSave()
+	if not (CFG.LearnStore and SK.ls.ready and type(writefile) == "function") then
+		return false
+	end
+	local okS, sig = pcall(SK.lsSig)
+	if not (okS and sig) then
+		return false
+	end
+	local d = {
+		v = 13,
+		sig = sig,
+		rtt = net.rtt,
+		tune = { M1 = tune.M1, M2 = tune.M2 },
+		stunSlack = stunSlack,
+		sPrior = {},
+		sPriorN = {},
+		m2s = {},
+		tele = {},
+	}
+	for k, v in pairs(SK.sPrior) do
+		if type(k) == "string" and SK.fin(v) then
+			d.sPrior[k] = v
+			d.sPriorN[k] = SK.fin(SK.sPriorN[k]) and SK.sPriorN[k] or 0
+		end
+	end
+	for k, s in pairs(SK.m2s) do
+		if type(k) == "string" and SK.fin(s.pOk) and SK.fin(s.pN) and SK.fin(s.dOk) and SK.fin(s.dN) then
+			d.m2s[k] = { pOk = s.pOk, pN = s.pN, dOk = s.dOk, dN = s.dN }
+		end
+	end
+	local cnt = 0
+	for key, e in pairs(SK.tl.keys) do
+		if e.n >= 3 and e.hits >= 3 and cnt < 60 and SK.fin(e.mean) and SK.fin(e.var) then
+			cnt += 1
+			d.tele[key] = { n = e.n, mean = e.mean, var = e.var, occ = e.occ, hits = e.hits, dmax = e.dmax, nB = e.nB, nG = e.nG, nP = e.nP, nH = e.nH, nD = e.nD, k2 = e.k2 }
+		end
+	end
+	local okJ, raw = pcall(HttpService.JSONEncode, HttpService, d)
+	if not okJ then
+		return false
+	end
+	local ok = pcall(writefile, CFG.LearnFile, raw)
+	if ok then
+		SK.ls.at = os.clock()
+		SK.ls.fp = SK.lsFp()
+	end
+	return ok
+end
+
+function SK.lsLoad()
+	if not (CFG.LearnStore and type(isfile) == "function" and type(readfile) == "function") then
+		return false
+	end
+	local okE, exists = pcall(isfile, CFG.LearnFile)
+	if not (okE and exists) then
+		return false
+	end
+	local okR, raw = pcall(readfile, CFG.LearnFile)
+	if not okR or type(raw) ~= "string" then
+		return false
+	end
+	local okD, d = pcall(HttpService.JSONDecode, HttpService, raw)
+	if not okD or type(d) ~= "table" or d.v ~= 13 then
+		return false
+	end
+	local okS, sig = pcall(SK.lsSig)
+	if not (okS and sig) or d.sig ~= sig then
+		evt("info", "hasil belajar lama dibuang (spec game beda)")
+		return false
+	end
+	local cur = readPing() or net.rtt
+	local same = SK.fin(d.rtt) and math.abs(d.rtt - cur) <= math.max(0.04, d.rtt * 0.35)
+	if same then
+		local w = 0.7
+		if type(d.tune) == "table" then
+			if SK.fin(d.tune.M1) then
+				tune.M1 = math.clamp(d.tune.M1 * w, -CFG.TuneMax, CFG.TuneMax)
+			end
+			if SK.fin(d.tune.M2) then
+				tune.M2 = math.clamp(d.tune.M2 * w, -CFG.TuneMax, CFG.TuneMax)
+			end
+		end
+		if SK.fin(d.stunSlack) then
+			stunSlack = math.clamp(CFG.StunSlackStart * (1 - w) + d.stunSlack * w, CFG.StunSlackMin, CFG.StunSlackMax)
+		end
+		if type(d.m2s) == "table" then
+			for k, s in pairs(d.m2s) do
+				if type(k) == "string" and Specs.styles[k] and type(s) == "table" and SK.fin(s.pOk) and SK.fin(s.pN) and SK.fin(s.dOk) and SK.fin(s.dN) then
+					SK.m2s[k] = { pOk = s.pOk * 0.5, pN = s.pN * 0.5, dOk = s.dOk * 0.5, dN = s.dN * 0.5 }
+				end
+			end
+		end
+	end
+	if type(d.sPrior) == "table" then
+		for k, v in pairs(d.sPrior) do
+			if type(k) == "string" and SK.fin(v) then
+				SK.sPrior[k] = math.clamp(v, -0.08, 0.08)
+				local pn = type(d.sPriorN) == "table" and d.sPriorN[k] or 0
+				SK.sPriorN[k] = math.min(SK.fin(pn) and pn or 0, 6)
+			end
+		end
+	end
+	if type(d.tele) == "table" then
+		local T = SK.tl
+		for key, s in pairs(d.tele) do
+			if type(key) == "string" and type(s) == "table" and not T.keys[key] and T.nkeys < CFG.TeleMaxKeys
+				and SK.fin(s.mean) and SK.fin(s.var) and SK.fin(s.n) and SK.fin(s.hits) and SK.fin(s.occ) then
+				local cap = math.min(s.n, 6) / math.max(s.n, 1)
+				T.keys[key] = {
+					n = math.min(s.n, 6),
+					mean = s.mean,
+					var = math.clamp(s.var, 1e-6, 0.01),
+					occ = s.occ * cap,
+					hits = s.hits * cap,
+					dmax = SK.fin(s.dmax) and s.dmax or 0,
+					nB = SK.fin(s.nB) and s.nB or 0,
+					nG = SK.fin(s.nG) and s.nG or 0,
+					nP = SK.fin(s.nP) and s.nP or 0,
+					nH = SK.fin(s.nH) and s.nH or 0,
+					nD = SK.fin(s.nD) and s.nD or 0,
+					k2 = SK.fin(s.k2) and s.k2 or 0,
+				}
+				T.nkeys += 1
+			end
+		end
+	end
+	return true
+end
+
+-- jalan di thread sendiri: tunggu spec ke-load, muat hasil belajar, terus simpan berkala pas lagi nggak tarung
+function SK.lsStart()
+	if not CFG.LearnStore then
+		return
+	end
+	for _ = 1, 80 do
+		if not alive then
+			return
+		end
+		if Specs.count > 0 then
+			break
+		end
+		task.wait(0.5)
+	end
+	if not alive or Specs.count == 0 then
+		return
+	end
+	local okL, loaded = pcall(SK.lsLoad)
+	if okL and loaded then
+		evt("info", "hasil belajar sesi lalu dimuat")
+	end
+	SK.ls.ready = true
+	SK.ls.fp = SK.lsFp()
+	while alive do
+		task.wait(10)
+		if not alive then
+			break
+		end
+		local now = os.clock()
+		if CFG.LearnStore and now - SK.ls.at > CFG.LearnSaveEvery and not SK.hot(now) and SK.lsFp() ~= SK.ls.fp then
+			pcall(SK.lsSave)
+		end
+	end
+end
+
+----------------------------------------------------------------------
+-- v13: DOCTOR -- "apa yang kurang?" dijawab dari data sesi lu sendiri (getgenv().__NyxAutoParry.Doctor())
+----------------------------------------------------------------------
+function SK.doctor()
+	local c = counters
+	local P, B, D, H, G = c.parried, c.blocked, c.dodged, c.hit, c.guardbroken
+	local all = P + B + D + H + G
+	local out = {}
+	local function say(s)
+		out[#out + 1] = s
+		print("[AutoParry:doctor] " .. s)
+	end
+	if all < 10 then
+		say(("data belum cukup (%.0f hit tercatat, butuh minimal 10). Lawan dulu sebentar, terus panggil Doctor() lagi."):format(all))
+		return out
+	end
+	local bad = H + G
+	say(("hasil: parry %.0f%% | block %.0f%% | dodge %.0f%% | KENA %.0f%% (%.0f dari %.0f hit)"):format(
+		P / all * 100, B / all * 100, D / all * 100, bad / all * 100, bad, all
+	))
+	local rows = {}
+	for k, v in pairs(skips) do
+		if k ~= "dup" and k ~= "iframes" and k ~= "locked" then
+			rows[#rows + 1] = { k, v }
+		end
+	end
+	table.sort(rows, function(x, y)
+		return x[2] > y[2]
+	end)
+	local pingMs = ("%.0f"):format(net.rtt * 1000)
+	for i = 1, math.min(#rows, 4) do
+		local k, v = rows[i][1], rows[i][2]
+		local tip = nil
+		if k == "late" then
+			tip = "ping " .. pingMs .. "ms + frame lebih gede dari windup serangan, jadi hit pertama emang nggak sempat di-react. Yang bisa: turunin ping / pindah server, jaga LateModeM1 = \"block\", dan biarin HitGuard + TeleLearn nutup hit lanjutan."
+		elseif k == "locked/cd" then
+			tip = "block kekunci cooldown 0.75s abis block lepas. Jangan lepas block manual pas ada musuh aktif; naikin MaxHoldActive atau PostParryTail."
+		elseif k == "locked/busy" then
+			tip = "lu lagi nyerang (busy) pas hit dateng. Pastiin GuardPriority = true, dan jangan spam klik pas lawan baru ngayun."
+		elseif k == "locked/stun" or k == "locked/ke-parry" then
+			tip = "block kekunci stun. Pastiin HitGuard dan ParriedGuard true; naikin HitGuardRange kalau lawan agak jauh."
+		elseif k == "locked/dodge" then
+			tip = "block ketahan dodge (Busy 0.4s). Matiin DodgeForM1 atau set DodgeFirstM2 = false kalau dodge kebanyakan."
+		elseif k == "locked/game" then
+			tip = "state game (CombatHandler.Local) yang nahan block. Kalau block kerasa telat, coba UseGameState = false."
+		elseif k == "range" then
+			tip = "banyak ancaman dibuang karena dianggap di luar jangkauan. Naikin RangeMargin (+0.5), WidthMargin atau CloseAlways (+2)."
+		elseif k == "heldold" then
+			tip = "block yang udah nyala kelamaan buat nge-parry (wajar kalau lagi chain). Kalau sering, kecilin ChainHold."
+		elseif k == "parrycd" then
+			tip = "parry masih cooldown (0.7s) pas hit dateng, normal di combo cepat. Pastiin BlockFallback = true."
+		elseif k == "dodge-late" or k == "dodge-early" or k == "dodge-recheck" or k == "dodge-unsure" then
+			tip = "dodge nggak sempat / kebuang. Cek DodgeInfo(); coba naikin DodgeLateBias."
+		elseif k == "notincombat" then
+			tip = "flag InCombat lu false pas ada serangan. Nyalain stance (T) lebih awal."
+		end
+		if tip then
+			say(("#%d skip \"%s\" x%.0f: %s"):format(i, k, v, tip))
+		else
+			say(("#%d skip \"%s\" x%.0f"):format(i, k, v))
+		end
+	end
+	if math.abs(tune.M1) >= CFG.TuneMax * 0.9 then
+		say(("tune M1 mentok (%+.3f). Geser TargetAgeM1 (+/-0.02) ke arah yang sama."):format(tune.M1))
+	end
+	if math.abs(tune.M2) >= CFG.TuneMax * 0.9 then
+		say(("tune M2 mentok (%+.3f). Geser TargetAgeM2 (+/-0.02) ke arah yang sama."):format(tune.M2))
+	end
+	if frame.fps < 40 then
+		say(("fps rendah (%.0f): timing jadi kasar. Turunin grafik, atau set UI = false."):format(frame.fps))
+	end
+	if net.var > 0.04 then
+		say(("ping goyang (+-%.0fms): jaga LagAdaptive = true."):format(net.var * 1000))
+	end
+	local mature, learning = 0, 0
+	for _, e in pairs(SK.tl.keys) do
+		if e.n > 0 then
+			if SK.tlMature(e) then
+				mature = mature + 1
+			else
+				learning = learning + 1
+			end
+		end
+	end
+	local kinds = {}
+	for k in pairs(SK.seen) do
+		kinds[#kinds + 1] = tostring(k)
+	end
+	table.sort(kinds)
+	if #kinds > 0 then
+		say("skill yang pernah kena ke lu: " .. table.concat(kinds, ", ") .. (mature == 0 and " (belum ada telegrafnya yang kebelajar; makin sering kena, makin cepat TeleLearn nangkep)" or ""))
+	end
+	say(("TeleLearn: %.0f telegraf aktif, %.0f lagi dipelajari (detail: TeleLearn())"):format(mature, learning))
+	return out
+end
+
 local seenKind = {}
 
 local function onCombat(data)
@@ -4036,6 +4621,10 @@ local function onCombat(data)
 		return
 	end
 	local info, kind = data.Info, data.Kind
+	-- v13: TeleLearn nyatet semua event yang belum dikenal (dan jalanin telegraf yang udah kebelajar)
+	if CFG.TeleLearn and not SK.tl.off and info ~= "Hit" then
+		SK.tlSafe(SK.tlEvent, data, info, kind)
+	end
 	if not CFG.Enabled and (info == "Sound" or info == "Flash") then
 		return
 	end
@@ -4530,7 +5119,7 @@ local Store = { dirtyAt = nil, defaults = {}, active = nil }
 local SAVE_KEYS, SAVE_SET = {}, {}
 do
 	-- Enabled sengaja nggak disimpan (script jangan nyala OFF diam-diam); Debug/Trace nggak disimpan biar print massal nggak nyala sendiri
-	local skipKeys = { UI = true, ConfigFile = true, Enabled = true, Debug = true, Trace = true, DebugPlan = true }
+	local skipKeys = { UI = true, ConfigFile = true, LearnFile = true, Enabled = true, Debug = true, Trace = true, DebugPlan = true }
 	for k, v in pairs(CFG) do
 		local t = typeof(v)
 		if not skipKeys[k] and (t == "number" or t == "boolean" or t == "string" or t == "EnumItem") then
@@ -6009,7 +6598,7 @@ end
 -- API + START
 ----------------------------------------------------------------------
 genv.__NyxAutoParry = {
-    Version = "12.0",
+    Version = "13.0",
     CFG = CFG,
     Counters = counters,
     Skips = skips,
@@ -6029,6 +6618,10 @@ genv.__NyxAutoParry = {
     Why = whyReport,
     StyleIQ = SK.iqReport,
     DodgeInfo = SK.ddInfoPrint,
+    Doctor = SK.doctor,
+    TeleLearn = SK.tlReport,
+    LearnSave = SK.lsSave,
+    LearnLoad = SK.lsLoad,
     Reset = resetStats,
     Save = Store.save,
     Load = Store.load,
@@ -6036,6 +6629,7 @@ genv.__NyxAutoParry = {
     Stop = function()
         alive = false
         pcall(Store.save)
+        pcall(SK.lsSave)
         pcall(uninstallSwingHook)
         if blockHeld then
             pcall(sendBlock, false)
@@ -6079,6 +6673,7 @@ if (CFG.MigratedTo or 0) < 4 then
     Store.touch()
 end
 task.spawn(loadSpecs)
+task.spawn(SK.lsStart) -- v13: muat hasil belajar sesi lalu (nunggu spec ke-load), simpan berkala
 task.spawn(function()
     for _ = 1, 60 do
         if not alive or installSwingHook() then
@@ -6097,5 +6692,5 @@ if CFG.UI then
     end)
 end
 
-notify("v12.0 loaded - tekan " .. CFG.ToggleKey.Name .. " buat toggle")
-log("loaded v12.0. toggle:", CFG.ToggleKey.Name, "| UI:", CFG.UIKey.Name, "| getgenv().__NyxAutoParry.Summary() buat ringkasan")
+notify("v13.0 loaded - tekan " .. CFG.ToggleKey.Name .. " buat toggle")
+log("loaded v13.0. toggle:", CFG.ToggleKey.Name, "| UI:", CFG.UIKey.Name, "| getgenv().__NyxAutoParry.Summary() buat ringkasan")
