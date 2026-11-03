@@ -1,9 +1,11 @@
 --!nonstrict
 --[[
-    AutoParry v4.0 (= v3.1 + block fallback + auto dodge; logika parry v3.1 nggak diubah)
-    Game    : Roblox fighting game (ReplicatedStorage.Remotes.Combat, M1/M2/Block/Parry)
+    AutoParry v13.1
+    Game    : Roblox fighting game (ReplicatedStorage.Remotes.Combat, M1/M2/Block/Parry/Dodge)
     Runtime : Luau, client-side (jalanin lewat executor lu)
-    Toggle  : P  (ubah di CFG.ToggleKey)
+    Toggle  : P (CFG.ToggleKey)  |  UI: CFG.UIKey (orb geser = pindah, tap = buka/tutup)
+    Diag    : getgenv().__NyxAutoParry.{ Summary, Why, Doctor, State, StyleIQ, DodgeInfo, TeleLearn, Report }()
+    Riwayat : lihat CHANGELOG.md (v3 -> v13.1). Semua fitur tambahan bisa dimatiin lewat CFG.
 
     Aturan server (dari dump CombatHandler / CombatSettings):
       - Parry  = Block ON dengan umur 0..ParryWindow(0.25s) pas hit mendarat di server,
@@ -15,223 +17,8 @@
       - Block ON ditolak kalau: stun, guard break, BusyUntil (lagi nyerang/dash), atau
         belum lewat BlockCooldown(0.75s) sejak Block OFF.
 
-    Yang baru di v3 (fokus: fps + ping + miss):
-      1. Scheduler pakai Heartbeat, bukan task.delay. task.delay selalu telat 0..1 frame
-         (di 30 fps bisa 33ms). Sekarang block dikirim di frame yang PALING DEKAT
-         sama waktu target (error maksimal setengah frame, bisa lebih awal).
-      2. Tracker FPS (rata-rata + p90 frame time). Telat proses event (~setengah frame)
-         dan telat kirim dikompensasi otomatis di rumus timing. Hold block juga
-         melebar kalau fps jelek / ping goyang.
-      3. Tracker ping ala TCP (SRTT + variasi), disampel terus tiap 0.1s (v2 cuma
-         nyampel pas ada event, jadi sering basi). Lonjakan sesaat nggak langsung dipercaya.
-      4. Cek ancaman pakai riwayat posisi lu (bukan cuma prediksi ke depan). Server
-         nge-rewind posisi lu ke masa lalu, jadi kalau lu dash menjauh, server masih
-         nganggep lu di range. Beberapa horizon dicoba, margin ikut melebar kalau ping tinggi.
-      5. Baca state game sendiri (CombatHandler.Local: BusyUntil, BlockReadyAt,
-         StunnedUntil, GuardBrokenUntil) buat tau kapan Block ON PASTI diterima server,
-         termasuk pas lu abis nyerang manual. Kalau nggak bisa di-require, balik ke model v2.
-      6. Belajar timing per attacker PER SWING (M1 combo ke-1/2/3/4) dan M2, bukan
-         satu angka per attacker. Murni dari selisih Sound -> Hit yang lu terima.
-      7. Prioritas: kalau M1 dan M2 bentrok dalam satu jendela cooldown, M2 yang diparry
-         (M2 = GuardBroken). M1 beruntun ke-Block ditutup pakai perpanjangan hold.
-      8. Sebelum M2 mendarat di masa parry cooldown, block yang masih nyala dilepas
-         dulu biar nggak jadi GuardBroken (cuma kena hit biasa).
-      9. Tune adaptif pakai momentum: salah arah berulang -> langkah makin gede.
-
-    Catatan jujur: M1 yang lead-nya <= ping lu (mis. windup 0.2s, ping 220ms) emang
-    nggak bisa di-react, paketnya nyampe setelah hit. Buat itu cuma ada chain cover.
-
-    Yang baru di v4:
-      A. Block fallback (M1): kalau parry nggak mungkin (parry cooldown, M1 Unparryable, block lama
-         udah lewat window parry) -> tetap Block biasa dan DITAHAN nyambung selama M1 beruntun.
-         Hold awal sekarang minimal sampai event hasil hit nyampe (dulu sering lepas duluan ->
-         chain guard nggak sempat nyambung -> kena cooldown block 0.75s -> hit penuh).
-         Kalau hasilnya Parried, block langsung dilepas lagi biar cooldown-nya cepet beres (ReleaseOnParry).
-      B. Auto dodge: M2 yang nggak bisa diparry (parry cd, Unparryable, block lama/kekunci, kecepetan)
-         -> Dodge, dikirim supaya hit mendarat di TENGAH iframe (0.26s). Block dilepas dulu (server
-         nolak dodge kalau masih Blocking). Pakai TryDodge bawaan game kalau bisa di-require.
-         Dodge juga jadi cadangan terakhir buat M1 yang nggak bisa diparry DAN nggak bisa diblock.
-      C. Parry M2 dari attacker itu pernah miss (GuardBroken / Hit) -> M2 berikutnya dari dia dodge
-         duluan sampai parry-nya berhasil lagi (DodgeAfterMiss).
-      Cooldown dash 2.25s, jadi dodge itu jatah langka: dipakai buat M2 dulu.
-]]
-
---[[
-    v5.0 (= v4 + anti-lag + block pas fight + parry/dodge pintar + UI)
-      LAG    : Trace/Debug default MATI (print massal ke console = sumber lag utama). FPS tracker tanpa
-               alokasi (dulu table.clone+sort tiap 12 frame), tanpa closure per frame, tanpa task.delay per
-               jadwal, ping stat di-cache, swing dari attacker jauh (>MaxTrackDist) diabaikan.
-      BLOCK  : UseGameState nyala (baca BusyUntil/BlockReadyAt/StunnedUntil game sendiri, jadi tau lu lagi
-               nyerang / baru block manual). Atribut "Blocking" dari block script sendiri nggak lagi dianggap
-               "lu lagi block manual". Abis parry, block ditahan sampai hit lain yang ditunggu ketutup.
-               Block ditolak server -> coba lagi begitu kunci kebuka kalau masih ada M1 dateng.
-               Klik kiri pas block script nyala (dan nggak ada hit nunggu) -> block dilepas biar bisa nyerang.
-      PARRY  : target umur block digeser sesuai noise (jitter ping + frame). Belajar lead lebih agresif di
-               sampel awal. Cek ancaman ikut gerak attacker (maju/lunge) + radius "deket banget".
-      DODGE  : bandingin PELUANG SUKSES parry vs dodge (distribusi normal dari noise ping/fps), ambil yang
-               lebih tinggi. Dodge cuma buat ancaman yang pasti kena hitbox, dicek ulang sebelum dikirim
-               (kalau attacker udah nggak ngincer lu, jatah dodge nggak dibuang).
-      UI     : panel kecil bisa digeser (header), "-" minimize, RightShift sembunyiin.
-]]
-
---[[
-	v6.0 (= v5 + fire instan + fix block kekunci + range lari + UI tombol bulat)
-	  LAG    : antrean dicek 2x per frame (PreRender + Heartbeat), jadwal yang udah waktunya langsung jalan
-			   (nggak nunggu frame berikutnya), trace/log nggak lagi nge-format string pas mati, UI cuma
-			   update pas panel kebuka, swing jauh (>60 stud) diabaikan, posisi cuma dicatat pas script ON.
-	  BLOCK  : FIX: rencana yang kekunci (cooldown block / busy abis nyerang / stun) dulu bisa kekirim setengah
-			   frame KECEPETAN lalu ditolak pengecekan sendiri -> hit lolos. Sekarang jadwalnya digeser.
-			   Status block lokal disamain sama atribut Blocking server (block yang dimatiin server nggak
-			   lagi dianggap masih nyala). Retry setelah ditolak dibatasin (nggak spam remote).
-			   Abis parry, block ditahan kalau ada attacker LAIN yang baru ngayun di deket lu.
-	  LARI   : range ancaman ikut kecepatan lari lu, 5 horizon rewind (bukan 3), margin depan/samping/belakang
-			   dilebarin, flag InCombat lu sendiri nggak lagi ngeblok kalau attacker-nya aktif.
-	  UI     : cuma tombol bulat kecil (geser = pindah, tap = buka/tutup panel).
-]]
-
---[[
-	v7.0 (= v6 + dibikin dari dump CombatHandler asli game)
-	  Hasil baca CombatHandler:
-		- Server nolak Block ON kalau lu lagi Busy (abis nyerang). HoldToSwing di game ngayun lagi di frame
-		  PERTAMA setelah busy abis -> Block ON script selalu kalah balapan -> hit lolos pas lu lagi fight.
-		- Block ON juga wajib InCombat (stance T nyala). Flag InCombat nggak bisa di-skip.
-		- Stun abis kena hit dibikin selesai 0.2s SEBELUM hit combo berikutnya mendarat -> masih ada celah buat
-		  parry hit ke-2 kalau Block ON dikirim persis pas stun abis.
-		- M1 Basic windup cuma 0.2s: di ping > ~150ms hit pertama emang nggak mungkin di-react (cuma bisa ditebak).
-	  Yang baru:
-		PRIORITAS : TrySwing game ditahan di jendela sebelum block dikirim -> block nggak kalah balapan sama
-					auto-swing. Swing manual pas nggak ada hit nunggu = block script dilepas dulu (mobile juga).
-		BLOCK     : Block/OFF dikirim lewat SetLocalBlocking asli game (state lokal, animasi, walkspeed ikut bener,
-					cek stun/busy/cooldown pakai state game sendiri). Kalau nggak bisa -> remote langsung.
-		PREDIKSI  : swing M1 berikutnya dalam combo ditebak dari spec style (windup+endlag) dan dijadwalin dari
-					sekarang -> hit yang lead-nya kurang dari ping tetap bisa di-parry. Dicek ulang sebelum dikirim.
-		RETRY     : block yang kekunci (stun abis kena hit / busy / cooldown) dicoba lagi begitu kunci kebuka,
-					asal paketnya masih sempat nyampe sebelum hit mendarat.
-]]
-
---[[
-	v8.0 (= v7 + kejar combo + unlock stun lebih awal + fallback block lewat remote + log "kenapa kena")
-	  COMBO  : abis M1 attacker mendarat di lu (kena / ke-block), hit combo berikutnya langsung direncanain dari event Hit itu
-			   (Endlag + Windup swing berikutnya) -> Block ON dikirim TEPAT pas stun lepas: parry kalau umur block masuk window,
-			   kalau nggak block biasa (ditahan), kalau block juga nggak sempat dodge. Attacker yang lagi nge-combo lu tetap
-			   dianggap ancaman walau cek hitbox meleset (knockback / ping / lunge).
-	  UNLOCK : stun dari hit dulu dihitung rtt/2 (kekonservatif). Sekarang dipelajari: block dikirim se-awal mungkin yang masih
-			   diterima server (stunSlack naik kalau BlockRefused, turun kalau block pas-unlock sukses).
-	  BLOCK  : cek lokal game (SetLocalBlocking) nolak padahal model kita bilang server bakal nerima -> kirim remote langsung
-			   (dulu: skip "local-refuse" -> hit lolos). Block biasa (fallback) dikirim lebih awal (BlockOnlyAge 0.22).
-	  DIAG   : getgenv().__NyxAutoParry.Why() = 10 hit terakhir + alasannya (skip apa, rtt, fps, block nyala/nggak, kunci, stun).
-]]
-
---[[
-	v9.0 (= v8 + perbaikan state + pengaman + UI baru). Logika timing inti v8 sengaja NGGAK diubah.
-	  FIX    : state combat direset pas mati/respawn (blockHeld, antrean, cooldown, combo nggak kebawa karakter lama).
-	           Tuning "kena/ke-block" cuma belajar dari block yang memang dikirim buat attacker itu (dulu hit dari attacker
-	           lain ikut ngegeser tune). Hitch frame nggak lagi ngerusak rata-rata frame time. Block/dodge dibatalin kalau
-	           attacker udah mati / knocked sebelum paket dikirim. Memori "parry M2 miss" kedaluwarsa (25s).
-	  SAFETY : self-heal tiap 0.5s (timer yang nyangkut nilainya nggak masuk akal dirapihin), ring buffer event.
-	  UI     : orb + jendela 5 tab (Ringkas, Bertahan, Timing, Log, Setelan), config disimpan otomatis, preset, grafik.
-]]
-
---[[
-	v10.0 (= v9 + sadar-skill). Logika timing inti v9 sengaja NGGAK diubah; semua tambahan di bawah ini bisa dimatiin lewat CFG.
-	  Dari hasil baca dump CombatHandler / Skills / CombatSettings:
-	  FIX   : event "Hit" dengan Kind selain M1/M2 (hit skill / barrage) dulu dianggap M1 -> ngegeser tune parry, ngerusak
-	          pelacak combo, dan nyalain hitReflex yang nebak swing M1 berikutnya (salah semua). Sekarang dipisah (isSK).
-	  BARU  : BarrageGuard. Skill multi-hit (Hits + Interval dibaca dari GSettings.Skills; mis. Hand Blades Barrage 4 hit tiap
-	          0.2s) nggak punya swing Sound/Flash yang bisa dibaca, jadi dipandu dari event Hit yang nyampe: hit berikutnya
-	          diprediksi di +Interval, Block/parry dikirim lagi tepat pas stun lepas, sampai hit terakhir. Barrage BreaksBlock -> dodge.
-	  BARU  : BackHitGuard. Server (Resolve) mecahin block + kasih damage penuh kalau penyerang di belakang lu DAN
-	          CombatSettings.BackHit.Enabled. Sekarang off di dump, tapi dibaca langsung: kalau nyala, parry/block diganti dodge.
-	  BARU  : tab Log nyatet Kind hit yang belum dikenal (info) -> bahan buat nambah dukungan skill berikutnya.
-]]
-
---[[
-	v12.0 = v11.5 + (pengenal style pintar, dodge ikut arah, M2 belajar dari hasil). Logika timing inti v11.5 NGGAK diubah; semua tambahan bisa dimatiin lewat CFG.
-	  STYLE  : (1) nama style dinormalisasi (besar/kecil, spasi, underscore) + sumber cadangan (atribut lain, StringValue, atribut Player).
-			   (2) style ditebak dari BUKTI yang kelihatan: nama Sound swing (unik per style), Hold Flash Heavy (cocok sama Windup+FlashTail style mana),
-			   jeda Sound->Hit M1 (cocok sama Windup swing style mana). Skor kumulatif + meluruh; atribut cuma ditimpa kalau buktinya konsisten & jauh lebih kuat.
-			   (3) PRIOR PER STYLE: koreksi lead hasil belajar dibagi ke semua attacker style yang sama -> attacker baru nggak mulai dari nol.
-	  DODGE  : arah dodge nggak maju doang. Lagi gerak (stick / WASD) -> ikut arah itu. Diem -> pilih dari 8 arah relatif attacker (samping buat lunge,
-			   mundur buat sweep, dst) dikurangi penalti tembok / jurang. Arah dipaksakan ke TryDodge lewat beberapa lapis (GetMoveVector, IsKeyDown,
-			   MoveDirection) dan DIVERIFIKASI dari Direction yang beneran dikirim game. Diagnosa: getgenv().__NyxAutoParry.DodgeInfo().
-	  M2     : statistik parry vs dodge per style (prior Beta) ikut ngebobot pilihan parry/dodge; target iframe dodge digeser sedikit ke belakang
-			   (paket telat lebih sering daripada kecepetan).
-	  DIAG   : getgenv().__NyxAutoParry.StyleIQ() = style tiap attacker + sumbernya + skor bukti + statistik M2.
-]]
---[[
-	v11.5 = v11.4 + (abis kena 1 hit langsung guard/parry, attacker yang ngebut/muter/dash, anti-lag UI)
-	  HITGUARD : abis KENA hit (stun), Block ON dikirim TEPAT pas stun lepas (bukan nunggu waktu hit lanjutan yang ditebak). Hit lanjutan
-	             yang mendarat 0.05-0.3s abis unlock = kena window parry (umur block 0..0.25s), yang lebih telat tetap ke-block (0 damage).
-	             Dicoba ulang (rearm) sampai kunci beneran kebuka, jadi hit counter yang nambah stun nggak bikin guard nyerah.
-	             Kalau hit lanjutan diperkirakan masih jauh abis unlock (> HitGuardEarly), guard jadi jaring pengaman: dikirim supaya umur
-	             block ~0.2s pas hit tebakan mendarat (rencana M1r tetap yang utama; guard cuma nutup kalau M1r gagal).
-	  GAPLEARN : interval hit->hit combo (Endlag+Windup) dipelajari per attacker. Dump: prediksi M1r meleset ~0.14s (hit mendarat lebih
-	             awal dari tebakan -> block belum nyala = kena). Koreksi sisa (di luar leadCorr) dipakai buat rencana berikutnya.
-	             ReflexAge: rencana refleks target umur block-nya digeser lebih awal (toleransi hit yang datang lebih cepat dari tebakan).
-	  MOBILE   : attacker yang lagi ngebut (dash kanan-kiri) atau muter cepat tetap dianggap ancaman (parry/block, bukan "range")
-	             sampai MobileRange stud. Cek hitbox dari posisi/hadap sekarang nggak bisa dipercaya pas dia lagi gerak.
-	  RETRY    : retry abis block ditolak boleh dicoba walau hit yang ditunggu tinggal 0.04s lagi (dulu minimal 0.15s -> hit lolos).
-	  ANTILAG  : refresh UI di-pause selama ada attacker aktif di deket lu (CombatUIPause) -> nggak ada update teks / grafik / simpan
-	             config pas lagi tarung. CPU script sendiri cuma ~46us/frame; hitch UI (layout teks, sparkline) yang dihindarin.
-]]
---[[
-	v11.4 = v11.3 + (dari live dump: abis LU ke-parry masih sering kena, M2 hampir selalu di-dodge)
-	  GUARD  : ParriedGuard sekarang di-REARM. Dulu cuma 3x coba tiap 0.03s lalu nyerah, padahal abis ke-parry lu kena stun parry 0.75s
-	           dan hit counter musuh yang mendarat di dalam stun nambah stun hit (+0.5s) -> kunci geser, guard keburu nyerah. Sekarang dicoba
-	           lagi tepat pas kunci beneran kebuka (sampai ParriedGuardWindow), dan kalau server nolak (BlockRefused) otomatis dijadwal ulang.
-	           Token guard dipisah dari planToken, jadi swing/plan musuh nggak lagi ngebatalin guard ini diam-diam.
-	  M2     : (1) "parry M2 miss" cuma dihitung kalau parry-nya beneran dikirim (dulu dodge yang gagal ikut dihitung -> M2 attacker itu
-	           di-dodge terus, padahal dodge cd 2.25s), butuh M2MissNeed miss berturut-turut + memori 12s. (2) dodge M2 nggak dibatalin
-	           recheck kalau attacker masih dalam DodgeRecheckDist. (3) switch parry->dodge lebih ketat (DodgeMinConf 0.70, gap 0.25).
-	           (4) telegraf M2 dari attacker yang madep ke lu sampai M2CloseAlways stud tetap dianggap ancaman -> parry (bukan "range").
-	  DIAG   : skip "locked" dipecah per sumber: locked/cd, locked/stun, locked/ke-parry, locked/dodge, locked/busy, locked/game
-	           (kelihatan di baris SKIP dump + di "alasan:" tiap hit). Ini yang nentuin apa yang ngunci block pas hit lolos.
-]]
---[[
-	v11.3 = v11.2 + LIVE di UI: tab Log punya kartu status live (block, tunggu, parry-cd, dodge, rtt, fps, kena terakhir, event terakhir;
-	  update ~4x/detik) dan tombol "Salin semua (live dump)" = ringkasan + status + semua hit yang lolos (+ alasan, style, jarak, event) +
-	  semua event + hitungan skip, satu klik ke clipboard (kalau clipboard nggak ada, dicetak ke console).
-]]
---[[
-	v11.2 = v11.1 + (1) M2RecheckDist: M2 yang di-skip "range" pas telegraf dicek ULANG pas windup udah lewat separuh (attacker lari/nge-dash
-	  nutup jarak selama windup 0.5-0.9s -> dulu hit-nya lolos tanpa rencana), (2) Why() nambah style attacker, jarak, dan umur event swing
-	  terakhir yang kebaca (kalau "event: nggak ada" = move itu nggak ngirim telegraf Flash/Sound yang dikenal script).
-]]
---[[
-	v11.1 = v11.0 + (1) Why() nandain hit yang masuk abis lu nge-parry / abis lu ke-parry, (2) kalau event Parried nyampe pas block
-	  udah keburu lepas (hold abis parry nggak sempat jalan), block dijadwalin ulang pas jendela hit lanjutan attacker (SK.postParryLate)
-	  dan di log keluar "parry masuk tapi block udah lepas Xms lalu".
-]]
---[[
-	v11.0 (= v10 + abis parry nggak bolong lagi + guard abis lu yang kena parry + pad ping/fps). Logika timing inti v10 NGGAK diubah.
-	  Dari dump CombatHandler: Block OFF = BlockReadyAt +0.75s (BlockCooldown). v10 selalu ngelepas block sedetik setelah Parried
-	  (ReleaseOnParry) -> selama 0.75s itu Block ON ditolak server. Hit lanjutan attacker yang ke-parry (stun 0.75s + windup 0.2s = ~0.95s)
-	  cuma nyisain jendela (0.2 - ping - frame - noise) buat Block ON -> di ping > ~65ms hampir selalu bolong, dan attacker LAIN / skill
-	  yang nyampe di 0.75s itu nggak bisa ditutup sama sekali. Block ngurangin damage 100% (DamageMultiplier = 0 di semua style), jadi
-	  ditahan jauh lebih aman daripada dilepas.
-	  PARRY  : PostParryHold. Abis Parried, block DITAHAN lewat jendela hit lanjutan attacker itu (+ tail, + pad ping/fps) dan minimal
-	           sampai ParryCooldown lewat. Dilepas lagi (gaya v10, buat re-parry) cuma kalau hitungan slack ping+fps lu masih longgar
-	           DAN nggak ada attacker lain yang aktif di deket lu.
-	  HOLD   : MaxHold 2.5s dulu motong block di tengah combo -> 0.75s bolong. Sekarang selama masih ada attacker aktif (ngayun
-	           dalam 1s terakhir, <= 20 stud) batasnya MaxHoldActive (6s). Hold nyambung/ResultPad ikut melebar kalau ping goyang.
-	  KENA PARRY (lu yang ke-parry musuh, stun 0.75s): unlock stun pakai kompensasi hasil belajar (stunComp), bukan rtt/2, dan Block
-	           dikirim otomatis pas stun lepas kalau musuhnya masih deket -> hit lanjutan dia di jendela parry (umur block 0..0.25s).
-	  PAD    : LagAdaptive. lagPad() = 0 di ping <= 80ms & 60fps; naik pelan sesuai ping / frame time / jitter. Dipakai di ChainHold,
-	           tail abis parry, hold guard.
-]]
-
---[[
-	v13.0 = v12 + (TeleLearn: telegraf skill/move yang belum dikenal dipelajari sendiri, LearnStore: hasil belajar disimpan antar sesi,
-	        barrage interval dari selisih hit asli, Doctor: diagnosa dari data sesi lu). Logika timing inti v12 NGGAK diubah; semua tambahan bisa dimatiin lewat CFG.
-	  Celah yang ketemu pas baca v12:
-	  TELEGRAF : cuma Sound swing M1 + Flash Heavy M2 yang dipahami. Skill / move lain (event Sound / Flash / Info lain) diabaikan, jadi hit pertama dari
-	             move itu selalu lolos dan tiap skill baru harus ditambahin manual. TeleLearn: tiap event yang belum dikenal dicatat, selisih ke hit yang
-	             nyampe dipelajari (kalau event bawa Hold, yang dipelajari selisih delay - Hold). Kalau konsisten + sering diikuti hit ke lu,
-	             event itu otomatis jadi telegraf (parry / block / dodge lewat react() yang sama). Noise (event yang nggak pernah diikuti hit) dibuang sendiri.
-	  BELAJAR  : semua hasil belajar (tune, stunSlack, prior style, statistik M2) hilang tiap sesi. LearnStore nyimpen ke file: yang tergantung ping dimuat cuma
-	             kalau ping sekarang mirip dan dikecilin, yang nggak tergantung ping dimuat selalu, dan dibuang kalau spec game berubah (sidik jari windup).
-	  BARRAGE  : interval hit lanjutan dulu diambil dari angka spec / default 0.2s. Sekarang dari rata-rata selisih hit yang beneran nyampe (BarrageGapLearn).
-	  DIAG     : getgenv().__NyxAutoParry.Doctor() = ringkasan hasil + saran konkret dari data sesi; TeleLearn() = telegraf yang lagi dipelajari / aktif.
+    Batas fisik: M1 yang lead-nya <= ping lu (mis. windup 0.2s, ping 220ms) nggak bisa di-react,
+    paketnya nyampe setelah hit. Buat itu cuma ada prediksi combo + chain cover.
 ]]
 
 local genv = (getgenv and getgenv()) or _G
@@ -248,7 +35,19 @@ local StarterGui = game:GetService("StarterGui")
 local HttpService = game:GetService("HttpService")
 
 local LocalPlayer = Players.LocalPlayer
-local Combat = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("Combat")
+local Combat
+do
+	local Remotes = ReplicatedStorage:WaitForChild("Remotes", 15)
+	Combat = Remotes and Remotes:WaitForChild("Combat", 15)
+end
+if not Combat then
+	local msg = "Remotes.Combat nggak ketemu (15s). Game update / nama remote berubah, script nggak dijalanin."
+	warn("[AutoParry] " .. msg)
+	pcall(function()
+		StarterGui:SetCore("SendNotification", { Title = "AutoParry", Text = msg, Duration = 6 })
+	end)
+	return
+end
 
 ----------------------------------------------------------------------
 -- CONFIG
@@ -450,7 +249,7 @@ local CFG = {
 	DodgeSafeDrop = 10, -- stud: tanah di ujung dash harus ada dalam segini ke bawah (anti jatuh ke jurang)
 	DodgeFrame = "Camera", -- "Camera" = arah relatif kamera (default Roblox) | "Character" = relatif hadap karakter
 	DodgeSpoofHold = 0.08, -- detik input arah palsu aktif setelah TryDodge dipanggil (kalau game baca arah telat)
-	DodgeHookIndex = true, -- pasang hook MoveDirection kalau TryDodge kebaca pakai MoveDirection (butuh hookmetamethod)
+	DodgeHookIndex = false, -- v13.1: default OFF. Hook __index global = ngelewatin SETIAP baca properti di game. Nyalain cuma kalau TryDodge game murni baca Humanoid.MoveDirection (butuh hookmetamethod)
 	DodgeRewriteRemote = false, -- tulis ulang Direction di remote Dodge (cuma ke nama yang pernah dikirim game sendiri). Nyalain kalau DodgeInfo() bilang arah nggak ikut
 	DodgeNameF = "Forward", DodgeNameB = "Back", DodgeNameL = "Left", DodgeNameR = "Right", -- nama arah buat remote
 	DodgeLateBias = 0.6, -- target iframe digeser ke belakang sebanding noise (paket telat lebih sering daripada kecepetan)
@@ -6598,7 +6397,7 @@ end
 -- API + START
 ----------------------------------------------------------------------
 genv.__NyxAutoParry = {
-    Version = "13.0",
+    Version = "13.1",
     CFG = CFG,
     Counters = counters,
     Skips = skips,
@@ -6672,6 +6471,12 @@ if (CFG.MigratedTo or 0) < 4 then
     CFG.MigratedTo = 4
     Store.touch()
 end
+-- v13.1: hook __index default OFF; config lama yang nyimpen true ditimpa SEKALI, abis itu pilihan lu dihormati
+if (CFG.MigratedTo or 0) < 5 then
+    CFG.DodgeHookIndex = false
+    CFG.MigratedTo = 5
+    Store.touch()
+end
 task.spawn(loadSpecs)
 task.spawn(SK.lsStart) -- v13: muat hasil belajar sesi lalu (nunggu spec ke-load), simpan berkala
 task.spawn(function()
@@ -6692,5 +6497,5 @@ if CFG.UI then
     end)
 end
 
-notify("v13.0 loaded - tekan " .. CFG.ToggleKey.Name .. " buat toggle")
-log("loaded v13.0. toggle:", CFG.ToggleKey.Name, "| UI:", CFG.UIKey.Name, "| getgenv().__NyxAutoParry.Summary() buat ringkasan")
+notify("v13.1 loaded - tekan " .. CFG.ToggleKey.Name .. " buat toggle")
+log("loaded v13.1. toggle:", CFG.ToggleKey.Name, "| UI:", CFG.UIKey.Name, "| getgenv().__NyxAutoParry.Summary() buat ringkasan")
