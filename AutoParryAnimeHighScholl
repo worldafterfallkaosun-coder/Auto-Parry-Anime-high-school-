@@ -1,6 +1,6 @@
 --!nonstrict
 --[[
-  AUTO PARRY v13.5  |  UI: Skill issue final boss (By Duke)
+  AUTO PARRY v13.6  |  UI: Skill issue final boss (By Duke)
 
   Isi file ini:
     1. Auto parry v13.2 UTUH (logika parry / dodge / learning tidak diubah).
@@ -18,6 +18,13 @@
   Tombol bulat: ketuk = buka/tutup | tahan = mode ringkas | tarik = pindah
   Hotkey default: RightAlt hub | F4 anti-lag | P toggle parry (bisa diubah di Setelan)
   Konfigurasi hub: AP13_hub.json | konfigurasi parry: tetap NyxAutoParry_v9.json
+
+  v13.6 (ringan + bersih, logika parry inti TIDAK diubah):
+    - Efek visual hub (aurora / partikel / scanline / glitch) default MATI. Nyalain lagi di Setelan > Efek visual.
+      Config lama otomatis dimigrasi SEKALI (fxv=2), abis itu pilihan lu dihormati.
+    - Hook FireServer: cek `self == Combat` (perbandingan referensi) gantinya typeof + baca .Name tiap remote game.
+      Hasilnya sama, kerjanya lebih sedikit di jalur yang kena SEMUA RemoteEvent.
+    - Versi di Summary / dump / notifikasi / Setelan disamain ke 13.6.
 
   v13.5 (perbaikan sisi hub / anti-lag, logika parry inti tidak diubah):
     - FIX autosave: perubahan opsi parry (slider / toggle / preset / reset) sekarang beneran tersimpan
@@ -43,7 +50,7 @@
 local function __startParry()
 --!nonstrict
 --[[
-    AutoParry v13.5
+    AutoParry v13.6
     Game    : Roblox fighting game (ReplicatedStorage.Remotes.Combat, M1/M2/Block/Parry/Dodge)
     Runtime : Luau, client-side (jalanin lewat executor lu)
     Toggle  : P (CFG.ToggleKey)  |  UI: CFG.UIKey (orb geser = pindah, tap = buka/tutup, tahan = ON/OFF)
@@ -2209,7 +2216,7 @@ function SK.ddInstall()
 				oldFS = hookfunction(Combat.FireServer, newcclosure(function(self, ...)
 					local s = H.fsSlot
 					-- v13.5: cuma remote Combat yang diproses (hook ini kena SEMUA RemoteEvent:FireServer di game)
-					if s and typeof(self) == "Instance" and self.Name == "Combat" then
+					if s and self == Combat then
 						pcall(s, self, (...))
 					end
 					return oldFS(self, ...)
@@ -5295,7 +5302,7 @@ local function summaryText()
     local rate = all > 0 and (c.parried + c.blocked + c.dodged) / all * 100 or 100
     local parryRate = landed > 0 and c.parried / landed * 100 or 0
     return table.concat({
-        ("AutoParry v13.5 | parry %d  block %d  dodge %d  kena %d  gb %d | aman %.0f%% | parry-rate %.0f%%"):format(
+        ("AutoParry v13.6 | parry %d  block %d  dodge %d  kena %d  gb %d | aman %.0f%% | parry-rate %.0f%%"):format(
             c.parried, c.blocked, c.dodged, c.hit, c.guardbroken, rate, parryRate
         ),
         ("rtt %.0fms (±%.0f) | fps %.0f (p90 %.0fms, spike %d) | cpu %.0fus/frame (max %.0fus)"):format(
@@ -5336,7 +5343,7 @@ function SK.dump()
     local function add(s)
         out[#out + 1] = s
     end
-    add("== AutoParry live dump · v13.5 ==")
+    add("== AutoParry live dump · v13.6 ==")
     add(summaryText())
     local r1, r2 = SK.live(now)
     add(r1)
@@ -5387,7 +5394,7 @@ end
 -- API + START
 ----------------------------------------------------------------------
 genv.__NyxAutoParry = {
-    Version = "13.5",
+    Version = "13.6",
     CFG = CFG,
     Counters = counters,
     Skips = skips,
@@ -5483,8 +5490,8 @@ task.spawn(function()
 end)
 
 
-notify("v13.5 loaded - tekan " .. CFG.ToggleKey.Name .. " buat toggle")
-log("loaded v13.5. toggle:", CFG.ToggleKey.Name, "| UI:", CFG.UIKey.Name, "| getgenv().__NyxAutoParry.Summary() buat ringkasan")
+notify("v13.6 loaded - tekan " .. CFG.ToggleKey.Name .. " buat toggle")
+log("loaded v13.6. toggle:", CFG.ToggleKey.Name, "| UI:", CFG.UIKey.Name, "| getgenv().__NyxAutoParry.Summary() buat ringkasan")
 
 end
 
@@ -6510,7 +6517,7 @@ print("[NONO v6.0] loaded | setfpscap:", HAS_SETFPSCAP, "| sethiddenproperty:", 
 -- =====================================================================
 --  DASAR
 -- =====================================================================
-local VERSION = "13.5"
+local VERSION = "13.6"
 
 local Players      = game:GetService("Players")
 local RunService   = game:GetService("RunService")
@@ -6588,7 +6595,7 @@ local FD, FB, FS = Enum.Font.GothamBold, Enum.Font.GothamMedium, Enum.Font.Gotha
 local CFGFILE = "AP13_hub.json"
 local S = {
     op = 74, sc = 100, accent = 1, motion = true, mute = true, leafGuard = true, autosave = true,
-    mini = false, fx = true, intro = true, fxFight = true,
+    mini = false, fx = false, fxv = 2, intro = true, fxFight = true,
     hk = { hub = "RightAlt", lag = "F4" },
     wp = nil, fp = nil, mp = nil,
     bst = { cap = 2, unlock = false, quality = false, light = false, mute = false, far = false, sweep = false, protect = true, lod = 400, dist = 120 },
@@ -6608,6 +6615,8 @@ local function loadSettings()
     num("op", 30, 95); num("sc", 70, 130); num("accent", 1, #ACCENTS)
     S.accent = math.floor(S.accent)
     bool("motion"); bool("mute"); bool("leafGuard"); bool("autosave"); bool("mini"); bool("fx"); bool("intro"); bool("fxFight")
+    -- v13.6: efek visual default mati; config lama (tanpa fxv=2) dimatiin SEKALI, abis itu pilihan lu dihormati
+    if d.fxv ~= 2 then S.fx = false end
     if type(d.hk) == "table" then
         for k, v in pairs(d.hk) do
             if S.hk[k] and type(v) == "string" then
@@ -9242,7 +9251,7 @@ do
     W.btnRow(p, { { "Matikan semua dan tutup", "dng", K.shutdownAll, 1, true } })
 
     local c5 = W.card(p)
-    W.row(c5, "Auto parry v" .. VERSION, "UI Skill issue final boss · By Duke · parry v13.5 dan Nono dikendalikan dari hub ini", false, 0)
+    W.row(c5, "Auto parry v" .. VERSION, "UI Skill issue final boss · By Duke · parry v13.6 dan Nono dikendalikan dari hub ini", false, 0)
 end
 BT = nil
 
