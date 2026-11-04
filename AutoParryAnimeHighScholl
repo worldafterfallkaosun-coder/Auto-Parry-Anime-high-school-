@@ -1,11 +1,12 @@
 --!nonstrict
 --[[
-    AutoParry v13.1
+    AutoParry v13.2
     Game    : Roblox fighting game (ReplicatedStorage.Remotes.Combat, M1/M2/Block/Parry/Dodge)
     Runtime : Luau, client-side (jalanin lewat executor lu)
-    Toggle  : P (CFG.ToggleKey)  |  UI: CFG.UIKey (orb geser = pindah, tap = buka/tutup)
+    Toggle  : P (CFG.ToggleKey)  |  UI: CFG.UIKey (orb geser = pindah, tap = buka/tutup, tahan = ON/OFF)
+    UI v13.2: dock orb+pill, jendela adaptif HP/PC (rail kiri / bar bawah), 7 tab, slider+stepper+ketik, cari semua opsi
     Diag    : getgenv().__NyxAutoParry.{ Summary, Why, Doctor, State, StyleIQ, DodgeInfo, TeleLearn, Report }()
-    Riwayat : lihat CHANGELOG.md (v3 -> v13.1). Semua fitur tambahan bisa dimatiin lewat CFG.
+    Riwayat : lihat CHANGELOG.md (v3 -> v13.2). Semua fitur tambahan bisa dimatiin lewat CFG.
 
     Aturan server (dari dump CombatHandler / CombatSettings):
       - Parry  = Block ON dengan umur 0..ParryWindow(0.25s) pas hit mendarat di server,
@@ -181,7 +182,7 @@ local CFG = {
 	SpikeGuard = true, -- hitch frame (>2.5x rata-rata) dipotong sebelum masuk ke rata-rata frame time
 	FramePump3 = true, -- antrean dicek juga di PreSimulation (selain PreRender + Heartbeat)
 	M2MissMemory = 12, -- detik: "parry M2 dari attacker ini miss" dilupain setelah segini [v11.4: 25 -> 12]
-	Accent = 1, -- warna aksen UI (1..4)
+	Accent = 1, -- warna aksen UI (1..6)
 	UIScale = 1,
 	Toasts = true,
 	AutoLite = true, -- UI melambat sendiri kalau fps jatuh / script berat
@@ -271,6 +272,10 @@ local CFG = {
 	LearnStore = true, -- simpan / muat hasil belajar (tune, prior style, statistik M2, telegraf) biar nggak mulai dari nol tiap sesi
 	LearnFile = "NyxAutoParry_learn_v13.json",
 	LearnSaveEvery = 30, -- detik minimal antar penyimpanan (cuma pas lagi nggak tarung)
+	UITab = "home", -- v13.2: tab UI terakhir yang kebuka (home/def/tun/intel/log/set/adv)
+	UIHud = true, -- v13.2: pill hitungan live (P/B/D/K) di samping orb
+	UIOrbHold = true, -- v13.2: tahan orb 0.5s = ON/OFF cepat
+	UIFightLite = true, -- v13.2: pas tarung orb + pill tetap diupdate (ringan), halaman tetap dibekukan
 }
 
 ----------------------------------------------------------------------
@@ -5056,7 +5061,7 @@ local function summaryText()
     local rate = all > 0 and (c.parried + c.blocked + c.dodged) / all * 100 or 100
     local parryRate = landed > 0 and c.parried / landed * 100 or 0
     return table.concat({
-        ("AutoParry v11.5 | parry %d  block %d  dodge %d  kena %d  gb %d | aman %.0f%% | parry-rate %.0f%%"):format(
+        ("AutoParry v13.2 | parry %d  block %d  dodge %d  kena %d  gb %d | aman %.0f%% | parry-rate %.0f%%"):format(
             c.parried, c.blocked, c.dodged, c.hit, c.guardbroken, rate, parryRate
         ),
         ("rtt %.0fms (±%.0f) | fps %.0f (p90 %.0fms, spike %d) | cpu %.0fus/frame (max %.0fus)"):format(
@@ -5097,7 +5102,7 @@ function SK.dump()
     local function add(s)
         out[#out + 1] = s
     end
-    add("== AutoParry live dump · v12.0 ==")
+    add("== AutoParry live dump · v13.2 ==")
     add(summaryText())
     local r1, r2 = SK.live(now)
     add(r1)
@@ -5145,1259 +5150,2302 @@ function SK.dump()
 end
 
 ----------------------------------------------------------------------
--- UI v9: orb kecil + jendela bertab (Ringkas / Bertahan / Timing / Log / Setelan)
--- Orb: geser = pindah, tap = buka/tutup jendela, warna = status (hijau ON, merah OFF, kuning mode hemat).
--- Jendela: header bisa digeser, "-" lipat, "x" tutup. Semua kontrol langsung nulis ke CFG dan disimpan otomatis.
+-- UI v13.2 (PRO): dock (orb + pill HUD) + jendela adaptif layar HP / PC
+--   * Ukuran dihitung dari viewport: landscape = rail tab di kiri, portrait = bar tab di bawah (jangkauan jempol).
+--     Ikut berubah pas rotasi layar. Target sentuh >= 34px, angka bisa digeser / +- (tahan = repeat) / diketik.
+--   * Orb: geser = pindah, tap = buka/tutup, tahan 0.5s = ON/OFF cepat. Pill di sampingnya = hitungan live.
+--   * Tab: Dasbor | Bertahan | Timing | Intel | Log | Setelan | Lanjut (cari + ubah SEMUA opsi CFG).
+--   * Semua kontrol langsung nulis ke CFG dan disimpan otomatis. Logika parry / dodge nggak disentuh.
 ----------------------------------------------------------------------
 local function buildUI()
-    if not alive then
-        return
-    end
-    local TweenService = game:GetService("TweenService")
+	if not alive then
+		return
+	end
+	local TweenService = game:GetService("TweenService")
+	local VER = "13.2"
+	local TOUCH = UserInputService.TouchEnabled
+	local CTL = TOUCH and 34 or 28 -- tinggi kontrol (stepper, chip, segmen)
+	local ROW = TOUCH and 42 or 34 -- tinggi baris toggle
+	local TITLE_H = TOUCH and 46 or 42
+	local FOOT_H = 22
+	local FB, FM, FR, FC = Enum.Font.GothamBold, Enum.Font.GothamMedium, Enum.Font.Gotham, Enum.Font.Code
+	local AL, AR, AC = Enum.TextXAlignment.Left, Enum.TextXAlignment.Right, Enum.TextXAlignment.Center
+	local AY = Enum.AutomaticSize.Y
+	local TR = Enum.TextTruncate.AtEnd
 
-    local ACCENTS = {
-        Color3.fromRGB(86, 156, 255),
-        Color3.fromRGB(62, 190, 125),
-        Color3.fromRGB(178, 128, 255),
-        Color3.fromRGB(255, 160, 70),
-    }
-    local T = {
-        bg = Color3.fromRGB(15, 16, 22),
-        bar = Color3.fromRGB(21, 23, 31),
-        card = Color3.fromRGB(28, 31, 42),
-        cardHi = Color3.fromRGB(40, 44, 60),
-        line = Color3.fromRGB(52, 57, 76),
-        text = Color3.fromRGB(236, 238, 246),
-        sub = Color3.fromRGB(144, 151, 172),
-        off = Color3.fromRGB(62, 67, 86),
-        good = Color3.fromRGB(62, 190, 125),
-        bad = Color3.fromRGB(235, 90, 90),
-        warn = Color3.fromRGB(255, 190, 72),
-        info = Color3.fromRGB(110, 170, 255),
-    }
-    local accent = ACCENTS[CFG.Accent] or ACCENTS[1]
-    local accentBind = {}
+	local ACCENTS = {
+		Color3.fromRGB(86, 156, 255),
+		Color3.fromRGB(62, 190, 125),
+		Color3.fromRGB(178, 128, 255),
+		Color3.fromRGB(255, 160, 70),
+		Color3.fromRGB(240, 105, 150),
+		Color3.fromRGB(70, 200, 210),
+	}
+	local T = {
+		bg = Color3.fromRGB(13, 14, 20),
+		bar = Color3.fromRGB(19, 21, 29),
+		card = Color3.fromRGB(26, 29, 40),
+		cardHi = Color3.fromRGB(38, 42, 58),
+		line = Color3.fromRGB(52, 57, 76),
+		text = Color3.fromRGB(236, 238, 246),
+		sub = Color3.fromRGB(144, 151, 172),
+		off = Color3.fromRGB(62, 67, 86),
+		good = Color3.fromRGB(62, 190, 125),
+		bad = Color3.fromRGB(235, 90, 90),
+		warn = Color3.fromRGB(255, 190, 72),
+		info = Color3.fromRGB(110, 170, 255),
+		dark = Color3.fromRGB(10, 12, 18),
+	}
+	-- semua helper UI ditaruh di tabel X (jatah local Luau per fungsi cuma 200)
+	local X = {
+		press = 0, collapsed = false, lite = false, W = 380, H = 440, rail = false,
+		open = {}, pages = {}, tabs = {}, counts = {}, bind = {}, hitSeen = counters.hit, lastSeq = EV.seq,
+		accent = ACCENTS[CFG.Accent] or ACCENTS[1], scale = 1,
+	}
+	X.bt = X.bind
+	local conns = {}
+	UI.conns = conns
+	X.cc = conns
+	local paints = {}
+	X.cp = paints
+	local orderN = setmetatable({}, { __mode = "k" })
 
-    local conns = {}
-    UI.conns = conns
-    local paints = {}
-    local activeDrag = nil
-    local orderN = setmetatable({}, { __mode = "k" })
-    local refreshPage = nil
-    local WIN_W, WIN_H, TITLE_H, TAB_H, FOOT_H = 352, 468, 42, 34, 24
+	------------------------------------------------------------------
+	-- helper dasar
+	------------------------------------------------------------------
+	local function hook(signal, fn)
+		local c = signal:Connect(fn)
+		local t = X.cc
+		t[#t + 1] = c
+		return c
+	end
+	local function addPaint(fn)
+		local t = X.cp
+		t[#t + 1] = fn
+	end
+	local NO_ORDER = { UIListLayout = true, UIGridLayout = true, UIPadding = true, UICorner = true, UIStroke = true, UIScale = true }
+	local function make(class, props, parent)
+		local o = Instance.new(class)
+		for k, v in pairs(props) do
+			o[k] = v
+		end
+		if parent then
+			local n = orderN[parent]
+			if n ~= nil and not NO_ORDER[class] then
+				n += 1
+				orderN[parent] = n
+				o.LayoutOrder = n
+			end
+			o.Parent = parent
+		end
+		return o
+	end
+	local function tween(inst, t, props)
+		pcall(function()
+			TweenService:Create(inst, TweenInfo.new(t, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), props):Play()
+		end)
+	end
+	local function corner(inst, r)
+		return make("UICorner", { CornerRadius = UDim.new(0, r) }, inst)
+	end
+	local function stroke(inst, col, th, tr)
+		return make("UIStroke", { Color = col, Thickness = th or 1, Transparency = tr or 0 }, inst)
+	end
+	local function pad(inst, l, t, r, b)
+		return make("UIPadding", {
+			PaddingLeft = UDim.new(0, l), PaddingTop = UDim.new(0, t),
+			PaddingRight = UDim.new(0, r), PaddingBottom = UDim.new(0, b),
+		}, inst)
+	end
+	local function list(inst, gap)
+		orderN[inst] = 0
+		return make("UIListLayout", { Padding = UDim.new(0, gap or 6), SortOrder = Enum.SortOrder.LayoutOrder }, inst)
+	end
+	local function text(parent, str, size, color, font, props)
+		local p = {
+			BackgroundTransparency = 1, BorderSizePixel = 0, Text = str, TextSize = size or 12,
+			TextColor3 = color or T.text, Font = font or FR,
+			TextXAlignment = AL, TextYAlignment = Enum.TextYAlignment.Center,
+			Size = UDim2.new(1, 0, 0, (size or 12) + 6),
+		}
+		if props then
+			for k, v in pairs(props) do
+				p[k] = v
+			end
+		end
+		return make("TextLabel", p, parent)
+	end
+	local function bindAccent(inst, prop)
+		local t = X.bt
+		t[#t + 1] = { inst, prop }
+		inst[prop] = X.accent
+	end
+	local function hex(c)
+		return ("#%02X%02X%02X"):format(math.floor(c.R * 255 + 0.5), math.floor(c.G * 255 + 0.5), math.floor(c.B * 255 + 0.5))
+	end
+	local function esc(s)
+		return (tostring(s):gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"))
+	end
+	local function setT(lbl, str)
+		if lbl.Text ~= str then
+			lbl.Text = str
+		end
+	end
+	local function paintAll()
+		for _, p in ipairs(paints) do
+			pcall(p)
+		end
+		if X.advP then
+			for _, p in ipairs(X.advP) do
+				pcall(p)
+			end
+		end
+	end
+	local function isPointer(input)
+		local t = input.UserInputType
+		return t == Enum.UserInputType.MouseButton1 or t == Enum.UserInputType.Touch
+	end
+	local function isMove(input)
+		local t = input.UserInputType
+		return t == Enum.UserInputType.MouseMovement or t == Enum.UserInputType.Touch
+	end
+	local function ms(v)
+		return math.floor(v * 1000 + 0.5)
+	end
 
-    local function hook(signal, fn)
-        local c = signal:Connect(fn)
-        conns[#conns + 1] = c
-        return c
-    end
+	------------------------------------------------------------------
+	-- ScreenGui
+	------------------------------------------------------------------
+	local gui = Instance.new("ScreenGui")
+	gui.Name = "NyxAutoParryUI"
+	gui.ResetOnSpawn = false
+	gui.IgnoreGuiInset = true
+	gui.DisplayOrder = 999
+	gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	pcall(function()
+		gui.ScreenInsets = Enum.ScreenInsets.DeviceSafeInsets -- poni / notch HP nggak nutup panel
+	end)
+	pcall(function()
+		if syn and syn.protect_gui then
+			syn.protect_gui(gui)
+		end
+	end)
+	local targets = {}
+	local okH, hui = pcall(function()
+		return gethui and gethui()
+	end)
+	if okH and hui then
+		targets[#targets + 1] = hui
+	end
+	local okC, cg = pcall(game.GetService, game, "CoreGui")
+	if okC and cg then
+		targets[#targets + 1] = cg
+	end
+	targets[#targets + 1] = LocalPlayer:WaitForChild("PlayerGui")
+	if not alive then
+		return
+	end
+	for _, p in ipairs(targets) do
+		pcall(function()
+			local old = p:FindFirstChild("NyxAutoParryUI")
+			if old then
+				old:Destroy()
+			end
+		end)
+	end
+	for _, p in ipairs(targets) do
+		local okP = pcall(function()
+			gui.Parent = p
+		end)
+		if okP and gui.Parent == p then
+			break
+		end
+	end
+	UI.gui = gui
 
-    local NO_ORDER = { UIListLayout = true, UIGridLayout = true, UIPadding = true, UICorner = true, UIStroke = true, UIScale = true }
-    local function make(class, props, parent)
-        local o = Instance.new(class)
-        for k, v in pairs(props) do
-            o[k] = v
-        end
-        if parent then
-            local n = orderN[parent]
-            if n ~= nil and not NO_ORDER[class] then
-                n += 1
-                orderN[parent] = n
-                o.LayoutOrder = n
-            end
-            o.Parent = parent
-        end
-        return o
-    end
+	function X.vp()
+		local v = gui.AbsoluteSize
+		if v.X < 100 or v.Y < 100 then
+			local cam = workspace.CurrentCamera
+			v = cam and cam.ViewportSize or Vector2.new(800, 400)
+		end
+		return v
+	end
 
-    local function tween(inst, t, props)
-        pcall(function()
-            TweenService:Create(inst, TweenInfo.new(t, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), props):Play()
-        end)
-    end
-    local function corner(inst, r)
-        return make("UICorner", { CornerRadius = UDim.new(0, r) }, inst)
-    end
-    local function stroke(inst, col, th, tr)
-        return make("UIStroke", { Color = col, Thickness = th or 1, Transparency = tr or 0 }, inst)
-    end
-    local function pad(inst, l, t, r, b)
-        return make("UIPadding", {
-            PaddingLeft = UDim.new(0, l), PaddingTop = UDim.new(0, t),
-            PaddingRight = UDim.new(0, r), PaddingBottom = UDim.new(0, b),
-        }, inst)
-    end
-    local function list(inst, gap)
-        orderN[inst] = 0
-        return make("UIListLayout", { Padding = UDim.new(0, gap or 6), SortOrder = Enum.SortOrder.LayoutOrder }, inst)
-    end
-    local function text(parent, str, size, color, font, props)
-        local p = {
-            BackgroundTransparency = 1, BorderSizePixel = 0, Text = str, TextSize = size or 12,
-            TextColor3 = color or T.text, Font = font or Enum.Font.Gotham,
-            TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Center,
-            Size = UDim2.new(1, 0, 0, (size or 12) + 6),
-        }
-        if props then
-            for k, v in pairs(props) do
-                p[k] = v
-            end
-        end
-        return make("TextLabel", p, parent)
-    end
-    local function bindAccent(inst, prop)
-        accentBind[#accentBind + 1] = { inst, prop }
-        inst[prop] = accent
-    end
-    local function hex(c)
-        return ("#%02X%02X%02X"):format(math.floor(c.R * 255 + 0.5), math.floor(c.G * 255 + 0.5), math.floor(c.B * 255 + 0.5))
-    end
-    local function esc(s)
-        return (tostring(s):gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"))
-    end
-    local function setT(lbl, str)
-        if lbl.Text ~= str then
-            lbl.Text = str
-        end
-    end
-    local function paintAll()
-        for _, p in ipairs(paints) do
-            p()
-        end
-    end
+	function X.clamp(f)
+		local vs = X.vp()
+		local ap, as = f.AbsolutePosition, f.AbsoluteSize
+		local dx, dy = 0, 0
+		if ap.X + as.X > vs.X then
+			dx = vs.X - (ap.X + as.X)
+		end
+		if ap.X + dx < 0 then
+			dx = -ap.X
+		end
+		if ap.Y + as.Y > vs.Y then
+			dy = vs.Y - (ap.Y + as.Y)
+		end
+		if ap.Y + dy < 0 then
+			dy = -ap.Y
+		end
+		if dx ~= 0 or dy ~= 0 then
+			local p = f.Position
+			f.Position = UDim2.new(p.X.Scale, p.X.Offset + dx, p.Y.Scale, p.Y.Offset + dy)
+		end
+	end
 
-    local function isPointer(input)
-        local t = input.UserInputType
-        return t == Enum.UserInputType.MouseButton1 or t == Enum.UserInputType.Touch
-    end
-    local function isMove(input)
-        local t = input.UserInputType
-        return t == Enum.UserInputType.MouseMovement or t == Enum.UserInputType.Touch
-    end
+	-- drag + tap + tahan (long-press). handle = yang disentuh, target = yang digeser
+	function X.dragify(handle, target, onTap, onHold)
+		hook(handle.InputBegan, function(input)
+			if not isPointer(input) then
+				return
+			end
+			local startPos, startUdim, moved, fired = input.Position, target.Position, false, false
+			local id = {}
+			X.ad = {
+				id = id,
+				update = function(i)
+					local d = i.Position - startPos
+					if not moved and d.Magnitude > 7 then
+						moved = true
+					end
+					if moved then
+						target.Position = UDim2.new(startUdim.X.Scale, startUdim.X.Offset + d.X, startUdim.Y.Scale, startUdim.Y.Offset + d.Y)
+					end
+				end,
+				finish = function()
+					if moved then
+						X.clamp(target)
+					elseif not fired and onTap then
+						onTap()
+					end
+				end,
+			}
+			if onHold then
+				task.delay(0.55, function()
+					if alive and X.ad and X.ad.id == id and not moved then
+						fired = true
+						onHold()
+					end
+				end)
+			end
+		end)
+	end
+	hook(UserInputService.InputChanged, function(input)
+		if X.ad and isMove(input) then
+			X.ad.update(input)
+		end
+	end)
+	hook(UserInputService.InputEnded, function(input)
+		if isPointer(input) then
+			X.press += 1
+			local d = X.ad
+			if d then
+				X.ad = nil
+				if d.lock then
+					d.lock.ScrollingEnabled = true
+				end
+				if d.finish then
+					d.finish()
+				end
+			end
+		end
+	end)
 
-    ------------------------------------------------------------------
-    -- ScreenGui
-    ------------------------------------------------------------------
-    local gui = Instance.new("ScreenGui")
-    gui.Name = "NyxAutoParryUI"
-    gui.ResetOnSpawn = false
-    gui.IgnoreGuiInset = true
-    gui.DisplayOrder = 999
-    gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-    pcall(function()
-        if syn and syn.protect_gui then
-            syn.protect_gui(gui)
-        end
-    end)
-    local targets = {}
-    local okH, hui = pcall(function()
-        return gethui and gethui()
-    end)
-    if okH and hui then
-        targets[#targets + 1] = hui
-    end
-    local okC, cg = pcall(game.GetService, game, "CoreGui")
-    if okC and cg then
-        targets[#targets + 1] = cg
-    end
-    targets[#targets + 1] = LocalPlayer:WaitForChild("PlayerGui")
-    if not alive then
-        return
-    end
-    for _, p in ipairs(targets) do
-        pcall(function()
-            local old = p:FindFirstChild("NyxAutoParryUI")
-            if old then
-                old:Destroy()
-            end
-        end)
-    end
-    for _, p in ipairs(targets) do
-        local okP = pcall(function()
-            gui.Parent = p
-        end)
-        if okP and gui.Parent == p then
-            break
-        end
-    end
-    UI.gui = gui
+	------------------------------------------------------------------
+	-- Dock: orb + pill HUD
+	------------------------------------------------------------------
+	local ORB = math.max(CFG.ButtonSize + 6, TOUCH and 46 or 40)
+	local dock = make("Frame", {
+		Name = "Dock", Size = UDim2.fromOffset(ORB, ORB), AutomaticSize = Enum.AutomaticSize.X, Position = UDim2.new(0, 12, 0.3, 0),
+		BackgroundTransparency = 1, BorderSizePixel = 0, Active = true, ZIndex = 20,
+	}, gui)
+	make("UIListLayout", {
+		FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 6),
+		VerticalAlignment = Enum.VerticalAlignment.Center, SortOrder = Enum.SortOrder.LayoutOrder,
+	}, dock)
+	local orb = make("TextButton", {
+		Name = "Orb", LayoutOrder = 1, Size = UDim2.fromOffset(ORB, ORB), Text = "AP", Font = FB, TextSize = 13, TextColor3 = T.text,
+		AutoButtonColor = false, BackgroundColor3 = T.good, BorderSizePixel = 0, ZIndex = 20,
+	}, dock)
+	corner(orb, ORB)
+	local orbRing = stroke(orb, T.text, 1.5, 0.55)
+	local hud = make("TextButton", {
+		Name = "Hud", LayoutOrder = 2, Size = UDim2.fromOffset(0, 28), AutomaticSize = Enum.AutomaticSize.X, Text = "", RichText = true,
+		Font = FC, TextSize = 11, TextColor3 = T.text, AutoButtonColor = false, BackgroundColor3 = T.bar, BackgroundTransparency = 0.05,
+		BorderSizePixel = 0, ZIndex = 20,
+	}, dock)
+	corner(hud, 14)
+	stroke(hud, T.line, 1, 0.3)
+	pad(hud, 10, 0, 10, 0)
 
-    local function clampToScreen(f)
-        local vs = gui.AbsoluteSize
-        local ap, as = f.AbsolutePosition, f.AbsoluteSize
-        local dx, dy = 0, 0
-        if ap.X + as.X > vs.X then
-            dx = vs.X - (ap.X + as.X)
-        end
-        if ap.X + dx < 0 then
-            dx = -ap.X
-        end
-        if ap.Y + as.Y > vs.Y then
-            dy = vs.Y - (ap.Y + as.Y)
-        end
-        if ap.Y + dy < 0 then
-            dy = -ap.Y
-        end
-        if dx ~= 0 or dy ~= 0 then
-            local p = f.Position
-            f.Position = UDim2.new(p.X.Scale, p.X.Offset + dx, p.Y.Scale, p.Y.Offset + dy)
-        end
-    end
+	------------------------------------------------------------------
+	-- Jendela
+	------------------------------------------------------------------
+	local win = make("Frame", {
+		Name = "Window", Size = UDim2.fromOffset(380, 440), Position = UDim2.fromOffset(40, 40), BackgroundColor3 = T.bg,
+		BorderSizePixel = 0, Visible = false, ClipsDescendants = true, Active = true, ZIndex = 10,
+	}, gui)
+	corner(win, 14)
+	stroke(win, T.line, 1, 0.2)
+	local winScale = make("UIScale", { Scale = 1 }, win)
 
-    local function makeDraggable(handle, target, onTap)
-        hook(handle.InputBegan, function(input)
-            if not isPointer(input) then
-                return
-            end
-            local startPos, startUdim, moved = input.Position, target.Position, false
-            activeDrag = {
-                update = function(i)
-                    local d = i.Position - startPos
-                    if not moved and d.Magnitude > 6 then
-                        moved = true
-                    end
-                    if moved then
-                        target.Position = UDim2.new(startUdim.X.Scale, startUdim.X.Offset + d.X, startUdim.Y.Scale, startUdim.Y.Offset + d.Y)
-                    end
-                end,
-                finish = function()
-                    if moved then
-                        clampToScreen(target)
-                    elseif onTap then
-                        onTap()
-                    end
-                end,
-            }
-        end)
-    end
+	local titleBar = make("Frame", { Size = UDim2.new(1, 0, 0, TITLE_H), BackgroundColor3 = T.bar, BorderSizePixel = 0 }, win)
+	local dot = make("Frame", { AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 14, 0.5, 0), Size = UDim2.fromOffset(8, 8), BackgroundColor3 = T.good, BorderSizePixel = 0 }, titleBar)
+	corner(dot, 4)
+	local BTN = TOUCH and 34 or 28
+	text(titleBar, ('Nyx AutoParry  <font size="10" color="%s">PRO v%s</font>'):format(hex(T.sub), VER), 14, T.text, FB, {
+		Position = UDim2.fromOffset(30, 0), Size = UDim2.new(1, -(30 + 8 + BTN * 2 + 14 + 44 + 10), 1, 0), RichText = true, TextTruncate = TR,
+	})
+	local function iconBtn(sym, xr, cb)
+		local b = make("TextButton", {
+			AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -xr, 0.5, 0), Size = UDim2.fromOffset(BTN, BTN), Text = sym,
+			Font = FB, TextSize = 15, TextColor3 = T.sub, BackgroundColor3 = T.cardHi, BorderSizePixel = 0, AutoButtonColor = false,
+		}, titleBar)
+		corner(b, 8)
+		hook(b.Activated, cb)
+		return b
+	end
+	iconBtn("x", 8, function()
+		win.Visible = false
+	end)
+	X.minBtn = iconBtn("-", 8 + BTN + 6, function()
+		X.setCollapsed(not X.collapsed)
+	end)
+	local pw = make("TextButton", {
+		AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -(8 + BTN * 2 + 14), 0.5, 0), Size = UDim2.fromOffset(44, 24),
+		Text = "", BackgroundColor3 = T.off, BorderSizePixel = 0, AutoButtonColor = false,
+	}, titleBar)
+	corner(pw, 12)
+	local pwKnob = make("Frame", { Size = UDim2.fromOffset(18, 18), Position = UDim2.fromOffset(3, 3), BackgroundColor3 = T.text, BorderSizePixel = 0 }, pw)
+	corner(pwKnob, 9)
+	local function paintPw(anim)
+		local on = CFG.Enabled and true or false
+		local kp = on and UDim2.fromOffset(23, 3) or UDim2.fromOffset(3, 3)
+		local col = on and X.accent or T.off
+		if anim == true then
+			tween(pwKnob, 0.12, { Position = kp })
+			tween(pw, 0.12, { BackgroundColor3 = col })
+		else
+			pwKnob.Position = kp
+			pw.BackgroundColor3 = col
+		end
+	end
+	hook(pw.Activated, function()
+		CFG.Enabled = not CFG.Enabled
+		paintPw(true)
+		UI.toast(CFG.Enabled and "AutoParry ON" or "AutoParry OFF", CFG.Enabled and "ok" or "bad")
+		UI.refresh()
+	end)
+	addPaint(paintPw)
+	paintPw(false)
 
-    hook(UserInputService.InputChanged, function(input)
-        if activeDrag and isMove(input) then
-            activeDrag.update(input)
-        end
-    end)
-    hook(UserInputService.InputEnded, function(input)
-        if activeDrag and isPointer(input) then
-            local d = activeDrag
-            activeDrag = nil
-            if d.lock then
-                d.lock.ScrollingEnabled = true
-            end
-            if d.finish then
-                d.finish()
-            end
-        end
-    end)
+	local body = make("Frame", { Position = UDim2.fromOffset(0, TITLE_H), Size = UDim2.new(1, 0, 1, -TITLE_H), BackgroundTransparency = 1, BorderSizePixel = 0 }, win)
+	local pagesHost = make("Frame", { Name = "Pages", BackgroundTransparency = 1, BorderSizePixel = 0, ClipsDescendants = true }, body)
+	X.pagesHost = pagesHost
+	local nav = make("ScrollingFrame", {
+		Name = "Nav", BackgroundColor3 = T.bar, BorderSizePixel = 0, ScrollBarThickness = 0, CanvasSize = UDim2.new(),
+		AutomaticCanvasSize = AY, ScrollingDirection = Enum.ScrollingDirection.Y,
+	}, body)
+	local navList = make("UIListLayout", { Padding = UDim.new(0, 2), SortOrder = Enum.SortOrder.LayoutOrder }, nav)
+	pad(nav, 4, 4, 4, 4)
+	local footer = make("Frame", { AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 0, 1, 0), Size = UDim2.new(1, 0, 0, FOOT_H), BackgroundColor3 = T.bar, BorderSizePixel = 0, ZIndex = 3 }, body)
+	local footL = text(footer, "", 10, T.sub, FC, { Position = UDim2.fromOffset(10, 0), Size = UDim2.new(0.64, -10, 1, 0), TextTruncate = TR, ZIndex = 3 })
+	local footR = text(footer, "", 10, T.sub, FC, { Position = UDim2.fromScale(0.64, 0), Size = UDim2.new(0.36, -10, 1, 0), TextXAlignment = AR, TextTruncate = TR, ZIndex = 3 })
 
-    ------------------------------------------------------------------
-    -- Orb
-    ------------------------------------------------------------------
-    local ORB = CFG.ButtonSize + 6
-    local orb = make("TextButton", {
-        Name = "Orb", Size = UDim2.fromOffset(ORB, ORB), Position = UDim2.new(0, 14, 0.35, 0), Text = "AP",
-        Font = Enum.Font.GothamBold, TextSize = 13, TextColor3 = T.text, AutoButtonColor = false,
-        BackgroundColor3 = T.good, BorderSizePixel = 0, ZIndex = 20,
-    }, gui)
-    corner(orb, ORB)
-    local orbRing = stroke(orb, T.text, 1.5, 0.55)
+	X.TABS = { { "home", "Dasbor" }, { "def", "Bertahan" }, { "tun", "Timing" }, { "intel", "Intel" }, { "log", "Log" }, { "set", "Setelan" }, { "adv", "Lanjut" } }
+	for i, t in ipairs(X.TABS) do
+		local b = make("TextButton", {
+			Name = t[1], LayoutOrder = i, Text = t[2], Font = FM, TextSize = 11, TextColor3 = T.sub, BackgroundColor3 = X.accent,
+			BackgroundTransparency = 1, BorderSizePixel = 0, AutoButtonColor = false, Size = UDim2.fromOffset(56, 40),
+		}, nav)
+		corner(b, 8)
+		bindAccent(b, "BackgroundColor3")
+		local ind = make("Frame", { BorderSizePixel = 0, BackgroundColor3 = X.accent, Visible = false }, b)
+		corner(ind, 2)
+		bindAccent(ind, "BackgroundColor3")
+		local badge = make("Frame", { Size = UDim2.fromOffset(8, 8), AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -5, 0, 5), BackgroundColor3 = T.bad, BorderSizePixel = 0, Visible = false }, b)
+		corner(badge, 4)
+		hook(b.Activated, function()
+			X.select(t[1])
+		end)
+		X.tabs[t[1]] = { btn = b, ind = ind, badge = badge }
+	end
 
-    ------------------------------------------------------------------
-    -- Jendela
-    ------------------------------------------------------------------
-    local win = make("Frame", {
-        Name = "Window", Size = UDim2.fromOffset(WIN_W, WIN_H), Position = UDim2.new(0, 14, 0.35, ORB + 8),
-        BackgroundColor3 = T.bg, BorderSizePixel = 0, Visible = false, ClipsDescendants = true, ZIndex = 10,
-    }, gui)
-    corner(win, 12)
-    stroke(win, T.line, 1)
-    local winScale = make("UIScale", { Scale = CFG.UIScale }, win)
+	------------------------------------------------------------------
+	-- Toast
+	------------------------------------------------------------------
+	local toastHost = make("Frame", {
+		Name = "Toasts", AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 8), Size = UDim2.fromOffset(260, 0),
+		AutomaticSize = AY, BackgroundTransparency = 1, ZIndex = 30,
+	}, gui)
+	make("UIListLayout", { Padding = UDim.new(0, 6), HorizontalAlignment = Enum.HorizontalAlignment.Center, SortOrder = Enum.SortOrder.LayoutOrder }, toastHost)
+	local toasts, toastSeq = {}, 0
+	UI.toast = function(msg, kind)
+		if not (CFG.Toasts and gui.Parent and gui.Enabled and alive) then
+			return
+		end
+		local col = (kind == "bad" and T.bad) or (kind == "ok" and T.good) or (kind == "warn" and T.warn) or X.accent
+		toastSeq += 1
+		local f = make("Frame", { LayoutOrder = toastSeq, Size = UDim2.new(1, 0, 0, 32), BackgroundColor3 = T.bar, BackgroundTransparency = 1, BorderSizePixel = 0, ZIndex = 30 }, toastHost)
+		corner(f, 9)
+		local st = stroke(f, col, 1.2, 1)
+		local lb = text(f, tostring(msg), 12, T.text, FM, { Size = UDim2.new(1, -16, 1, 0), Position = UDim2.fromOffset(8, 0), TextTransparency = 1, ZIndex = 31, TextXAlignment = AC, TextTruncate = TR })
+		tween(f, 0.15, { BackgroundTransparency = 0.05 })
+		tween(st, 0.15, { Transparency = 0.2 })
+		tween(lb, 0.15, { TextTransparency = 0 })
+		toasts[#toasts + 1] = f
+		while #toasts > 3 do
+			local old = table.remove(toasts, 1)
+			pcall(function()
+				old:Destroy()
+			end)
+		end
+		task.delay(2.2, function()
+			if f.Parent then
+				tween(f, 0.3, { BackgroundTransparency = 1 })
+				tween(st, 0.3, { Transparency = 1 })
+				tween(lb, 0.3, { TextTransparency = 1 })
+			end
+		end)
+		task.delay(2.55, function()
+			pcall(function()
+				f:Destroy()
+			end)
+		end)
+	end
 
-    local titleBar = make("Frame", { Size = UDim2.new(1, 0, 0, TITLE_H), BackgroundColor3 = T.bar, BorderSizePixel = 0 }, win)
-    local dot = make("Frame", { Position = UDim2.fromOffset(14, 17), Size = UDim2.fromOffset(8, 8), BackgroundColor3 = T.good, BorderSizePixel = 0 }, titleBar)
-    corner(dot, 4)
-    text(titleBar, "Nyx AutoParry", 14, T.text, Enum.Font.GothamBold, { Position = UDim2.fromOffset(30, 0), Size = UDim2.new(0, 98, 1, 0) })
-    text(titleBar, "v11.5", 10, T.sub, Enum.Font.GothamMedium, { Position = UDim2.fromOffset(130, 0), Size = UDim2.new(0, 40, 1, 0) })
+	------------------------------------------------------------------
+	-- komponen
+	------------------------------------------------------------------
+	X.units = {
+		ms = { mul = 1000, dec = 0, suf = " ms" },
+		s = { mul = 1, dec = 2, suf = " s" },
+		stud = { mul = 1, dec = 1, suf = " st" },
+		pct = { mul = 100, dec = 0, suf = "%" },
+		n2 = { mul = 1, dec = 2, suf = "" },
+		n3 = { mul = 1, dec = 3, suf = "" },
+		n4 = { mul = 1, dec = 4, suf = "" },
+		int = { mul = 1, dec = 0, suf = "" },
+		auto = { mul = 1, dec = -1, suf = "" },
+	}
+	function X.fmt(U, v)
+		if U.dec < 0 then
+			local str = ("%.4f"):format(v * U.mul)
+			str = str:gsub("0+$", ""):gsub("%.$", "")
+			return str .. U.suf
+		end
+		return (("%." .. U.dec .. "f"):format(v * U.mul)) .. U.suf
+	end
+	function X.afterToggle()
+		for _, f in ipairs(X.counts) do
+			pcall(f)
+		end
+	end
 
-    local function iconBtn(sym, xFromRight, cb)
-        local b = make("TextButton", {
-            AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -xFromRight, 0.5, 0), Size = UDim2.fromOffset(26, 26),
-            Text = sym, Font = Enum.Font.GothamBold, TextSize = 14, TextColor3 = T.sub, BackgroundColor3 = T.cardHi, BorderSizePixel = 0, AutoButtonColor = false,
-        }, titleBar)
-        corner(b, 7)
-        hook(b.MouseEnter, function()
-            tween(b, 0.1, { BackgroundColor3 = T.line })
-        end)
-        hook(b.MouseLeave, function()
-            tween(b, 0.1, { BackgroundColor3 = T.cardHi })
-        end)
-        hook(b.Activated, cb)
-        return b
-    end
+	function X.card(parent, title, sub)
+		local c = make("Frame", { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = AY, BackgroundColor3 = T.card, BorderSizePixel = 0 }, parent)
+		corner(c, 10)
+		stroke(c, T.line, 1, 0.65)
+		pad(c, 12, 10, 12, 10)
+		list(c, 8)
+		local subLbl = nil
+		if title then
+			local h = make("Frame", { Size = UDim2.new(1, 0, 0, 16), BackgroundTransparency = 1 }, c)
+			text(h, string.upper(title), 10, T.sub, FB, { Size = UDim2.new(0.55, 0, 1, 0) })
+			subLbl = text(h, sub or "", 10, T.sub, FR, { Position = UDim2.fromScale(0.45, 0), Size = UDim2.fromScale(0.55, 1), TextXAlignment = AR, TextTruncate = TR })
+		end
+		return c, subLbl
+	end
 
-    local body = make("Frame", { Position = UDim2.fromOffset(0, TITLE_H), Size = UDim2.new(1, 0, 1, -TITLE_H), BackgroundTransparency = 1, BorderSizePixel = 0 }, win)
-    local collapsed = false
-    local function setCollapsed(v)
-        collapsed = v
-        body.Visible = not v
-        tween(win, 0.15, { Size = UDim2.fromOffset(WIN_W, v and TITLE_H or WIN_H) })
-    end
-    iconBtn("x", 8, function()
-        win.Visible = false
-    end)
-    iconBtn("-", 40, function()
-        setCollapsed(not collapsed)
-    end)
+	function X.hrow(parent, h)
+		local r = make("Frame", { Size = UDim2.new(1, 0, 0, h or CTL + 2), BackgroundTransparency = 1 }, parent)
+		make("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }, r)
+		orderN[r] = 0
+		return r
+	end
 
-    ------------------------------------------------------------------
-    -- Switch / Slider / Button / Tile / Spark
-    ------------------------------------------------------------------
-    local function makeSwitch(parent, key, pos, onChange)
-        local track = make("TextButton", {
-            AnchorPoint = Vector2.new(1, 0.5), Position = pos, Size = UDim2.fromOffset(38, 20), Text = "",
-            AutoButtonColor = false, BackgroundColor3 = T.off, BorderSizePixel = 0,
-        }, parent)
-        corner(track, 10)
-        local knob = make("Frame", { Size = UDim2.fromOffset(14, 14), Position = UDim2.fromOffset(3, 3), BackgroundColor3 = T.text, BorderSizePixel = 0 }, track)
-        corner(knob, 7)
-        local function paint(animate)
-            local on = CFG[key] and true or false
-            local kp = on and UDim2.fromOffset(21, 3) or UDim2.fromOffset(3, 3)
-            local col = on and accent or T.off
-            if animate == true then
-                tween(knob, 0.12, { Position = kp })
-                tween(track, 0.12, { BackgroundColor3 = col })
-            else
-                knob.Position = kp
-                track.BackgroundColor3 = col
-            end
-        end
-        hook(track.Activated, function()
-            CFG[key] = not CFG[key]
-            paint(true)
-            Store.touch()
-            if onChange then
-                onChange(CFG[key])
-            end
-        end)
-        paints[#paints + 1] = paint
-        paint(false)
-        return track
-    end
+	function X.btn(parent, label, cb, props)
+		local p = {
+			Size = UDim2.new(1, 0, 0, CTL + 2), Text = label, Font = FM, TextSize = 12, TextColor3 = T.text,
+			BackgroundColor3 = T.cardHi, BorderSizePixel = 0, AutoButtonColor = false,
+		}
+		if props then
+			for k, v in pairs(props) do
+				p[k] = v
+			end
+		end
+		local b = make("TextButton", p, parent)
+		corner(b, 8)
+		local base = p.BackgroundColor3
+		hook(b.InputBegan, function(i)
+			if isPointer(i) then
+				tween(b, 0.06, { BackgroundColor3 = T.line })
+			end
+		end)
+		hook(b.InputEnded, function(i)
+			if isPointer(i) then
+				tween(b, 0.15, { BackgroundColor3 = base })
+			end
+		end)
+		hook(b.Activated, cb)
+		return b
+	end
 
-    local function switchRow(parent, label, key, hint, onChange)
-        local row = make("Frame", { Size = UDim2.new(1, 0, 0, hint and 38 or 28), BackgroundTransparency = 1 }, parent)
-        text(row, label, 12, T.text, Enum.Font.GothamMedium, { Size = UDim2.new(1, -50, 0, 18), Position = UDim2.fromOffset(0, hint and 0 or 5) })
-        if hint then
-            text(row, hint, 10, T.sub, Enum.Font.Gotham, { Size = UDim2.new(1, -50, 0, 14), Position = UDim2.fromOffset(0, 19), TextTruncate = Enum.TextTruncate.AtEnd })
-        end
-        makeSwitch(row, key, UDim2.new(1, 0, 0.5, 0), onChange)
-        return row
-    end
+	-- accordion: judul + hitungan "n/m aktif" + panah. Return body.
+	function X.fold(parent, title, def, keys)
+		local box = make("Frame", { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = AY, BackgroundColor3 = T.card, BorderSizePixel = 0 }, parent)
+		corner(box, 10)
+		stroke(box, T.line, 1, 0.65)
+		list(box, 0)
+		local head = make("TextButton", { Size = UDim2.new(1, 0, 0, ROW + 4), BackgroundTransparency = 1, Text = "", AutoButtonColor = false }, box)
+		text(head, title, 13, T.text, FB, { Position = UDim2.fromOffset(12, 0), Size = UDim2.new(1, -112, 1, 0), TextTruncate = TR })
+		local cnt = text(head, "", 11, T.sub, FM, { AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -30, 0, 0), Size = UDim2.fromOffset(70, ROW + 4), TextXAlignment = AR })
+		local arrow = text(head, ">", 15, T.sub, FB, { AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(1, -16, 0.5, 0), Size = UDim2.fromOffset(18, 18), TextXAlignment = AC })
+		local fb = make("Frame", { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = AY, BackgroundTransparency = 1, Visible = false }, box)
+		pad(fb, 12, 2, 12, 10)
+		list(fb, 8)
+		local function setOpen(v)
+			X.open[title] = v
+			fb.Visible = v
+			arrow.Rotation = v and 90 or 0
+		end
+		hook(head.Activated, function()
+			setOpen(not fb.Visible)
+		end)
+		local o = X.open[title]
+		if o == nil then
+			o = def and true or false
+		end
+		setOpen(o)
+		if keys then
+			X.counts[#X.counts + 1] = function()
+				local n = 0
+				for _, k in ipairs(keys) do
+					if CFG[k] then
+						n += 1
+					end
+				end
+				setT(cnt, ("%d/%d"):format(n, #keys))
+			end
+		end
+		return fb
+	end
 
-    local function sliderRow(parent, label, key, lo, hi, step, fmt, opts)
-        opts = opts or {}
-        local get = opts.get or function()
-            return CFG[key]
-        end
-        local set = opts.set or function(v)
-            CFG[key] = v
-        end
-        local row = make("Frame", { Size = UDim2.new(1, 0, 0, 44), BackgroundTransparency = 1 }, parent)
-        text(row, label, 12, T.text, Enum.Font.GothamMedium, { Size = UDim2.new(0.62, 0, 0, 18) })
-        local val = text(row, "", 12, accent, Enum.Font.GothamBold, {
-            Position = UDim2.new(0.62, 0, 0, 0), Size = UDim2.new(0.38, 0, 0, 18), TextXAlignment = Enum.TextXAlignment.Right,
-        })
-        accentBind[#accentBind + 1] = { val, "TextColor3" }
-        local track = make("Frame", { Position = UDim2.new(0, 0, 0, 29), Size = UDim2.new(1, 0, 0, 6), BackgroundColor3 = T.off, BorderSizePixel = 0 }, row)
-        corner(track, 3)
-        local fill = make("Frame", { Size = UDim2.new(0, 0, 1, 0), BackgroundColor3 = accent, BorderSizePixel = 0 }, track)
-        corner(fill, 3)
-        accentBind[#accentBind + 1] = { fill, "BackgroundColor3" }
-        local knob = make("Frame", {
-            AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0, 0, 0.5, 0), Size = UDim2.fromOffset(14, 14),
-            BackgroundColor3 = T.text, BorderSizePixel = 0,
-        }, track)
-        corner(knob, 7)
-        local hit = make("TextButton", { Position = UDim2.new(0, 0, 0, 18), Size = UDim2.new(1, 0, 0, 26), BackgroundTransparency = 1, Text = "", AutoButtonColor = false }, row)
-        local function paint()
-            local v = get()
-            local a = math.clamp((v - lo) / (hi - lo), 0, 1)
-            fill.Size = UDim2.new(a, 0, 1, 0)
-            knob.Position = UDim2.new(a, 0, 0.5, 0)
-            setT(val, fmt(v))
-        end
-        local function fromX(x)
-            local w = math.max(track.AbsoluteSize.X, 1)
-            local a = math.clamp((x - track.AbsolutePosition.X) / w, 0, 1)
-            local v = lo + a * (hi - lo)
-            v = math.floor(v / step + 0.5) * step
-            v = tonumber(("%.4f"):format(math.clamp(v, lo, hi)))
-            set(v)
-            paint()
-        end
-        hook(hit.InputBegan, function(input)
-            if not isPointer(input) then
-                return
-            end
-            local sf = row:FindFirstAncestorOfClass("ScrollingFrame")
-            if sf then
-                sf.ScrollingEnabled = false
-            end
-            fromX(input.Position.X)
-            activeDrag = {
-                lock = sf,
-                update = function(i)
-                    fromX(i.Position.X)
-                end,
-                finish = function()
-                    Store.touch()
-                    if opts.onChange then
-                        opts.onChange(get())
-                    end
-                end,
-            }
-        end)
-        paints[#paints + 1] = paint
-        paint()
-        return row
-    end
+	-- baris toggle: seluruh baris bisa di-tap
+	function X.swRow(parent, label, key, hint, onChange)
+		local h = hint and ROW + 8 or ROW
+		local row = make("TextButton", { Size = UDim2.new(1, 0, 0, h), BackgroundTransparency = 1, Text = "", AutoButtonColor = false }, parent)
+		text(row, label, 13, T.text, FM, { Size = UDim2.new(1, -56, 0, 18), Position = UDim2.fromOffset(0, hint and 4 or (h - 18) / 2), TextTruncate = TR })
+		if hint then
+			text(row, hint, 10, T.sub, FR, { Size = UDim2.new(1, -56, 0, 14), Position = UDim2.fromOffset(0, 23), TextTruncate = TR })
+		end
+		local track = make("Frame", { AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, 0, 0.5, 0), Size = UDim2.fromOffset(44, 24), BackgroundColor3 = T.off, BorderSizePixel = 0 }, row)
+		corner(track, 12)
+		local knob = make("Frame", { Size = UDim2.fromOffset(18, 18), Position = UDim2.fromOffset(3, 3), BackgroundColor3 = T.text, BorderSizePixel = 0 }, track)
+		corner(knob, 9)
+		local function paint(anim)
+			local on = CFG[key] and true or false
+			local kp = on and UDim2.fromOffset(23, 3) or UDim2.fromOffset(3, 3)
+			local col = on and X.accent or T.off
+			if anim == true then
+				tween(knob, 0.12, { Position = kp })
+				tween(track, 0.12, { BackgroundColor3 = col })
+			else
+				knob.Position = kp
+				track.BackgroundColor3 = col
+			end
+		end
+		hook(row.Activated, function()
+			CFG[key] = not CFG[key]
+			paint(true)
+			Store.touch()
+			if onChange then
+				onChange(CFG[key])
+			end
+			X.afterToggle()
+		end)
+		addPaint(paint)
+		paint(false)
+		return row
+	end
 
-    local function button(parent, label, cb, props)
-        local p = {
-            Size = UDim2.new(1, 0, 0, 30), Text = label, Font = Enum.Font.GothamMedium, TextSize = 12, TextColor3 = T.text,
-            BackgroundColor3 = T.cardHi, BorderSizePixel = 0, AutoButtonColor = false,
-        }
-        if props then
-            for k, v in pairs(props) do
-                p[k] = v
-            end
-        end
-        local b = make("TextButton", p, parent)
-        corner(b, 7)
-        local base = p.BackgroundColor3
-        hook(b.MouseEnter, function()
-            tween(b, 0.1, { BackgroundColor3 = T.line })
-        end)
-        hook(b.MouseLeave, function()
-            tween(b, 0.1, { BackgroundColor3 = base })
-        end)
-        hook(b.Activated, cb)
-        return b
-    end
+	-- chip toggle kecil (grid)
+	function X.chip(parent, label, key)
+		local b = make("TextButton", { Text = label, Font = FM, TextSize = 12, TextColor3 = T.sub, BackgroundColor3 = T.cardHi, BorderSizePixel = 0, AutoButtonColor = false }, parent)
+		corner(b, 8)
+		local function paint()
+			local on = CFG[key] and true or false
+			b.BackgroundColor3 = on and X.accent or T.cardHi
+			b.TextColor3 = on and T.dark or T.sub
+		end
+		hook(b.Activated, function()
+			CFG[key] = not CFG[key]
+			paint()
+			Store.touch()
+			X.afterToggle()
+		end)
+		addPaint(paint)
+		paint()
+		return b
+	end
 
-    local function card(parent, title)
-        local c = make("Frame", { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundColor3 = T.card, BorderSizePixel = 0 }, parent)
-        corner(c, 9)
-        pad(c, 10, 8, 10, 8)
-        list(c, 6)
-        if title then
-            text(c, string.upper(title), 10, T.sub, Enum.Font.GothamBold, { Size = UDim2.new(1, 0, 0, 14) })
-        end
-        return c
-    end
+	-- tahan tombol = ulang otomatis (stepper)
+	function X.hold(btn, fn)
+		hook(btn.InputBegan, function(input)
+			if not isPointer(input) then
+				return
+			end
+			local id = X.press
+			fn()
+			task.spawn(function()
+				task.wait(0.4)
+				local n = 0
+				while alive and X.press == id and btn.Parent do
+					fn()
+					n += 1
+					task.wait(n > 12 and 0.03 or 0.07)
+				end
+			end)
+		end)
+	end
 
-    local function rowHost(parent, h)
-        return make("Frame", { Size = UDim2.new(1, 0, 0, h or 30), BackgroundTransparency = 1 }, parent)
-    end
+	function X.stepBtn(parent, sym, pos, fn)
+		local b = make("TextButton", {
+			AnchorPoint = Vector2.new(1, 0), Position = pos, Size = UDim2.fromOffset(CTL, CTL), Text = sym, Font = FB, TextSize = 18,
+			TextColor3 = T.text, BackgroundColor3 = T.cardHi, BorderSizePixel = 0, AutoButtonColor = false,
+		}, parent)
+		corner(b, 7)
+		X.hold(b, fn)
+		hook(b.InputBegan, function(i)
+			if isPointer(i) then
+				tween(b, 0.06, { BackgroundColor3 = T.line })
+			end
+		end)
+		hook(b.InputEnded, function(i)
+			if isPointer(i) then
+				tween(b, 0.15, { BackgroundColor3 = T.cardHi })
+			end
+		end)
+		return b
+	end
 
-    local function tile(parent, caption, color)
-        local f = make("Frame", { BackgroundColor3 = T.cardHi, BorderSizePixel = 0 }, parent)
-        corner(f, 7)
-        local v = text(f, "0", 18, color, Enum.Font.GothamBold, { Position = UDim2.fromOffset(0, 4), Size = UDim2.new(1, 0, 0, 22), TextXAlignment = Enum.TextXAlignment.Center })
-        text(f, caption, 9, T.sub, Enum.Font.GothamMedium, { Position = UDim2.fromOffset(0, 27), Size = UDim2.new(1, 0, 0, 12), TextXAlignment = Enum.TextXAlignment.Center })
-        return v
-    end
+	-- angka: label + [-][nilai (bisa diketik)][+] + slider (kalau ada lo/hi)
+	-- o = { lo, hi, step, unit, hint, get, set, onChange, zero, slider }
+	function X.num(parent, label, key, o)
+		o = o or {}
+		local U = X.units[o.unit or "n3"] or X.units.n3
+		local get = o.get or function()
+			return CFG[key]
+		end
+		local set = o.set or function(v)
+			CFG[key] = v
+		end
+		local lo, hi, step = o.lo, o.hi, o.step or 0.01
+		local slider = (lo ~= nil and hi ~= nil and o.slider ~= false)
+		local hintH = o.hint and 15 or 0
+		local H = CTL + hintH + (slider and 28 or 4)
+		local row = make("Frame", { Size = UDim2.new(1, 0, 0, H), BackgroundTransparency = 1 }, parent)
+		local ctlW = CTL * 2 + 70 + 8
+		text(row, label, 13, T.text, FM, { Size = UDim2.new(1, -(ctlW + 6), 0, CTL), TextTruncate = TR })
+		local box = make("TextBox", {
+			AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -(CTL + 4), 0, 0), Size = UDim2.fromOffset(70, CTL), Text = "",
+			ClearTextOnFocus = false, Font = FB, TextSize = 12, TextColor3 = X.accent, BackgroundColor3 = T.cardHi, BorderSizePixel = 0,
+		}, row)
+		corner(box, 7)
+		bindAccent(box, "TextColor3")
+		if o.hint then
+			text(row, o.hint, 10, T.sub, FR, { Position = UDim2.fromOffset(0, CTL + 1), Size = UDim2.new(1, 0, 0, 14), TextTruncate = TR })
+		end
+		local fill, knob, track, hit
+		if slider then
+			local ty = CTL + hintH + 10
+			track = make("Frame", { Position = UDim2.new(0, 0, 0, ty), Size = UDim2.new(1, 0, 0, 6), BackgroundColor3 = T.off, BorderSizePixel = 0 }, row)
+			corner(track, 3)
+			fill = make("Frame", { Size = UDim2.new(0, 0, 1, 0), BackgroundColor3 = X.accent, BorderSizePixel = 0 }, track)
+			corner(fill, 3)
+			bindAccent(fill, "BackgroundColor3")
+			knob = make("Frame", {
+				AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0, 0, 0.5, 0), Size = UDim2.fromOffset(16, 16),
+				BackgroundColor3 = T.text, BorderSizePixel = 0, ZIndex = 2,
+			}, track)
+			corner(knob, 8)
+			hit = make("TextButton", {
+				AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 0, 0, ty + 3), Size = UDim2.new(1, 0, 0, 28),
+				BackgroundTransparency = 1, Text = "", AutoButtonColor = false,
+			}, row)
+		end
+		local function paint()
+			local v = get()
+			if not box:IsFocused() then
+				setT(box, (o.zero and v <= 0) and o.zero or X.fmt(U, v))
+			end
+			if slider then
+				local a = math.clamp((v - lo) / (hi - lo), 0, 1)
+				fill.Size = UDim2.new(a, 0, 1, 0)
+				knob.Position = UDim2.new(a, 0, 0.5, 0)
+			end
+		end
+		local function apply(v)
+			if lo ~= nil then
+				v = math.max(lo, v)
+			end
+			if hi ~= nil then
+				v = math.min(hi, v)
+			end
+			if lo == nil and hi == nil then
+				v = math.clamp(v, -1e6, 1e6)
+			end
+			v = tonumber(("%.5f"):format(v)) or v
+			set(v)
+			paint()
+			Store.touch()
+			if o.onChange then
+				o.onChange(v)
+			end
+		end
+		local function nudge(dir)
+			local v = get() + dir * step
+			apply(math.floor(v / step + 0.5) * step)
+		end
+		X.stepBtn(row, "+", UDim2.new(1, 0, 0, 0), function()
+			nudge(1)
+		end)
+		X.stepBtn(row, "-", UDim2.new(1, -(CTL + 4 + 70 + 4), 0, 0), function()
+			nudge(-1)
+		end)
+		hook(box.Focused, function()
+			local v = get()
+			box.Text = X.fmt({ mul = U.mul, dec = U.dec, suf = "" }, v)
+		end)
+		hook(box.FocusLost, function()
+			local raw = box.Text:gsub("[^%d%.%-]", "")
+			local n = tonumber(raw)
+			if n then
+				apply(n / U.mul)
+			end
+			paint()
+		end)
+		if slider then
+			hook(hit.InputBegan, function(input)
+				if not isPointer(input) then
+					return
+				end
+				local sf = row:FindFirstAncestorOfClass("ScrollingFrame")
+				if sf then
+					sf.ScrollingEnabled = false
+				end
+				local function fromX(x)
+					local w = math.max(track.AbsoluteSize.X, 1)
+					local a = math.clamp((x - track.AbsolutePosition.X) / w, 0, 1)
+					local v = lo + a * (hi - lo)
+					apply(math.floor(v / step + 0.5) * step)
+				end
+				fromX(input.Position.X)
+				X.ad = {
+					lock = sf,
+					update = function(i)
+						fromX(i.Position.X)
+					end,
+				}
+			end)
+		end
+		addPaint(paint)
+		paint()
+		return row
+	end
 
-    local SPARK_N = 60
-    local function spark(parent, title)
-        local box = make("Frame", { Size = UDim2.new(1, 0, 0, 66), BackgroundTransparency = 1 }, parent)
-        text(box, title, 10, T.sub, Enum.Font.GothamBold, { Size = UDim2.new(0.5, 0, 0, 14) })
-        local cur = text(box, "-", 11, T.text, Enum.Font.GothamBold, { Position = UDim2.new(0.5, 0, 0, 0), Size = UDim2.new(0.5, 0, 0, 14), TextXAlignment = Enum.TextXAlignment.Right })
-        local area = make("Frame", { Position = UDim2.fromOffset(0, 18), Size = UDim2.new(1, 0, 0, 46), BackgroundColor3 = T.cardHi, BorderSizePixel = 0 }, box)
-        corner(area, 6)
-        local bars = {}
-        for i = 1, SPARK_N do
-            bars[i] = make("Frame", {
-                AnchorPoint = Vector2.new(0, 1), Position = UDim2.new((i - 1) / SPARK_N, 0, 1, -2), Size = UDim2.new(1 / SPARK_N, -1, 0, 2),
-                BackgroundColor3 = T.good, BorderSizePixel = 0, Visible = false,
-            }, area)
-        end
-        return { bars = bars, cur = cur }
-    end
-    local function drawSpark(sp, arr, head, count, vmax, colorFn)
-        for k = 1, SPARK_N do
-            local bar = sp.bars[k]
-            local age = SPARK_N - k
-            if age < count then
-                local v = arr[(head - age - 1) % SPARK_N + 1] or 0
-                bar.Size = UDim2.new(1 / SPARK_N, -1, 0, math.floor(2 + math.clamp(v / vmax, 0, 1) * 38))
-                bar.BackgroundColor3 = colorFn(v)
-                bar.Visible = true
-            else
-                bar.Visible = false
-            end
-        end
-    end
+	-- segmen (pilih satu). label boleh nil. o = { key, get, set, hint, onChange }
+	function X.seg(parent, label, opts, o)
+		o = o or {}
+		local get = o.get or function()
+			return CFG[o.key]
+		end
+		local set = o.set or function(v)
+			CFG[o.key] = v
+		end
+		local y, H = 0, CTL + 6
+		if label then
+			H += 20
+			y = 20
+		end
+		if o.hint then
+			H += 14
+		end
+		local row = make("Frame", { Size = UDim2.new(1, 0, 0, H), BackgroundTransparency = 1 }, parent)
+		if label then
+			text(row, label, 13, T.text, FM, { Size = UDim2.new(1, 0, 0, 18), TextTruncate = TR })
+		end
+		if o.hint then
+			text(row, o.hint, 10, T.sub, FR, { Position = UDim2.fromOffset(0, y - 1), Size = UDim2.new(1, 0, 0, 14), TextTruncate = TR })
+			y += 14
+		end
+		local holder = make("Frame", { Position = UDim2.fromOffset(0, y + 2), Size = UDim2.new(1, 0, 0, CTL), BackgroundColor3 = T.cardHi, BorderSizePixel = 0 }, row)
+		corner(holder, 8)
+		pad(holder, 3, 3, 3, 3)
+		local btns = {}
+		local n = #opts
+		local paint
+		for i, name in ipairs(opts) do
+			local b = make("TextButton", {
+				Position = UDim2.new((i - 1) / n, 0, 0, 0), Size = UDim2.new(1 / n, -2, 1, 0), Text = tostring(name), Font = FM, TextSize = 11,
+				TextColor3 = T.sub, BackgroundColor3 = X.accent, BackgroundTransparency = 1, BorderSizePixel = 0, AutoButtonColor = false,
+			}, holder)
+			corner(b, 6)
+			hook(b.Activated, function()
+				set(name)
+				paint()
+				Store.touch()
+				if o.onChange then
+					o.onChange(name)
+				end
+			end)
+			btns[i] = b
+		end
+		paint = function()
+			local cur = get()
+			for i, name in ipairs(opts) do
+				local on = cur == name
+				btns[i].BackgroundTransparency = on and 0 or 1
+				btns[i].BackgroundColor3 = X.accent
+				btns[i].TextColor3 = on and T.dark or T.sub
+			end
+		end
+		addPaint(paint)
+		paint()
+		return row
+	end
 
-    ------------------------------------------------------------------
-    -- Toast
-    ------------------------------------------------------------------
-    local toastHost = make("Frame", {
-        Name = "Toasts", AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 10), Size = UDim2.fromOffset(250, 0),
-        AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, ZIndex = 30,
-    }, gui)
-    make("UIListLayout", { Padding = UDim.new(0, 6), HorizontalAlignment = Enum.HorizontalAlignment.Center, SortOrder = Enum.SortOrder.LayoutOrder }, toastHost)
-    local toasts, toastSeq = {}, 0
-    UI.toast = function(msg, kind)
-        if not (CFG.Toasts and gui.Parent and gui.Enabled and alive) then
-            return
-        end
-        local col = (kind == "bad" and T.bad) or (kind == "ok" and T.good) or (kind == "warn" and T.warn) or accent
-        toastSeq += 1
-        local f = make("Frame", { LayoutOrder = toastSeq, Size = UDim2.new(1, 0, 0, 30), BackgroundColor3 = T.bar, BackgroundTransparency = 1, BorderSizePixel = 0, ZIndex = 30 }, toastHost)
-        corner(f, 8)
-        local st = stroke(f, col, 1.2, 1)
-        local lb = text(f, tostring(msg), 12, T.text, Enum.Font.GothamMedium, { Size = UDim2.new(1, -16, 1, 0), Position = UDim2.fromOffset(8, 0), TextTransparency = 1, ZIndex = 31, TextXAlignment = Enum.TextXAlignment.Center })
-        tween(f, 0.15, { BackgroundTransparency = 0.05 })
-        tween(st, 0.15, { Transparency = 0.2 })
-        tween(lb, 0.15, { TextTransparency = 0 })
-        toasts[#toasts + 1] = f
-        while #toasts > 3 do
-            local old = table.remove(toasts, 1)
-            pcall(function()
-                old:Destroy()
-            end)
-        end
-        task.delay(2.2, function()
-            if f.Parent then
-                tween(f, 0.3, { BackgroundTransparency = 1 })
-                tween(st, 0.3, { Transparency = 1 })
-                tween(lb, 0.3, { TextTransparency = 1 })
-            end
-        end)
-        task.delay(2.55, function()
-            pcall(function()
-                f:Destroy()
-            end)
-        end)
-    end
+	function X.strRow(parent, label, key, hint)
+		local row = make("Frame", { Size = UDim2.new(1, 0, 0, ROW + (hint and 14 or 0)), BackgroundTransparency = 1 }, parent)
+		text(row, label, 13, T.text, FM, { Size = UDim2.new(0.5, 0, 0, ROW), TextTruncate = TR })
+		local box = make("TextBox", {
+			AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, 0, 0, (ROW - CTL) / 2), Size = UDim2.new(0.48, 0, 0, CTL),
+			Text = tostring(CFG[key]), ClearTextOnFocus = false, Font = FB, TextSize = 12, TextColor3 = X.accent,
+			BackgroundColor3 = T.cardHi, BorderSizePixel = 0,
+		}, row)
+		corner(box, 7)
+		bindAccent(box, "TextColor3")
+		if hint then
+			text(row, hint, 10, T.sub, FR, { Position = UDim2.fromOffset(0, ROW), Size = UDim2.new(1, 0, 0, 14), TextTruncate = TR })
+		end
+		hook(box.FocusLost, function()
+			if box.Text ~= "" then
+				CFG[key] = box.Text
+				Store.touch()
+			end
+			box.Text = tostring(CFG[key])
+		end)
+		addPaint(function()
+			if not box:IsFocused() then
+				setT(box, tostring(CFG[key]))
+			end
+		end)
+	end
 
-    ------------------------------------------------------------------
-    -- Tab bar + halaman
-    ------------------------------------------------------------------
-    local TABS = { { "sum", "Ringkas" }, { "def", "Bertahan" }, { "tim", "Timing" }, { "log", "Log" }, { "set", "Setelan" } }
-    local tabBar = make("Frame", { Size = UDim2.new(1, 0, 0, TAB_H), BackgroundColor3 = T.bar, BorderSizePixel = 0 }, body)
-    local indicator = make("Frame", { Position = UDim2.new(0, 8, 1, -2), Size = UDim2.new(1 / #TABS, -16, 0, 2), BorderSizePixel = 0 }, tabBar)
-    bindAccent(indicator, "BackgroundColor3")
-    local tabBtns = {}
-    local pagesHost = make("Frame", { Position = UDim2.fromOffset(0, TAB_H), Size = UDim2.new(1, 0, 1, -(TAB_H + FOOT_H)), BackgroundTransparency = 1, BorderSizePixel = 0, ClipsDescendants = true }, body)
-    local pages = {}
+	function X.keyRow(parent, label, key)
+		local row = make("Frame", { Size = UDim2.new(1, 0, 0, ROW), BackgroundTransparency = 1 }, parent)
+		text(row, label, 13, T.text, FM, { Size = UDim2.new(0.5, 0, 1, 0), TextTruncate = TR })
+		local b = make("TextButton", {
+			AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, 0, 0.5, 0), Size = UDim2.fromOffset(112, CTL), Text = "",
+			Font = FB, TextSize = 11, TextColor3 = T.text, BackgroundColor3 = T.cardHi, BorderSizePixel = 0, AutoButtonColor = false,
+		}, row)
+		corner(b, 7)
+		local function paint()
+			local k = CFG[key]
+			local waiting = X.rebinding == key
+			b.Text = waiting and "tekan tombol…" or (typeof(k) == "EnumItem" and k.Name or tostring(k))
+			b.BackgroundColor3 = waiting and X.accent or T.cardHi
+			b.TextColor3 = waiting and T.dark or T.text
+		end
+		hook(b.Activated, function()
+			if X.rebinding == key then
+				X.rebinding, UI.capture = nil, nil
+				paintAll()
+				return
+			end
+			X.rebinding = key
+			paintAll()
+			UI.capture = function(kc)
+				if kc ~= Enum.KeyCode.Escape and kc ~= Enum.KeyCode.Unknown then
+					CFG[key] = kc
+					Store.touch()
+					UI.toast(label .. " = " .. kc.Name, "ok")
+				end
+				X.rebinding, UI.capture = nil, nil
+				paintAll()
+			end
+		end)
+		addPaint(paint)
+		paint()
+	end
 
-    local function newPage(name)
-        local sf = make("ScrollingFrame", {
-            Name = name, Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 3,
-            ScrollBarImageColor3 = T.line, CanvasSize = UDim2.new(0, 0, 0, 0), AutomaticCanvasSize = Enum.AutomaticSize.Y,
-            ScrollingDirection = Enum.ScrollingDirection.Y, Visible = false,
-        }, pagesHost)
-        pad(sf, 10, 10, 12, 12)
-        list(sf, 8)
-        local p = { frame = sf, refresh = nil }
-        pages[name] = p
-        return p, sf
-    end
+	function X.tile(parent, caption, color)
+		local f = make("Frame", { BackgroundColor3 = T.cardHi, BorderSizePixel = 0 }, parent)
+		corner(f, 8)
+		local v = text(f, "0", 19, color, FB, { Position = UDim2.fromOffset(0, 5), Size = UDim2.new(1, 0, 0, 22), TextXAlignment = AC })
+		text(f, caption, 10, T.sub, FM, { Position = UDim2.fromOffset(0, 29), Size = UDim2.new(1, 0, 0, 13), TextXAlignment = AC, TextTruncate = TR })
+		return v
+	end
 
-    local function selectTab(name)
-        UI.tab = name
-        for i, t in ipairs(TABS) do
-            local on = t[1] == name
-            pages[t[1]].frame.Visible = on
-            tabBtns[i].TextColor3 = on and T.text or T.sub
-            if on then
-                tween(indicator, 0.15, { Position = UDim2.new((i - 1) / #TABS, 8, 1, -2) })
-            end
-        end
-        if refreshPage then
-            refreshPage()
-        end
-    end
-    for i, t in ipairs(TABS) do
-        local b = make("TextButton", {
-            Position = UDim2.new((i - 1) / #TABS, 0, 0, 0), Size = UDim2.new(1 / #TABS, 0, 1, -2), Text = t[2],
-            Font = Enum.Font.GothamMedium, TextSize = 11, TextColor3 = T.sub, BackgroundTransparency = 1, BorderSizePixel = 0, AutoButtonColor = false,
-        }, tabBar)
-        hook(b.Activated, function()
-            selectTab(t[1])
-        end)
-        tabBtns[i] = b
-    end
+	function X.grid(parent, cols, h)
+		local g = make("Frame", { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = AY, BackgroundTransparency = 1 }, parent)
+		orderN[g] = 0
+		make("UIGridLayout", {
+			CellSize = UDim2.new(1 / cols, -math.ceil(6 * (cols - 1) / cols), 0, h), CellPadding = UDim2.fromOffset(6, 6), SortOrder = Enum.SortOrder.LayoutOrder,
+		}, g)
+		return g
+	end
 
-    local footer = make("Frame", { AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 0, 1, 0), Size = UDim2.new(1, 0, 0, FOOT_H), BackgroundColor3 = T.bar, BorderSizePixel = 0 }, body)
-    local footLbl = text(footer, "", 10, T.sub, Enum.Font.Code, { Position = UDim2.fromOffset(10, 0), Size = UDim2.new(1, -20, 1, 0), TextTruncate = Enum.TextTruncate.AtEnd })
+	-- bar bertumpuk (distribusi hasil hit)
+	function X.stack(parent)
+		local bar = make("Frame", { Size = UDim2.new(1, 0, 0, 10), BackgroundColor3 = T.off, BorderSizePixel = 0, ClipsDescendants = true }, parent)
+		corner(bar, 5)
+		local segs = {}
+		for i = 1, 5 do
+			segs[i] = make("Frame", { Size = UDim2.new(0, 0, 1, 0), BackgroundColor3 = T.good, BorderSizePixel = 0 }, bar)
+		end
+		return { segs = segs }
+	end
+	function X.setStack(st, vals, cols)
+		local tot = 0
+		for i = 1, #vals do
+			tot += vals[i]
+		end
+		local x = 0
+		for i = 1, #st.segs do
+			local f = tot > 0 and (vals[i] or 0) / tot or 0
+			local s = st.segs[i]
+			s.Position = UDim2.new(x, 0, 0, 0)
+			s.Size = UDim2.new(f, 0, 1, 0)
+			s.BackgroundColor3 = cols[i]
+			x += f
+		end
+	end
 
-    ------------------------------------------------------------------
-    -- Halaman 1: Ringkas
-    ------------------------------------------------------------------
-    local P1, s1 = newPage("sum")
-    local hero = card(s1)
-    local heroTop = rowHost(hero, 40)
-    local safeBig = text(heroTop, "100%", 30, T.good, Enum.Font.GothamBold, { Size = UDim2.new(0.45, 0, 1, 0) })
-    local safeCap = text(heroTop, "", 11, T.sub, Enum.Font.Gotham, { Position = UDim2.new(0.45, 0, 0, 0), Size = UDim2.new(0.55, 0, 1, 0), TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Right })
-    local barBG = make("Frame", { Size = UDim2.new(1, 0, 0, 6), BackgroundColor3 = T.off, BorderSizePixel = 0 }, hero)
-    corner(barBG, 3)
-    local barFill = make("Frame", { Size = UDim2.new(1, 0, 1, 0), BackgroundColor3 = T.good, BorderSizePixel = 0 }, barBG)
-    corner(barFill, 3)
+	-- meter: label + nilai + bar isi
+	function X.meter(parent, label)
+		local row = make("Frame", { Size = UDim2.new(1, 0, 0, 30), BackgroundTransparency = 1 }, parent)
+		text(row, label, 11, T.sub, FM, { Size = UDim2.new(0.4, 0, 0, 14) })
+		local val = text(row, "", 11, T.text, FB, { Position = UDim2.fromScale(0.4, 0), Size = UDim2.new(0.6, 0, 0, 14), TextXAlignment = AR })
+		local track = make("Frame", { Position = UDim2.fromOffset(0, 19), Size = UDim2.new(1, 0, 0, 6), BackgroundColor3 = T.off, BorderSizePixel = 0 }, row)
+		corner(track, 3)
+		local fill = make("Frame", { Size = UDim2.new(0, 0, 1, 0), BackgroundColor3 = T.good, BorderSizePixel = 0 }, track)
+		corner(fill, 3)
+		return { val = val, fill = fill }
+	end
+	function X.setMeter(m, frac, col, str)
+		m.fill.Size = UDim2.new(math.clamp(frac, 0, 1), 0, 1, 0)
+		m.fill.BackgroundColor3 = col
+		setT(m.val, str)
+	end
 
-    local grid = make("Frame", { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1 }, s1)
-    orderN[grid] = 0
-    make("UIGridLayout", { CellSize = UDim2.new(0.25, -5, 0, 42), CellPadding = UDim2.fromOffset(6, 6), SortOrder = Enum.SortOrder.LayoutOrder }, grid)
-    local tParry = tile(grid, "PARRY", T.good)
-    local tBlock = tile(grid, "BLOCK", T.info)
-    local tDodge = tile(grid, "DODGE", accent)
-    accentBind[#accentBind + 1] = { tDodge, "TextColor3" }
-    local tHit = tile(grid, "KENA", T.bad)
-    local tGB = tile(grid, "GUARD BRK", T.bad)
-    local tPred = tile(grid, "PREDIKSI", T.sub)
-    local tReflex = tile(grid, "REFLEKS", T.sub)
-    local tHeal = tile(grid, "SELF-HEAL", T.sub)
+	X.SPN = 60
+	function X.spark(parent, title)
+		local box = make("Frame", { Size = UDim2.new(1, 0, 0, 66), BackgroundTransparency = 1 }, parent)
+		text(box, title, 10, T.sub, FB, { Size = UDim2.new(0.5, 0, 0, 14) })
+		local cur = text(box, "-", 11, T.text, FB, { Position = UDim2.fromScale(0.5, 0), Size = UDim2.fromScale(0.5, 0), TextXAlignment = AR })
+		cur.Size = UDim2.new(0.5, 0, 0, 14)
+		local area = make("Frame", { Position = UDim2.fromOffset(0, 18), Size = UDim2.new(1, 0, 0, 46), BackgroundColor3 = T.cardHi, BorderSizePixel = 0 }, box)
+		corner(area, 6)
+		local bars = {}
+		for i = 1, X.SPN do
+			bars[i] = make("Frame", {
+				AnchorPoint = Vector2.new(0, 1), Position = UDim2.new((i - 1) / X.SPN, 0, 1, -2), Size = UDim2.new(1 / X.SPN, -1, 0, 2),
+				BackgroundColor3 = T.good, BorderSizePixel = 0, Visible = false,
+			}, area)
+		end
+		return { bars = bars, cur = cur }
+	end
+	function X.drawSpark(sp, arr, head, count, vmax, colorFn)
+		for k = 1, X.SPN do
+			local bar = sp.bars[k]
+			local age = X.SPN - k
+			if age < count then
+				local v = arr[(head - age - 1) % X.SPN + 1] or 0
+				bar.Size = UDim2.new(1 / X.SPN, -1, 0, math.floor(2 + math.clamp(v / vmax, 0, 1) * 38))
+				bar.BackgroundColor3 = colorFn(v)
+				bar.Visible = true
+			else
+				bar.Visible = false
+			end
+		end
+	end
 
-    local gcard = card(s1, "Jaringan & performa")
-    local spPing = spark(gcard, "PING (ms)")
-    local spFps = spark(gcard, "FPS")
-    local spCpu = spark(gcard, "CPU SCRIPT (µs / frame)")
+	function X.newPage(id)
+		local sf = make("ScrollingFrame", {
+			Name = id, Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 3,
+			ScrollBarImageColor3 = T.line, CanvasSize = UDim2.new(), AutomaticCanvasSize = AY,
+			ScrollingDirection = Enum.ScrollingDirection.Y, Visible = false,
+		}, X.pagesHost)
+		pad(sf, 10, 10, 10, 16)
+		list(sf, 8)
+		local P = { frame = sf }
+		X.pages[id] = P
+		return P, sf
+	end
 
-    local ecard = card(s1, "Event terakhir")
-    local evLbls = {}
-    for i = 1, 4 do
-        evLbls[i] = text(ecard, "", 11, T.text, Enum.Font.Code, { Size = UDim2.new(1, 0, 0, 15), RichText = true, TextTruncate = Enum.TextTruncate.AtEnd })
-    end
-    local brow = rowHost(s1, 30)
-    make("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }, brow)
-    orderN[brow] = 0
-    button(brow, "Reset stat", function()
-        resetStats()
-        UI.toast("Statistik direset", "info")
-        if UI.refresh then
-            UI.refresh()
-        end
-    end, { Size = UDim2.new(0.5, -3, 1, 0) })
-    button(brow, "Salin ringkasan", function()
-        local ok = pcall(function()
-            setclipboard(summaryText())
-        end)
-        if not ok then
-            print(summaryText())
-        end
-        UI.toast(ok and "Ringkasan disalin" or "Clipboard nggak ada, dicetak ke console", ok and "ok" or "warn")
-    end, { Size = UDim2.new(0.5, -3, 1, 0) })
+	function X.applyAccent()
+		X.accent = ACCENTS[CFG.Accent] or ACCENTS[1]
+		for _, set in ipairs({ X.bind, X.advB or {} }) do
+			for _, ab in ipairs(set) do
+				pcall(function()
+					ab[1][ab[2]] = X.accent
+				end)
+			end
+		end
+		paintAll()
+	end
+	function X.setAccent(i)
+		CFG.Accent = i
+		X.applyAccent()
+		Store.touch()
+	end
 
-    local function pingColor(v)
-        return v < 80 and T.good or (v < 150 and T.warn or T.bad)
-    end
-    local function fpsColor(v)
-        return v >= 50 and T.good or (v >= 30 and T.warn or T.bad)
-    end
-    local function cpuColor(v)
-        return v < 400 and T.good or (v < 1200 and T.warn or T.bad)
-    end
-    local KCOL = { parry = T.good, block = T.info, dodge = accent, hit = T.bad, gb = T.bad, plan = T.sub, skip = T.warn, info = T.sub }
-    local function kindColor(k)
-        if k == "dodge" then
-            return accent
-        end
-        return KCOL[k] or T.text
-    end
+	function X.kindColor(k)
+		if k == "dodge" then
+			return X.accent
+		end
+		return (({ parry = T.good, block = T.info, hit = T.bad, gb = T.bad, plan = T.sub, skip = T.warn, info = T.sub })[k]) or T.text
+	end
 
-    P1.refresh = function()
-        local c = counters
-        local landed = c.parried + c.blocked + c.guardbroken + c.hit
-        local all = landed + c.dodged
-        local rate = all > 0 and (c.parried + c.blocked + c.dodged) / all or 1
-        setT(safeBig, ("%d%%"):format(math.floor(rate * 100 + 0.5)))
-        safeBig.TextColor3 = rate >= 0.8 and T.good or (rate >= 0.55 and T.warn or T.bad)
-        barFill.Size = UDim2.new(rate, 0, 1, 0)
-        barFill.BackgroundColor3 = safeBig.TextColor3
-        setT(safeCap, landed > 0 and ("aman dari %d hit yang nyampe · parry %d%%"):format(all, math.floor(c.parried / math.max(landed, 1) * 100 + 0.5)) or "belum ada hit yang nyampe")
-        setT(tParry, tostring(c.parried))
-        setT(tBlock, tostring(c.blocked))
-        setT(tDodge, tostring(c.dodged))
-        setT(tHit, tostring(c.hit))
-        setT(tGB, tostring(c.guardbroken))
-        setT(tPred, tostring(c.predicted))
-        setT(tReflex, tostring(c.reflex))
-        setT(tHeal, tostring(c.healed + c.recheck))
-        local g = Maint.g
-        drawSpark(spPing, g.ping, g.head, g.count, 300, pingColor)
-        drawSpark(spFps, g.fps, g.head, g.count, 144, fpsColor)
-        drawSpark(spCpu, g.cpu, g.head, g.count, 2000, cpuColor)
-        setT(spPing.cur, ("%d ms ±%d"):format(math.floor(net.rtt * 1000 + 0.5), math.floor(net.var * 1000 + 0.5)))
-        setT(spFps.cur, ("%d fps · spike %d"):format(math.floor(frame.fps + 0.5), frame.spikes))
-        setT(spCpu.cur, ("%d µs · max %d"):format(math.floor(frame.cpu * 1e6 + 0.5), math.floor(frame.cpuMax * 1e6 + 0.5)))
-        local now = os.clock()
-        for i = 1, #evLbls do
-            local e = EV.count >= i and EV.ring[(EV.head - i) % EV.cap + 1] or nil
-            if e then
-                setT(evLbls[i], ('<font color="%s">%4.0fs</font> <font color="%s">%s</font>'):format(hex(T.sub), now - e.t, hex(kindColor(e.kind)), esc(e.text)))
-            else
-                setT(evLbls[i], i == 1 and ('<font color="%s">belum ada event</font>'):format(hex(T.sub)) or "")
-            end
-        end
-    end
+	function X.copy(txt, okMsg)
+		local ok = pcall(function()
+			local fn = setclipboard or toclipboard
+			fn(txt)
+		end)
+		if not ok then
+			print(txt)
+		end
+		UI.toast(ok and okMsg or "Clipboard nggak ada, dicetak ke console", ok and "ok" or "warn")
+	end
 
-    ------------------------------------------------------------------
-    -- Halaman 2: Bertahan
-    ------------------------------------------------------------------
-    local P2, s2 = newPage("def")
-    local function group(title, items)
-        local c = card(s2, title)
-        for _, it in ipairs(items) do
-            switchRow(c, it[1], it[2], it[3], it[4])
-        end
-        return c
-    end
-    group("Respons utama", {
-        { "Parry", "Enabled", "toggle cepat: tombol di tab Setelan", function()
-            UI.toast(CFG.Enabled and "AutoParry ON" or "AutoParry OFF", CFG.Enabled and "ok" or "bad")
-        end },
-        { "Block biasa", "BlockFallback", "parry nggak mungkin -> tetap block" },
-        { "Dodge", "DodgeEnabled", "cadangan buat M2 / M1 yang nggak kekejar" },
-        { "Mode pintar", "SmartMode", "pilih parry vs dodge dari peluang sukses" },
-    })
-    group("Block", {
-        { "Chain guard", "ChainGuard", "block ditahan nyambung buat M1 beruntun" },
-        { "Lepas abis parry", "ReleaseOnParry", "cooldown block cepat beres" },
-        { "Jaga crowd", "CrowdGuard", "tahan block kalau attacker lain baru ngayun" },
-        { "Prioritas block", "GuardPriority", "swing manual ditahan pas block mau dikirim" },
-        { "Lepas pas klik", "ReleaseOnManualAttack", "klik kiri = block script dilepas" },
-        { "Raw block", "RawOnLocalRefuse", "cek lokal nolak tapi model bilang aman" },
-    })
-    group("Dodge", {
-        { "M2 pakai dodge", "DodgeForM2" },
-        { "M1 dodge cadangan", "DodgeForM1", "kalau parry & block sama-sama nggak sempat" },
-        { "M2 dodge duluan", "DodgeFirstM2", "parry M2 cuma kalau dodge cooldown" },
-        { "Dodge abis miss", "DodgeAfterMiss", "parry M2 pernah miss -> dodge dulu" },
-        { "Pakai TryDodge game", "DodgeViaGame", "animasi + dorongan ikut bener" },
-    })
-    group("Combo & prediksi", {
-        { "Prediksi combo", "PredictCombo", "tebak M1 berikutnya (lead < ping)" },
-        { "Refleks combo", "HitReflex", "abis kena/block langsung rencanain hit lanjut" },
-        { "Combo keep", "ComboKeep", "attacker yang lagi nge-combo tetap ancaman" },
-        { "Fast unlock", "FastUnlock", "block keluar tepat pas stun lepas" },
-        { "Retry abis unlock", "RetryAfterUnlock" },
-        { "Retry abis ditolak", "GuardRetryOnRefuse" },
-    })
-    group("Keamanan state (v9)", {
-        { "Reset pas respawn", "RespawnReset", "mati/respawn = state bersih" },
-        { "Self-heal", "SelfHeal", "timer nyangkut dirapihin tiap 0.5s" },
-        { "Cek attacker", "RecheckAttacker", "attacker mati/knocked = block batal" },
-        { "Tune per attacker", "TuneByAttacker", "belajar cuma dari block yang relevan" },
-        { "Spike guard", "SpikeGuard", "hitch frame nggak ngerusak rata-rata fps" },
-        { "Titik cek ekstra", "FramePump3", "antrean dicek juga di PreSimulation" },
-    })
-    group("Skill & belakang (v10)", {
-        { "Sadar skill", "SkillAware", "hit skill nggak dihitung M1 (tune/combo bersih)" },
-        { "Barrage guard", "BarrageGuard", "skill multi-hit: block/parry lagi tiap Interval" },
-        { "Back-hit guard", "BackHitGuard", "kalau server nyalain BackHit: dodge, bukan block" },
-    })
-    group("Abis parry (v11)", {
-        { "Tahan block abis parry", "PostParryHold", "nggak dilepas langsung (cooldown 0.75s = celah)" },
-        { "Guard abis kena parry", "ParriedGuard", "block pas stun lepas kalau LU yang ke-parry" },
-        { "Pad ping / fps", "LagAdaptive", "hold & chain melebar kalau ping tinggi / fps rendah" },
-    })
-    group("Abis kena & ngebut (v11.5)", {
-        { "Guard abis kena", "HitGuard", "block ON tepat pas stun lepas -> hit lanjutan ke-parry / ke-block" },
-        { "Guard abis kena M2/GB", "HitGuardM2", "guard yang sama abis kena M2 / guard break" },
-        { "Belajar interval combo", "GapLearn", "tebakan hit lanjutan dikoreksi dari interval asli attacker" },
-        { "Attacker ngebut = ancaman", "MobileThreat", "dash kanan-kiri / muter cepat tetap di-parry (bukan skip range)" },
-        { "Pause UI pas tarung", "CombatUIPause", "anti hitch: UI & simpan config nunggu fight selesai" },
-    })
-    group("Style & dodge (v12)", {
-        { "Pengenal style pintar", "StyleIQ", "style kosong / salah ditebak dari Sound, hold M2, windup M1" },
-        { "Prior per style", "StylePrior", "attacker baru mulai dari koreksi lead style yang sama" },
-        { "Dodge ikut arah", "DodgeDir", "ikut arah gerak lu / arah aman terbaik, bukan maju doang" },
-        { "Ikut arah gerak", "DodgeFollowInput", "lagi gerak -> dodge searah (kalau jalurnya aman)" },
-        { "Belajar M2 per style", "M2Learn", "statistik parry vs dodge M2 ngebobot pilihan" },
-    })
+	------------------------------------------------------------------
+	-- Halaman: Dasbor
+	------------------------------------------------------------------
+	function X.pageHome()
+		local P, sf = X.newPage("home")
+		local hero = X.card(sf)
+		local top = make("Frame", { Size = UDim2.new(1, 0, 0, 48), BackgroundTransparency = 1 }, hero)
+		local big = text(top, "100%", 34, T.good, FB, { Size = UDim2.new(0.4, 0, 1, 0) })
+		local cap = text(top, "", 11, T.sub, FR, { Position = UDim2.fromScale(0.4, 0), Size = UDim2.fromScale(0.6, 1), TextWrapped = true, TextXAlignment = AR })
+		local stk = X.stack(hero)
+		local legend = text(hero, "", 11, T.sub, FM, { Size = UDim2.new(1, 0, 0, 16), RichText = true, TextTruncate = TR })
+		local pwr = make("TextButton", { Size = UDim2.new(1, 0, 0, CTL + 8), Font = FB, TextSize = 13, BorderSizePixel = 0, AutoButtonColor = false, Text = "" }, hero)
+		corner(pwr, 9)
+		local function paintPwr()
+			local on = CFG.Enabled and true or false
+			pwr.BackgroundColor3 = on and T.good or T.bad
+			pwr.TextColor3 = on and T.dark or T.text
+			pwr.Text = on and "AUTOPARRY  ·  ON" or "AUTOPARRY  ·  OFF"
+		end
+		hook(pwr.Activated, function()
+			CFG.Enabled = not CFG.Enabled
+			UI.toast(CFG.Enabled and "AutoParry ON" or "AutoParry OFF", CFG.Enabled and "ok" or "bad")
+			UI.refresh()
+		end)
+		addPaint(paintPwr)
+		paintPwr()
 
-    ------------------------------------------------------------------
-    -- Halaman 3: Timing
-    ------------------------------------------------------------------
-    local P3, s3 = newPage("tim")
-    local fMs = function(v)
-        return ("%d ms"):format(math.floor(v * 1000 + 0.5))
-    end
-    local fSec = function(v)
-        return ("%.2f s"):format(v)
-    end
-    local fStud = function(v)
-        return ("%.1f stud"):format(v)
-    end
-    local fNum = function(v)
-        return ("%.3f"):format(v)
-    end
-    local fScale = function(v)
-        return ("%d%%"):format(math.floor(v * 100 + 0.5))
-    end
+		local qc = X.card(sf, "Pintasan")
+		local qg = X.grid(qc, 3, CTL + 4)
+		for _, c in ipairs({ { "Block", "BlockFallback" }, { "Dodge", "DodgeEnabled" }, { "Pintar", "SmartMode" }, { "Prediksi", "PredictCombo" }, { "Refleks", "HitReflex" }, { "Guard", "HitGuard" } }) do
+			X.chip(qg, c[1], c[2])
+		end
 
-    local cPre = card(s3, "Preset")
-    local presetRow = rowHost(cPre, 30)
-    make("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }, presetRow)
-    orderN[presetRow] = 0
-    local presetBtns = {}
-    for i, pr in ipairs(Store.presets) do
-        local b = button(presetRow, pr.name, function()
-            Store.apply(pr.name)
-            paintAll()
-            UI.toast("Preset " .. pr.name .. " dipakai", "ok")
-            if UI.refresh then
-                UI.refresh()
-            end
-        end, { Size = UDim2.new(1 / #Store.presets, -4, 1, 0) })
-        presetBtns[i] = b
-    end
-    local presetNote = text(cPre, "", 10, T.sub, Enum.Font.Gotham, { Size = UDim2.new(1, 0, 0, 14) })
-    paints[#paints + 1] = function()
-        local act = Store.activePreset()
-        for i, pr in ipairs(Store.presets) do
-            presetBtns[i].BackgroundColor3 = (pr.name == act) and accent or T.cardHi
-            presetBtns[i].TextColor3 = (pr.name == act) and Color3.fromRGB(10, 12, 18) or T.text
-        end
-        setT(presetNote, "preset aktif: " .. act .. " (titik awal, bukan hasil tuning ke game lu)")
-    end
+		local lv = X.card(sf, "Status live")
+		local mBlock = X.meter(lv, "Block")
+		local mParry = X.meter(lv, "Parry cooldown")
+		local mDodge = X.meter(lv, "Dodge")
+		local lastHit = text(lv, "", 11, T.sub, FR, { Size = UDim2.new(1, 0, 0, 16), TextTruncate = TR })
 
-    local cWin = card(s3, "Window parry & hold")
-    sliderRow(cWin, "Umur block M1", "TargetAgeM1", 0.06, 0.20, 0.005, fMs)
-    sliderRow(cWin, "Umur block M2", "TargetAgeM2", 0.06, 0.20, 0.005, fMs)
-    sliderRow(cWin, "Hold abis hit", "HoldAfterHit", 0.03, 0.20, 0.005, fMs)
-    sliderRow(cWin, "Toleransi telat", "LateTolerance", 0, 0.08, 0.005, fMs)
-    sliderRow(cWin, "Chain hold", "ChainHold", 0.4, 1.5, 0.05, fSec)
-    sliderRow(cWin, "Hold maksimal", "MaxHold", 1, 4, 0.1, fSec)
-    local cRange = card(s3, "Jangkauan ancaman")
-    sliderRow(cRange, "Margin depan", "RangeMargin", 0, 6, 0.5, fStud)
-    sliderRow(cRange, "Dekat banget", "CloseAlways", 0, 20, 1, fStud)
-    sliderRow(cRange, "Margin belakang", "BackMargin", 0, 8, 0.5, fStud)
-    sliderRow(cRange, "Jarak combo-keep", "ComboKeepRange", 8, 24, 1, fStud)
-    local cLearn = card(s3, "Belajar (adaptif)")
-    switchRow(cLearn, "Adaptif", "Adaptive", "geser timing dari hasil hit")
-    sliderRow(cLearn, "Langkah tune", "TuneStep", 0.004, 0.03, 0.002, fMs)
-    sliderRow(cLearn, "Batas tune", "TuneMax", 0.03, 0.15, 0.01, fMs)
-    sliderRow(cLearn, "Ping manual", "PingOverride", 0, 0.35, 0.01, function(v)
-        return v <= 0 and "auto" or fMs(v)
-    end, {
-        get = function()
-            return CFG.PingOverride or 0
-        end,
-        set = function(v)
-            CFG.PingOverride = v > 0 and v or nil
-        end,
-    })
-    local tuneLbl = text(cLearn, "", 11, T.sub, Enum.Font.Code, { Size = UDim2.new(1, 0, 0, 16) })
-    button(cLearn, "Reset hasil belajar", function()
-        tune.M1, tune.M2 = 0, 0
-        streak.M1.dir, streak.M1.n, streak.M2.dir, streak.M2.n = 0, 0, 0, 0
-        stunSlack = CFG.StunSlackStart
-        table.clear(leadCorr)
-        table.clear(leadAll)
-        table.clear(leadN)
-        UI.toast("Hasil belajar direset", "ok")
-    end)
-    P3.refresh = function()
-        paintAll()
-        setT(tuneLbl, ("tune M1 %+.3f · M2 %+.3f · slack %.2f"):format(tune.M1, tune.M2, stunSlack))
-    end
+		local tc = X.card(sf, "Hitungan")
+		local tg = X.grid(tc, 4, 48)
+		local tParry = X.tile(tg, "PARRY", T.good)
+		local tBlock = X.tile(tg, "BLOCK", T.info)
+		local tDodge = X.tile(tg, "DODGE", X.accent)
+		bindAccent(tDodge, "TextColor3")
+		local tHit = X.tile(tg, "KENA", T.bad)
+		local tGB = X.tile(tg, "GUARD BRK", T.bad)
+		local tPred = X.tile(tg, "PREDIKSI", T.sub)
+		local tReflex = X.tile(tg, "REFLEKS", T.sub)
+		local tHeal = X.tile(tg, "SELF-HEAL", T.sub)
 
-    ------------------------------------------------------------------
-    -- Halaman 4: Log
-    ------------------------------------------------------------------
-    local P4, s4 = newPage("log")
-    local FILTERS = { { "all", "Semua" }, { "parry", "Parry" }, { "block", "Block" }, { "dodge", "Dodge" }, { "hit", "Kena" }, { "other", "Lain" } }
-    local filter, whyMode, forceLog = "all", false, true
-    -- v11.3: kartu status live
-    local cLive = card(s4)
-    local liveL = {}
-    for i = 1, 4 do
-        liveL[i] = text(cLive, "", 11, T.text, Enum.Font.Code, { Size = UDim2.new(1, 0, 0, 15), RichText = true, TextTruncate = Enum.TextTruncate.AtEnd })
-    end
-    local cTop = card(s4)
-    local chipsHost = rowHost(cTop, 26)
-    local chips = {}
-    for i, f in ipairs(FILTERS) do
-        local b = make("TextButton", {
-            Position = UDim2.new((i - 1) / #FILTERS, 0, 0, 0), Size = UDim2.new(1 / #FILTERS, -3, 1, 0), Text = f[2],
-            Font = Enum.Font.GothamMedium, TextSize = 11, TextColor3 = T.sub, BackgroundColor3 = T.cardHi, BorderSizePixel = 0, AutoButtonColor = false,
-        }, chipsHost)
-        corner(b, 6)
-        hook(b.Activated, function()
-            filter, whyMode, forceLog = f[1], false, true
-            refreshPage()
-        end)
-        chips[i] = b
-    end
-    local actRow = rowHost(cTop, 28)
-    make("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }, actRow)
-    orderN[actRow] = 0
-    local whyBtn = button(actRow, "Kenapa kena?", function()
-        whyMode, forceLog = not whyMode, true
-        refreshPage()
-    end, { Size = UDim2.new(0.5, -3, 1, 0) })
-    button(actRow, "Bersihin log", function()
-        EV.head, EV.count = 0, 0
-        table.clear(whyLog)
-        forceLog = true
-        refreshPage()
-    end, { Size = UDim2.new(0.5, -3, 1, 0) })
-    -- v11.3: satu tombol salin semua
-    local copyRow = rowHost(cTop, 28)
-    make("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }, copyRow)
-    orderN[copyRow] = 0
-    button(copyRow, "Salin semua (live dump)", function()
-        local okD, txt = pcall(SK.dump)
-        if not okD then
-            UI.toast("Gagal bikin dump: " .. tostring(txt), "bad")
-            return
-        end
-        local okC = pcall(function()
-            local fn = setclipboard or toclipboard
-            fn(txt)
-        end)
-        if not okC then
-            print(txt)
-        end
-        local _, nl = txt:gsub("\n", "\n")
-        UI.toast(okC and ("Disalin · %d baris"):format(nl + 1) or "Clipboard nggak ada, dicetak ke console", okC and "ok" or "warn")
-    end, { Size = UDim2.new(1, 0, 1, 0) })
-    local logBox = card(s4)
-    local LOG_ROWS = 40
-    local logRows = {}
-    for i = 1, LOG_ROWS do
-        logRows[i] = text(logBox, "", 11, T.text, Enum.Font.Code, { Size = UDim2.new(1, 0, 0, 15), RichText = true, TextTruncate = Enum.TextTruncate.AtEnd, Visible = false })
-    end
-    local logEmpty = text(logBox, "belum ada event", 11, T.sub, Enum.Font.Gotham, { Size = UDim2.new(1, 0, 0, 18) })
-    local function kindMatch(k)
-        if filter == "all" then
-            return true
-        elseif filter == "hit" then
-            return k == "hit" or k == "gb"
-        elseif filter == "other" then
-            return k == "plan" or k == "skip" or k == "info"
-        end
-        return k == filter
-    end
-    P4.refresh = function()
-        for i, f in ipairs(FILTERS) do
-            local on = (not whyMode) and f[1] == filter
-            chips[i].BackgroundColor3 = on and accent or T.cardHi
-            chips[i].TextColor3 = on and Color3.fromRGB(10, 12, 18) or T.sub
-        end
-        whyBtn.BackgroundColor3 = whyMode and T.bad or T.cardHi
-        local now = os.clock()
-        local l1, l2, l3, l4, fresh = SK.live(now)
-        setT(liveL[1], esc(l1))
-        setT(liveL[2], esc(l2))
-        setT(liveL[3], esc(l3))
-        setT(liveL[4], esc(l4))
-        liveL[1].TextColor3 = blockHeld and T.good or T.sub
-        liveL[3].TextColor3 = fresh and T.bad or T.sub
-        local n = 0
-        if whyMode then
-            for i = #whyLog, 1, -1 do
-                local w = whyLog[i]
-                if n + 3 > LOG_ROWS then
-                    break
-                end
-                n += 1
-                logRows[n].Text = ('<font color="%s">%4.0fs</font> <font color="%s">%s dari %s · combo %d%s</font>'):format(
-                    hex(T.sub), now - w.t, hex(T.bad), w.kind, esc(w.who), w.combo,
-                    (w.pa and w.pa < 2.0) and (" · %.1fs abis parry"):format(w.pa)
-                        or ((w.bp and w.bp < 2.0) and (" · %.1fs abis ke-parry"):format(w.bp) or "")
-                )
-                logRows[n].Visible = true
-                n += 1
-                logRows[n].Text = ('<font color="%s">   %s · rtt %dms · %dfps · block %s · kunci %.2fs</font>'):format(
-                    hex(T.warn), esc(w.why), math.floor(w.rtt * 1000 + 0.5), math.floor(w.fps + 0.5), w.held and "nyala" or "mati", w.locked
-                )
-                logRows[n].Visible = true
-                n += 1
-                logRows[n].Text = ('<font color="%s">   style %s · jarak %s · event %s</font>'):format(
-                    hex(T.sub), esc(tostring(w.st or "?")), w.dist and ("%.1f"):format(w.dist) or "?", w.sw and ("%.2fs lalu"):format(w.sw) or "nggak ada"
-                )
-                logRows[n].Visible = true
-            end
-        else
-            for age = 0, EV.count - 1 do
-                local e = EV.ring[(EV.head - age - 1) % EV.cap + 1]
-                if e and kindMatch(e.kind) then
-                    n += 1
-                    if n > LOG_ROWS then
-                        n = LOG_ROWS
-                        break
-                    end
-                    logRows[n].Text = ('<font color="%s">%5.1fs</font> <font color="%s">%s</font>'):format(hex(T.sub), now - e.t, hex(kindColor(e.kind)), esc(e.text))
-                    logRows[n].Visible = true
-                end
-            end
-        end
-        for i = n + 1, LOG_ROWS do
-            logRows[i].Visible = false
-        end
-        logEmpty.Visible = n == 0
-        forceLog = false
-    end
+		local gc = X.card(sf, "Jaringan & performa")
+		local spPing = X.spark(gc, "PING (ms)")
+		local spFps = X.spark(gc, "FPS")
+		local spCpu = X.spark(gc, "CPU SCRIPT (µs / frame)")
 
-    ------------------------------------------------------------------
-    -- Halaman 5: Setelan
-    ------------------------------------------------------------------
-    local P5, s5 = newPage("set")
-    local rebinding = nil
-    local function keyRow(parent, label, key)
-        local row = rowHost(parent, 30)
-        text(row, label, 12, T.text, Enum.Font.GothamMedium, { Size = UDim2.new(0.55, 0, 1, 0) })
-        local b = make("TextButton", {
-            AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, 0, 0.5, 0), Size = UDim2.fromOffset(100, 24), Text = "",
-            Font = Enum.Font.GothamBold, TextSize = 11, TextColor3 = T.text, BackgroundColor3 = T.cardHi, BorderSizePixel = 0, AutoButtonColor = false,
-        }, row)
-        corner(b, 6)
-        local function paint()
-            b.Text = (rebinding == key) and "tekan tombol…" or CFG[key].Name
-            b.BackgroundColor3 = (rebinding == key) and accent or T.cardHi
-        end
-        hook(b.Activated, function()
-            if rebinding == key then
-                rebinding, UI.capture = nil, nil
-                paint()
-                return
-            end
-            rebinding = key
-            paintAll()
-            UI.capture = function(kc)
-                if kc ~= Enum.KeyCode.Escape and kc ~= Enum.KeyCode.Unknown then
-                    CFG[key] = kc
-                    Store.touch()
-                    UI.toast(label .. " = " .. kc.Name, "ok")
-                end
-                rebinding, UI.capture = nil, nil
-                paintAll()
-            end
-        end)
-        paints[#paints + 1] = paint
-        paint()
-    end
-    local cKeys = card(s5, "Tombol")
-    keyRow(cKeys, "Toggle parry", "ToggleKey")
-    keyRow(cKeys, "Sembunyiin UI", "UIKey")
+		local ec = X.card(sf, "Event terakhir")
+		local evL = {}
+		for i = 1, 5 do
+			evL[i] = text(ec, "", 11, T.text, FC, { Size = UDim2.new(1, 0, 0, 15), RichText = true, TextTruncate = TR })
+		end
+		local br = X.hrow(sf)
+		X.btn(br, "Reset stat", function()
+			resetStats()
+			UI.toast("Statistik direset", "info")
+			UI.refresh()
+		end, { Size = UDim2.new(0.5, -3, 1, 0) })
+		X.btn(br, "Salin ringkasan", function()
+			X.copy(summaryText(), "Ringkasan disalin")
+		end, { Size = UDim2.new(0.5, -3, 1, 0) })
 
-    local cLook = card(s5, "Tampilan")
-    sliderRow(cLook, "Ukuran UI", "UIScale", 0.7, 1.4, 0.05, fScale, {
-        onChange = function()
-            winScale.Scale = CFG.UIScale
-            clampToScreen(win)
-        end,
-    })
-    do
-        local row = rowHost(cLook, 30)
-        text(row, "Warna aksen", 12, T.text, Enum.Font.GothamMedium, { Size = UDim2.new(0.5, 0, 1, 0) })
-        local sw = make("Frame", { AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, 0, 0.5, 0), Size = UDim2.fromOffset(4 * 28, 24), BackgroundTransparency = 1 }, row)
-        for i, col in ipairs(ACCENTS) do
-            local b = make("TextButton", { Position = UDim2.fromOffset((i - 1) * 28, 0), Size = UDim2.fromOffset(24, 24), Text = "", BackgroundColor3 = col, BorderSizePixel = 0, AutoButtonColor = false }, sw)
-            corner(b, 12)
-            hook(b.Activated, function()
-                CFG.Accent = i
-                accent = col
-                for _, ab in ipairs(accentBind) do
-                    pcall(function()
-                        ab[1][ab[2]] = accent
-                    end)
-                end
-                paintAll()
-                Store.touch()
-            end)
-        end
-    end
-    switchRow(cLook, "Notifikasi kecil", "Toasts")
-    switchRow(cLook, "Mode hemat otomatis", "AutoLite", "UI melambat sendiri kalau fps jatuh")
+		local function pingColor(v)
+			return v < 80 and T.good or (v < 150 and T.warn or T.bad)
+		end
+		local function fpsColor(v)
+			return v >= 50 and T.good or (v >= 30 and T.warn or T.bad)
+		end
+		local function cpuColor(v)
+			return v < 400 and T.good or (v < 1200 and T.warn or T.bad)
+		end
+		local DEAD = Color3.fromRGB(150, 55, 55)
 
-    local cCfg = card(s5, "Konfigurasi")
-    switchRow(cCfg, "Simpan otomatis", "SaveConfig", "file: " .. CFG.ConfigFile, function(on)
-        if not on then
-            Store.save() -- catat sekali bahwa auto-save dimatiin, biar launch berikutnya nggak nyala lagi
-        end
-    end)
-    local cfgRow = rowHost(cCfg, 30)
-    make("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }, cfgRow)
-    orderN[cfgRow] = 0
-    button(cfgRow, "Simpan", function()
-        local ok = Store.save()
-        UI.toast(ok and "Config disimpan" or "Executor nggak punya writefile", ok and "ok" or "warn")
-    end, { Size = UDim2.new(1 / 3, -4, 1, 0) })
-    button(cfgRow, "Muat", function()
-        local ok = Store.load()
-        winScale.Scale = CFG.UIScale
-        paintAll()
-        UI.toast(ok and "Config dimuat" or "Belum ada config", ok and "ok" or "warn")
-    end, { Size = UDim2.new(1 / 3, -4, 1, 0) })
-    button(cfgRow, "Bawaan", function()
-        Store.reset()
-        winScale.Scale = CFG.UIScale
-        paintAll()
-        UI.toast("Dikembalikan ke bawaan", "ok")
-    end, { Size = UDim2.new(1 / 3, -4, 1, 0) })
+		P.refresh = function()
+			local c = counters
+			local landed = c.parried + c.blocked + c.guardbroken + c.hit
+			local all = landed + c.dodged
+			local rate = all > 0 and (c.parried + c.blocked + c.dodged) / all or 1
+			local col = rate >= 0.8 and T.good or (rate >= 0.55 and T.warn or T.bad)
+			setT(big, ("%d%%"):format(math.floor(rate * 100 + 0.5)))
+			big.TextColor3 = col
+			setT(cap, landed > 0 and ("aman dari %d hit nyampe\nparry %d%% dari yang nyampe"):format(all, math.floor(c.parried / math.max(landed, 1) * 100 + 0.5)) or "belum ada hit\nyang nyampe")
+			X.setStack(stk, { c.parried, c.blocked, c.dodged, c.hit, c.guardbroken }, { T.good, T.info, X.accent, T.bad, DEAD })
+			setT(legend, ('<font color="%s">parry %d</font>  <font color="%s">block %d</font>  <font color="%s">dodge %d</font>  <font color="%s">kena %d</font>  <font color="%s">gb %d</font>'):format(
+				hex(T.good), c.parried, hex(T.info), c.blocked, hex(X.accent), c.dodged, hex(T.bad), c.hit, hex(DEAD), c.guardbroken))
+			paintPwr()
+			setT(tParry, tostring(c.parried))
+			setT(tBlock, tostring(c.blocked))
+			setT(tDodge, tostring(c.dodged))
+			setT(tHit, tostring(c.hit))
+			setT(tGB, tostring(c.guardbroken))
+			setT(tPred, tostring(c.predicted))
+			setT(tReflex, tostring(c.reflex))
+			setT(tHeal, tostring(c.healed + c.recheck))
 
-    local cDbg = card(s5, "Debug")
-    switchRow(cDbg, "Catat event (tab Log)", "LogEvents")
-    switchRow(cDbg, "Debug print", "Debug", "bisa bikin lag, nyalain pas perlu")
-    switchRow(cDbg, "Trace keputusan", "Trace", "print tiap swing + alasannya")
-    switchRow(cDbg, "Catat 'kenapa kena'", "WhyHit")
+			local now = os.clock()
+			local gl = gameLock()
+			local rdy = math.max(readyAt, lockedUntil, dodgeBlockUntil, gl or -math.huge) - now
+			if blockHeld then
+				X.setMeter(mBlock, 1, T.good, "NYALA")
+			elseif rdy > 0.005 then
+				X.setMeter(mBlock, 1 - rdy / math.max(SR.BlockCooldown, rdy), T.warn, ("terkunci %.2fs"):format(rdy))
+			else
+				X.setMeter(mBlock, 1, T.info, "siap")
+			end
+			local pcd = parriedAt + SR.ParryCooldown - now
+			if pcd > 0 then
+				X.setMeter(mParry, 1 - pcd / SR.ParryCooldown, T.warn, ("%.2fs"):format(pcd))
+			else
+				X.setMeter(mParry, 1, T.good, "siap")
+			end
+			local dw = dodgeWait(now)
+			if dw > 0.02 then
+				X.setMeter(mDodge, 1 - dw / math.max(SR.Dash.Cooldown, dw), T.warn, ("%.1fs"):format(dw))
+			else
+				X.setMeter(mDodge, 1, X.accent, "siap")
+			end
+			local _, _, r3, _, fresh = SK.live(now)
+			setT(lastHit, r3)
+			lastHit.TextColor3 = fresh and T.bad or T.sub
 
-    local cInfo = card(s5, "Info")
-    local infoLbl = text(cInfo, "", 10, T.sub, Enum.Font.Code, { Size = UDim2.new(1, 0, 0, 74), TextWrapped = true, TextYAlignment = Enum.TextYAlignment.Top })
-    local cDanger = card(s5, "Bahaya")
-    local armed = false
-    local unloadBtn
-    unloadBtn = button(cDanger, "Matikan & copot script", function()
-        if not armed then
-            armed = true
-            unloadBtn.Text = "Yakin? tap sekali lagi"
-            unloadBtn.BackgroundColor3 = T.bad
-            task.delay(2.5, function()
-                armed = false
-                if unloadBtn.Parent then
-                    unloadBtn.Text = "Matikan & copot script"
-                    unloadBtn.BackgroundColor3 = T.cardHi
-                end
-            end)
-            return
-        end
-        local api = genv.__NyxAutoParry
-        if api and api.Stop then
-            api.Stop()
-        end
-    end)
-    P5.refresh = function()
-        paintAll()
-        local h = getHandler()
-        setT(infoLbl, ("handler game : %s\nstate lokal   : %s\nhook swing    : %s\nblock via game: %s\nstyle kebaca  : %d\nfile config   : %s"):format(
-            h and "ya" or "nggak", (h and type(h.Local) == "table") and "ya" or "nggak", origTrySwing and "ya" or "nggak",
-            (CFG.UseGameBlock and h and type(h.SetLocalBlocking) == "function") and "ya" or "nggak", Specs.count,
-            (type(writefile) == "function") and "bisa" or "nggak ada writefile"
-        ))
-    end
+			local g = Maint.g
+			X.drawSpark(spPing, g.ping, g.head, g.count, 300, pingColor)
+			X.drawSpark(spFps, g.fps, g.head, g.count, 144, fpsColor)
+			X.drawSpark(spCpu, g.cpu, g.head, g.count, 2000, cpuColor)
+			setT(spPing.cur, ("%d ms ±%d"):format(ms(net.rtt), ms(net.var)))
+			setT(spFps.cur, ("%d fps · spike %d"):format(math.floor(frame.fps + 0.5), frame.spikes))
+			setT(spCpu.cur, ("%d µs · max %d"):format(math.floor(frame.cpu * 1e6 + 0.5), math.floor(frame.cpuMax * 1e6 + 0.5)))
+			for i = 1, #evL do
+				local e = EV.count >= i and EV.ring[(EV.head - i) % EV.cap + 1] or nil
+				if e then
+					setT(evL[i], ('<font color="%s">%4.0fs</font> <font color="%s">%s</font>'):format(hex(T.sub), now - e.t, hex(X.kindColor(e.kind)), esc(e.text)))
+				else
+					setT(evL[i], i == 1 and ('<font color="%s">belum ada event</font>'):format(hex(T.sub)) or "")
+				end
+			end
+		end
+	end
 
-    ------------------------------------------------------------------
-    -- Refresh + loop
-    ------------------------------------------------------------------
-    refreshPage = function()
-        local p = pages[UI.tab]
-        if p and p.refresh and win.Visible and not collapsed then
-            local ok, err = pcall(p.refresh)
-            if not ok and not UI.errShown then
-                UI.errShown = true
-                print("[AutoParry] UI refresh error:", err)
-            end
-        end
-    end
+	------------------------------------------------------------------
+	-- Halaman: Bertahan
+	------------------------------------------------------------------
+	function X.pageDef()
+		local P, sf = X.newPage("def")
+		-- items: { "label", "Key", "hint", onChange } = toggle; function(body) = baris custom
+		local function group(title, def, items)
+			local keys = {}
+			for _, it in ipairs(items) do
+				if type(it) == "table" then
+					keys[#keys + 1] = it[2]
+				end
+			end
+			local fb = X.fold(sf, title, def, keys)
+			for _, it in ipairs(items) do
+				if type(it) == "function" then
+					it(fb)
+				else
+					X.swRow(fb, it[1], it[2], it[3], it[4])
+				end
+			end
+		end
+		group("Respons utama", true, {
+			{ "Parry", "Enabled", "saklar utama (sama kayak di header)", function()
+				UI.toast(CFG.Enabled and "AutoParry ON" or "AutoParry OFF", CFG.Enabled and "ok" or "bad")
+				UI.refresh()
+			end },
+			{ "Block biasa", "BlockFallback", "parry nggak mungkin -> tetap block" },
+			{ "Dodge", "DodgeEnabled", "cadangan buat M2 / M1 yang nggak kekejar" },
+			{ "Mode pintar", "SmartMode", "pilih parry vs dodge dari peluang sukses" },
+			function(b)
+				X.seg(b, "M1 yang kepepet (late)", { "skip", "block" }, { key = "LateModeM1", hint = "hit M1 terlalu mepet buat di-react" })
+			end,
+			function(b)
+				X.seg(b, "M2 yang kepepet (late)", { "skip", "block" }, { key = "LateModeM2", hint = "M2 lebih aman di-skip (block = GuardBroken)" })
+			end,
+		})
+		group("Block", false, {
+			{ "Chain guard", "ChainGuard", "block ditahan nyambung buat M1 beruntun" },
+			{ "Lepas abis parry", "ReleaseOnParry", "cooldown block cepat beres" },
+			{ "Jaga crowd", "CrowdGuard", "tahan block kalau attacker lain baru ngayun" },
+			{ "Prioritas block", "GuardPriority", "swing manual ditahan pas block mau dikirim" },
+			{ "Lepas pas klik", "ReleaseOnManualAttack", "klik kiri = block script dilepas" },
+			{ "Raw block", "RawOnLocalRefuse", "cek lokal nolak tapi model bilang aman" },
+			{ "Pakai block game", "UseGameBlock", "SetLocalBlocking asli game" },
+			{ "Pakai state game", "UseGameState", "baca busy/stun/cooldown dari CombatHandler" },
+		})
+		group("Dodge", false, {
+			{ "M2 pakai dodge", "DodgeForM2" },
+			{ "M1 dodge cadangan", "DodgeForM1", "kalau parry & block sama-sama nggak sempat" },
+			{ "M2 dodge duluan", "DodgeFirstM2", "parry M2 cuma kalau dodge cooldown" },
+			{ "Dodge abis miss", "DodgeAfterMiss", "parry M2 pernah miss -> dodge dulu" },
+			{ "Pakai TryDodge game", "DodgeViaGame", "animasi + dorongan ikut bener" },
+			{ "Dodge ikut arah", "DodgeDir", "ikut arah gerak / arah aman, bukan maju doang" },
+			{ "Ikut arah gerak", "DodgeFollowInput", "lagi gerak -> dodge searah (kalau aman)" },
+			function(b)
+				X.seg(b, "Mode arah dodge", { "Smart", "Input", "Away", "Game" }, { key = "DodgeDirMode" })
+			end,
+			function(b)
+				X.seg(b, "Acuan arah", { "Camera", "Character" }, { key = "DodgeFrame", hint = "relatif kamera atau hadap karakter" })
+			end,
+		})
+		group("Combo & prediksi", false, {
+			{ "Prediksi combo", "PredictCombo", "tebak M1 berikutnya (lead < ping)" },
+			{ "Refleks combo", "HitReflex", "abis kena/block langsung rencanain hit lanjut" },
+			{ "Combo keep", "ComboKeep", "attacker yang lagi nge-combo tetap ancaman" },
+			{ "Fast unlock", "FastUnlock", "block keluar tepat pas stun lepas" },
+			{ "Retry abis unlock", "RetryAfterUnlock" },
+			{ "Retry abis ditolak", "GuardRetryOnRefuse" },
+			{ "Belajar interval combo", "GapLearn", "tebakan hit lanjutan dikoreksi dari interval asli" },
+			{ "Attacker ngebut = ancaman", "MobileThreat", "dash kanan-kiri / muter cepat tetap di-parry" },
+		})
+		group("Abis parry & abis kena", false, {
+			{ "Tahan block abis parry", "PostParryHold", "cooldown 0.75s = celah buat hit lanjutan" },
+			{ "Guard abis kena parry", "ParriedGuard", "block pas stun lepas kalau LU yang ke-parry" },
+			{ "Guard abis kena", "HitGuard", "block ON tepat pas stun lepas" },
+			{ "Guard abis kena M2/GB", "HitGuardM2", "guard yang sama abis M2 / guard break" },
+			{ "Pad ping / fps", "LagAdaptive", "hold melebar kalau ping tinggi / fps rendah" },
+		})
+		group("Skill, style & belajar", false, {
+			{ "Sadar skill", "SkillAware", "hit skill nggak dihitung M1" },
+			{ "Barrage guard", "BarrageGuard", "skill multi-hit: block/parry lagi tiap interval" },
+			{ "Back-hit guard", "BackHitGuard", "kalau BackHit nyala: dodge, bukan block" },
+			{ "Pengenal style pintar", "StyleIQ", "style kosong / salah ditebak dari bukti" },
+			{ "Prior per style", "StylePrior", "attacker baru mulai dari koreksi style yang sama" },
+			{ "Belajar M2 per style", "M2Learn", "statistik parry vs dodge ngebobot pilihan" },
+			{ "TeleLearn", "TeleLearn", "belajar telegraf serangan yang belum dikenal" },
+			{ "Simpan hasil belajar", "LearnStore", "nggak mulai dari nol tiap sesi" },
+		})
+		group("Keamanan state", false, {
+			{ "Reset pas respawn", "RespawnReset", "mati/respawn = state bersih" },
+			{ "Self-heal", "SelfHeal", "timer nyangkut dirapihin tiap 0.5s" },
+			{ "Cek attacker", "RecheckAttacker", "attacker mati/knocked = block batal" },
+			{ "Tune per attacker", "TuneByAttacker", "belajar cuma dari block yang relevan" },
+			{ "Spike guard", "SpikeGuard", "hitch frame nggak ngerusak rata-rata fps" },
+			{ "Titik cek ekstra", "FramePump3", "antrean dicek juga di PreSimulation" },
+		})
+		P.refresh = function()
+			X.afterToggle()
+		end
+	end
 
-    local lastSeq = EV.seq
-    local lite = false
-    local function refreshOrb()
-        local on = CFG.Enabled and true or false
-        local col = (not on) and T.bad or (lite and T.warn or T.good)
-        if orb.BackgroundColor3 ~= col then
-            orb.BackgroundColor3 = col
-        end
-        if dot.BackgroundColor3 ~= col then
-            dot.BackgroundColor3 = col
-        end
-        setT(orb, lite and on and "AP·" or "AP")
-        if EV.seq ~= lastSeq then
-            local e = EV.ring[(EV.head - 1) % EV.cap + 1]
-            lastSeq = EV.seq
-            if e and (e.kind == "parry" or e.kind == "block" or e.kind == "dodge" or e.kind == "hit" or e.kind == "gb") then
-                orbRing.Color = kindColor(e.kind)
-                orbRing.Transparency = 0.05
-                orbRing.Thickness = 3.5
-                tween(orbRing, 0.5, { Transparency = 0.55, Thickness = 1.5 })
-            end
-        end
-    end
-    local function refreshFooter()
-        setT(footLbl, ("%dms ±%d · %dfps · cpu %.2fms%s"):format(
-            math.floor(net.rtt * 1000 + 0.5), math.floor(net.var * 1000 + 0.5), math.floor(frame.fps + 0.5), frame.cpu * 1000, lite and " · hemat" or ""
-        ))
-    end
+	------------------------------------------------------------------
+	-- Halaman: Timing
+	------------------------------------------------------------------
+	function X.pageTun()
+		local P, sf = X.newPage("tun")
+		local cPre = X.card(sf, "Preset")
+		local names = {}
+		for _, pr in ipairs(Store.presets) do
+			names[#names + 1] = pr.name
+		end
+		X.seg(cPre, nil, names, {
+			get = Store.activePreset,
+			set = function(v)
+				Store.apply(v)
+			end,
+			onChange = function()
+				paintAll()
+				UI.toast("Preset dipakai", "ok")
+			end,
+		})
+		local presetNote = text(cPre, "", 10, T.sub, FR, { Size = UDim2.new(1, 0, 0, 14), TextTruncate = TR })
+		addPaint(function()
+			setT(presetNote, "aktif: " .. Store.activePreset() .. " (titik awal, bukan hasil tuning ke game lu)")
+		end)
 
-    UI.refresh = function()
-        paintAll()
-        refreshOrb()
-        if win.Visible then
-            refreshFooter()
-            refreshPage()
-        end
-    end
-    UI.toggleWindow = function()
-        if win.Visible then
-            win.Visible = false
-            return
-        end
-        if not UI.placed then
-            UI.placed = true
-            local op = orb.Position
-            win.Position = UDim2.new(op.X.Scale, op.X.Offset, op.Y.Scale, op.Y.Offset + ORB + 8)
-        end
-        win.Visible = true
-        clampToScreen(win)
-        UI.refresh()
-    end
-    UI.setVisible = function()
-        gui.Enabled = not gui.Enabled
-    end
+		local w = X.fold(sf, "Window parry & hold", true)
+		X.num(w, "Umur block M1", "TargetAgeM1", { lo = 0.06, hi = 0.20, step = 0.005, unit = "ms", hint = "umur block pas M1 mendarat (window 0-250ms)" })
+		X.num(w, "Umur block M2", "TargetAgeM2", { lo = 0.06, hi = 0.20, step = 0.005, unit = "ms" })
+		X.num(w, "Hold abis hit", "HoldAfterHit", { lo = 0.03, hi = 0.20, step = 0.005, unit = "ms" })
+		X.num(w, "Toleransi telat", "LateTolerance", { lo = 0, hi = 0.08, step = 0.005, unit = "ms" })
+		X.num(w, "Chain hold", "ChainHold", { lo = 0.4, hi = 1.5, step = 0.05, unit = "s" })
+		X.num(w, "Hold maksimal", "MaxHold", { lo = 1, hi = 4, step = 0.1, unit = "s" })
+		X.num(w, "Hold maks (aktif)", "MaxHoldActive", { lo = 2, hi = 10, step = 0.5, unit = "s" })
+		X.num(w, "Pad hasil hit", "ResultPad", { lo = 0.02, hi = 0.15, step = 0.005, unit = "ms" })
 
-    makeDraggable(orb, orb, UI.toggleWindow)
-    makeDraggable(titleBar, win, nil)
-    makeSwitch(titleBar, "Enabled", UDim2.new(1, -72, 0.5, 0), function()
-        UI.toast(CFG.Enabled and "AutoParry ON" or "AutoParry OFF", CFG.Enabled and "ok" or "bad")
-        UI.refresh()
-    end)
+		local r = X.fold(sf, "Jangkauan ancaman", false)
+		X.num(r, "Margin depan", "RangeMargin", { lo = 0, hi = 6, step = 0.5, unit = "stud" })
+		X.num(r, "Margin samping", "WidthMargin", { lo = 0, hi = 5, step = 0.5, unit = "stud" })
+		X.num(r, "Margin belakang", "BackMargin", { lo = 0, hi = 8, step = 0.5, unit = "stud" })
+		X.num(r, "Dekat banget", "CloseAlways", { lo = 0, hi = 20, step = 1, unit = "stud" })
+		X.num(r, "Dekat banget (M2)", "M2CloseAlways", { lo = 0, hi = 30, step = 1, unit = "stud" })
+		X.num(r, "Jarak combo-keep", "ComboKeepRange", { lo = 8, hi = 24, step = 1, unit = "stud" })
+		X.num(r, "Jarak guard abis kena", "HitGuardRange", { lo = 8, hi = 24, step = 1, unit = "stud" })
+		X.num(r, "Jarak guard abis ke-parry", "ParriedGuardRange", { lo = 8, hi = 24, step = 1, unit = "stud" })
 
-    selectTab(UI.tab or "sum")
+		local d = X.fold(sf, "Dodge (iframe)", false)
+		X.num(d, "Titik hit di iframe", "DodgeAgeFrac", { lo = 0.2, hi = 0.8, step = 0.05, unit = "pct", hint = "50% = hit mendarat di tengah iframe" })
+		X.num(d, "Peluang minimum dodge", "DodgeMinConf", { lo = 0.4, hi = 0.95, step = 0.05, unit = "pct" })
+		X.num(d, "Selisih pindah ke dodge", "DodgeSwitchGap", { lo = 0, hi = 0.5, step = 0.05, unit = "pct" })
+		X.num(d, "Bobot arah gerak", "DodgeInputWeight", { lo = 0, hi = 4, step = 0.25, unit = "n2" })
+		X.num(d, "Bias telat", "DodgeLateBias", { lo = 0, hi = 1.5, step = 0.1, unit = "n2" })
+		X.num(d, "Tahan input arah", "DodgeSpoofHold", { lo = 0.02, hi = 0.2, step = 0.01, unit = "ms" })
 
-    task.spawn(function()
-        local lastLite = -math.huge
-        while alive and gui.Parent do
-            local visible = win.Visible and not collapsed
-            local fighting = CFG.CombatUIPause and SK.hot(os.clock()) -- v11.5: lagi tarung -> UI nggak disentuh sama sekali
-            local wantLite = CFG.AutoLite and (frame.fps < CFG.LiteFps or frame.cpu > 0.0015)
-            if wantLite then
-                lastLite = os.clock()
-            end
-            lite = wantLite or (os.clock() - lastLite < 4)
-            task.wait(visible and (lite and 0.6 or 0.25) or (lite and 1.5 or 0.6))
-            if not (alive and gui.Parent) then
-                break
-            end
-            -- v11.5: abis tunggu, cek lagi (attacker bisa baru mulai ngayun); pas tarung nggak ada update teks / grafik / writefile
-            fighting = fighting or (CFG.CombatUIPause and SK.hot(os.clock()))
-            if not fighting then
-                pcall(refreshOrb)
-                if visible then
-                    pcall(refreshFooter)
-                    refreshPage()
-                end
-                if Store.dirtyAt and os.clock() - Store.dirtyAt > 1.2 then
-                    Store.save()
-                end
-            end
-        end
-    end)
+		local l = X.fold(sf, "Belajar & jaringan", false)
+		X.swRow(l, "Adaptif", "Adaptive", "geser timing dari hasil hit")
+		X.num(l, "Langkah tune", "TuneStep", { lo = 0.004, hi = 0.03, step = 0.002, unit = "ms" })
+		X.num(l, "Batas tune", "TuneMax", { lo = 0.03, hi = 0.15, step = 0.01, unit = "ms" })
+		X.num(l, "Ping manual", "PingOverride", {
+			lo = 0, hi = 0.35, step = 0.01, unit = "ms", zero = "auto", hint = "0 = baca otomatis",
+			get = function()
+				return CFG.PingOverride or 0
+			end,
+			set = function(v)
+				CFG.PingOverride = v > 0 and v or nil
+			end,
+		})
+		local tuneLbl = text(l, "", 11, T.sub, FC, { Size = UDim2.new(1, 0, 0, 16), TextTruncate = TR })
+		X.btn(l, "Reset hasil belajar", function()
+			tune.M1, tune.M2 = 0, 0
+			streak.M1.dir, streak.M1.n, streak.M2.dir, streak.M2.n = 0, 0, 0, 0
+			stunSlack = CFG.StunSlackStart
+			table.clear(leadCorr)
+			table.clear(leadAll)
+			table.clear(leadN)
+			UI.toast("Hasil belajar direset", "ok")
+		end)
+		P.refresh = function()
+			paintAll()
+			X.afterToggle()
+			setT(tuneLbl, ("tune M1 %+.3f · M2 %+.3f · slack %.2f"):format(tune.M1, tune.M2, stunSlack))
+		end
+	end
 
-    task.delay(1, function()
-        UI.toast("Ketuk bulatan AP buat buka panel", "info")
-    end)
+	------------------------------------------------------------------
+	-- Halaman: Intel (style musuh, telegraf, dodge, Doctor)
+	------------------------------------------------------------------
+	function X.pageIntel()
+		local P, sf = X.newPage("intel")
+		local S = { at = -math.huge }
+		local cSt = X.card(sf, "Status script")
+		local stLbl = text(cSt, "", 11, T.text, FC, { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = AY, TextWrapped = true, TextYAlignment = Enum.TextYAlignment.Top })
+
+		local cStyle = X.card(sf, "Style musuh", "pengenal style")
+		local styleL = {}
+		for i = 1, 6 do
+			styleL[i] = text(cStyle, "", 11, T.text, FC, { Size = UDim2.new(1, 0, 0, 15), RichText = true, TextTruncate = TR })
+		end
+
+		local cM2 = X.card(sf, "Statistik M2", "parry vs dodge")
+		local m2L = {}
+		for i = 1, 4 do
+			m2L[i] = text(cM2, "", 11, T.text, FC, { Size = UDim2.new(1, 0, 0, 15), RichText = true, TextTruncate = TR })
+		end
+
+		local cTele, teleSub = X.card(sf, "TeleLearn", "")
+		local teleL = {}
+		for i = 1, 8 do
+			teleL[i] = text(cTele, "", 11, T.text, FC, { Size = UDim2.new(1, 0, 0, 15), RichText = true, TextTruncate = TR })
+		end
+		local teleSum = text(cTele, "", 10, T.sub, FR, { Size = UDim2.new(1, 0, 0, 14), TextTruncate = TR })
+
+		local cDod = X.card(sf, "Arah dodge")
+		local dodLbl = text(cDod, "", 11, T.text, FC, { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = AY, TextWrapped = true, TextYAlignment = Enum.TextYAlignment.Top })
+		X.btn(cDod, "Cetak DodgeInfo ke console", function()
+			pcall(SK.ddInfoPrint)
+			UI.toast("Dicetak ke console", "info")
+		end)
+
+		local cDoc = X.card(sf, "Doctor", "diagnosa dari data sesi lu")
+		local docBox = make("Frame", { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = AY, BackgroundTransparency = 1 }, cDoc)
+		list(docBox, 6)
+		X.btn(cDoc, "Jalankan Doctor", function()
+			for _, ch in ipairs(docBox:GetChildren()) do
+				if not ch:IsA("UIListLayout") then
+					ch:Destroy()
+				end
+			end
+			orderN[docBox] = 0
+			local ok, lines = pcall(SK.doctor)
+			if not ok or type(lines) ~= "table" then
+				lines = { "Doctor error: " .. tostring(lines) }
+			end
+			for _, ln in ipairs(lines) do
+				text(docBox, tostring(ln), 11, T.text, FR, { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = AY, TextWrapped = true, TextYAlignment = Enum.TextYAlignment.Top })
+			end
+		end)
+		X.btn(cDoc, "Cetak Style + TeleLearn ke console", function()
+			pcall(SK.iqReport)
+			pcall(SK.tlReport)
+			UI.toast("Dicetak ke console", "info")
+		end)
+
+		P.refresh = function()
+			local now = os.clock()
+			if now - S.at < 0.45 then
+				return
+			end
+			S.at = now
+			local h = getHandler()
+			local yn = function(v)
+				return v and "ya" or "nggak"
+			end
+			setT(stLbl, ("handler game : %s\nstate lokal   : %s\nhook swing    : %s\nblock via game: %s\nstyle kebaca  : %d\nsave/load file: %s"):format(
+				yn(h), yn(h and type(h.Local) == "table"), yn(origTrySwing), yn(CFG.UseGameBlock and h and type(h.SetLocalBlocking) == "function"),
+				Specs.count, (type(writefile) == "function") and "bisa" or "nggak ada writefile"))
+
+			local rows = {}
+			for ch, st in pairs(SK.iqState) do
+				if typeof(ch) == "Instance" and ch.Parent and st.name ~= nil then
+					rows[#rows + 1] = { ch.Name, tostring(st.name), tostring(st.src), st.bestS or 0 }
+				end
+			end
+			table.sort(rows, function(a, b)
+				return a[1] < b[1]
+			end)
+			for i = 1, #styleL do
+				local r = rows[i]
+				if r then
+					setT(styleL[i], ('%s  <font color="%s">%s</font>  <font color="%s">[%s]</font>'):format(esc(r[1]), hex(X.accent), esc(r[2]), hex(T.sub), esc(r[3])))
+				else
+					setT(styleL[i], (i == 1) and ('<font color="%s">belum ada attacker yang kebaca</font>'):format(hex(T.sub)) or "")
+				end
+			end
+
+			local m2 = {}
+			for name, s in pairs(SK.m2s) do
+				m2[#m2 + 1] = { name, s }
+			end
+			table.sort(m2, function(a, b)
+				return a[1] < b[1]
+			end)
+			for i = 1, #m2L do
+				local r = m2[i]
+				if r then
+					local s = r[2]
+					setT(m2L[i], ('%s  parry <font color="%s">%.0f/%.0f</font>  dodge <font color="%s">%.0f/%.0f</font>'):format(esc(r[1]), hex(T.good), s.pOk, s.pN, hex(X.accent), s.dOk, s.dN))
+				else
+					setT(m2L[i], (i == 1) and ('<font color="%s">belum ada data M2</font>'):format(hex(T.sub)) or "")
+				end
+			end
+
+			local tl = {}
+			local mature, learning = 0, 0
+			for key, e in pairs(SK.tl.keys) do
+				if e.n > 0 then
+					local isM = SK.tlMature(e)
+					if isM then
+						mature += 1
+					else
+						learning += 1
+					end
+					tl[#tl + 1] = { key, e, isM }
+				end
+			end
+			table.sort(tl, function(a, b)
+				return a[2].n > b[2].n
+			end)
+			for i = 1, #teleL do
+				local r = tl[i]
+				if r then
+					local e = r[2]
+					local short = tostring(r[1]):gsub("^E:", "")
+					setT(teleL[i], ('<font color="%s">%s</font> %s n%d %dms±%d'):format(
+						r[3] and hex(T.good) or hex(T.warn), r[3] and "AKTIF" or "belajar", esc(short), math.floor(e.n), ms(e.mean), ms(math.sqrt(e.var))))
+				else
+					setT(teleL[i], (i == 1) and ('<font color="%s">belum ada telegraf baru</font>'):format(hex(T.sub)) or "")
+				end
+			end
+			setT(teleSub, ("%d aktif · %d belajar"):format(mature, learning))
+			setT(teleSum, ("aksi %d · sampel %d · jenis %d · error %d%s"):format(SK.tl.acted, SK.tl.learned, SK.tl.nkeys, SK.tl.errs, SK.tl.off and " · OFF" or ""))
+
+			local dd = SK.dd
+			local info = dd.info or {}
+			local lines = {
+				("mode %s · lapis: ControlModule %s | IsKeyDown %s | MoveDirection %s | remote %s"):format(
+					tostring(CFG.DodgeDirMode), info.cm and "ON" or "-", info.keys and "ON" or "-", info.idx and "ON" or "-", info.fire and "ON" or "-"),
+				("diarahin %d · sesuai %d · beda %d · remote ditulis ulang %d"):format(dd.n, dd.okN, dd.missN, dd.rewrote),
+			}
+			if dd.last then
+				lines[#lines + 1] = ("terakhir: pilih %s (%s) %.1fs lalu · game kirim %s"):format(tostring(dd.last.name), tostring(dd.last.why), now - dd.last.at, tostring(dd.nat or "?"))
+			end
+			setT(dodLbl, table.concat(lines, "\n"))
+		end
+	end
+
+	------------------------------------------------------------------
+	-- Halaman: Log
+	------------------------------------------------------------------
+	function X.pageLog()
+		local P, sf = X.newPage("log")
+		local S = { filter = "all", why = false }
+		local cLive = X.card(sf)
+		local liveL = {}
+		for i = 1, 4 do
+			liveL[i] = text(cLive, "", 11, T.text, FC, { Size = UDim2.new(1, 0, 0, 15), RichText = true, TextTruncate = TR })
+		end
+		local cTop = X.card(sf)
+		local FILTERS = { { "all", "Semua" }, { "parry", "Parry" }, { "block", "Block" }, { "dodge", "Dodge" }, { "hit", "Kena" }, { "other", "Lain" } }
+		local chipsHost = make("Frame", { Size = UDim2.new(1, 0, 0, CTL), BackgroundTransparency = 1 }, cTop)
+		local chips = {}
+		for i, f in ipairs(FILTERS) do
+			local b = make("TextButton", {
+				Position = UDim2.new((i - 1) / #FILTERS, 0, 0, 0), Size = UDim2.new(1 / #FILTERS, -3, 1, 0), Text = f[2], Font = FM, TextSize = 11,
+				TextColor3 = T.sub, BackgroundColor3 = T.cardHi, BorderSizePixel = 0, AutoButtonColor = false,
+			}, chipsHost)
+			corner(b, 7)
+			hook(b.Activated, function()
+				S.filter, S.why = f[1], false
+				X.refreshPage()
+			end)
+			chips[i] = b
+		end
+		local r1 = X.hrow(cTop)
+		local whyBtn = X.btn(r1, "Kenapa kena?", function()
+			S.why = not S.why
+			X.refreshPage()
+		end, { Size = UDim2.new(0.5, -3, 1, 0) })
+		X.btn(r1, "Bersihin log", function()
+			EV.head, EV.count = 0, 0
+			table.clear(whyLog)
+			X.refreshPage()
+		end, { Size = UDim2.new(0.5, -3, 1, 0) })
+		local r2 = X.hrow(cTop)
+		X.btn(r2, "Salin semua (live dump)", function()
+			local okD, txt = pcall(SK.dump)
+			if not okD then
+				UI.toast("Gagal bikin dump: " .. tostring(txt), "bad")
+				return
+			end
+			local _, nl = txt:gsub("\n", "\n")
+			X.copy(txt, ("Disalin · %d baris"):format(nl + 1))
+		end, { Size = UDim2.new(1, 0, 1, 0) })
+
+		local logBox = X.card(sf)
+		local ROWS = 40
+		local logRows = {}
+		for i = 1, ROWS do
+			logRows[i] = text(logBox, "", 11, T.text, FC, { Size = UDim2.new(1, 0, 0, 15), RichText = true, TextTruncate = TR, Visible = false })
+		end
+		local logEmpty = text(logBox, "belum ada event", 11, T.sub, FR, { Size = UDim2.new(1, 0, 0, 18) })
+		local function kindMatch(k)
+			if S.filter == "all" then
+				return true
+			elseif S.filter == "hit" then
+				return k == "hit" or k == "gb"
+			elseif S.filter == "other" then
+				return k == "plan" or k == "skip" or k == "info"
+			end
+			return k == S.filter
+		end
+		P.refresh = function()
+			for i, f in ipairs(FILTERS) do
+				local on = (not S.why) and f[1] == S.filter
+				chips[i].BackgroundColor3 = on and X.accent or T.cardHi
+				chips[i].TextColor3 = on and T.dark or T.sub
+			end
+			whyBtn.BackgroundColor3 = S.why and T.bad or T.cardHi
+			local now = os.clock()
+			local l1, l2, l3, l4, fresh = SK.live(now)
+			setT(liveL[1], esc(l1))
+			setT(liveL[2], esc(l2))
+			setT(liveL[3], esc(l3))
+			setT(liveL[4], esc(l4))
+			liveL[1].TextColor3 = blockHeld and T.good or T.sub
+			liveL[3].TextColor3 = fresh and T.bad or T.sub
+			local n = 0
+			if S.why then
+				for i = #whyLog, 1, -1 do
+					local w = whyLog[i]
+					if n + 3 > ROWS then
+						break
+					end
+					n += 1
+					logRows[n].Text = ('<font color="%s">%4.0fs</font> <font color="%s">%s dari %s · combo %d%s</font>'):format(
+						hex(T.sub), now - w.t, hex(T.bad), w.kind, esc(w.who), w.combo,
+						(w.pa and w.pa < 2.0) and (" · %.1fs abis parry"):format(w.pa)
+							or ((w.bp and w.bp < 2.0) and (" · %.1fs abis ke-parry"):format(w.bp) or ""))
+					logRows[n].Visible = true
+					n += 1
+					logRows[n].Text = ('<font color="%s">   %s · rtt %dms · %dfps · block %s · kunci %.2fs</font>'):format(
+						hex(T.warn), esc(w.why), ms(w.rtt), math.floor(w.fps + 0.5), w.held and "nyala" or "mati", w.locked)
+					logRows[n].Visible = true
+					n += 1
+					logRows[n].Text = ('<font color="%s">   style %s · jarak %s · event %s</font>'):format(
+						hex(T.sub), esc(tostring(w.st or "?")), w.dist and ("%.1f"):format(w.dist) or "?", w.sw and ("%.2fs lalu"):format(w.sw) or "nggak ada")
+					logRows[n].Visible = true
+				end
+			else
+				for age = 0, EV.count - 1 do
+					local e = EV.ring[(EV.head - age - 1) % EV.cap + 1]
+					if e and kindMatch(e.kind) then
+						n += 1
+						if n > ROWS then
+							n = ROWS
+							break
+						end
+						logRows[n].Text = ('<font color="%s">%5.1fs</font> <font color="%s">%s</font>'):format(hex(T.sub), now - e.t, hex(X.kindColor(e.kind)), esc(e.text))
+						logRows[n].Visible = true
+					end
+				end
+			end
+			for i = n + 1, ROWS do
+				logRows[i].Visible = false
+			end
+			logEmpty.Visible = n == 0
+		end
+	end
+
+	------------------------------------------------------------------
+	-- Halaman: Setelan
+	------------------------------------------------------------------
+	function X.pageSet()
+		local P, sf = X.newPage("set")
+		local cTip = X.card(sf, "Cara pakai")
+		text(cTip, "Orb: ketuk = buka panel · geser = pindah · tahan 0.5s = ON/OFF cepat.\nPill di sebelah orb = hitungan live (P parry · B block · D dodge · K kena).\nAngka: geser slider, tekan +/- (tahan = ulang), atau ketuk nilainya buat ngetik.", 11, T.sub, FR, {
+			Size = UDim2.new(1, 0, 0, 0), AutomaticSize = AY, TextWrapped = true, TextYAlignment = Enum.TextYAlignment.Top,
+		})
+
+		local cLook = X.card(sf, "Tampilan")
+		X.num(cLook, "Ukuran UI", "UIScale", { lo = 0.7, hi = 1.4, step = 0.05, unit = "pct", onChange = function()
+			X.layout()
+			task.defer(X.clamp, win)
+		end })
+		do
+			local row = make("Frame", { Size = UDim2.new(1, 0, 0, ROW), BackgroundTransparency = 1 }, cLook)
+			text(row, "Warna aksen", 13, T.text, FM, { Size = UDim2.new(0.4, 0, 1, 0) })
+			local sw = make("Frame", { AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, 0, 0.5, 0), Size = UDim2.fromOffset(#ACCENTS * 32, 28), BackgroundTransparency = 1 }, row)
+			for i, col in ipairs(ACCENTS) do
+				local b = make("TextButton", { Position = UDim2.fromOffset((i - 1) * 32, 0), Size = UDim2.fromOffset(28, 28), Text = "", BackgroundColor3 = col, BorderSizePixel = 0, AutoButtonColor = false }, sw)
+				corner(b, 14)
+				local ring = stroke(b, T.text, 2, 1)
+				addPaint(function()
+					ring.Transparency = (CFG.Accent == i) and 0 or 1
+				end)
+				hook(b.Activated, function()
+					X.setAccent(i)
+				end)
+			end
+		end
+		X.swRow(cLook, "Pill hitungan", "UIHud", "ringkasan live di samping orb")
+		X.swRow(cLook, "Tahan orb = ON/OFF", "UIOrbHold", "tahan 0.5 detik tanpa geser")
+		X.swRow(cLook, "Notifikasi kecil", "Toasts")
+		X.swRow(cLook, "Mode hemat otomatis", "AutoLite", "UI melambat sendiri kalau fps jatuh")
+		X.swRow(cLook, "Pause UI pas tarung", "CombatUIPause", "halaman nggak di-refresh selama ada attacker aktif")
+		X.swRow(cLook, "Orb + pill tetap hidup", "UIFightLite", "pas tarung cuma orb & pill yang diupdate (ringan)")
+
+		local cKeys = X.card(sf, "Tombol (keyboard)")
+		X.keyRow(cKeys, "Toggle parry", "ToggleKey")
+		X.keyRow(cKeys, "Sembunyiin UI", "UIKey")
+
+		local cCfg = X.card(sf, "Konfigurasi")
+		X.swRow(cCfg, "Simpan otomatis", "SaveConfig", "file: " .. CFG.ConfigFile, function(on)
+			if not on then
+				Store.save()
+			end
+		end)
+		local cr = X.hrow(cCfg)
+		X.btn(cr, "Simpan", function()
+			local ok = Store.save()
+			UI.toast(ok and "Config disimpan" or "Executor nggak punya writefile", ok and "ok" or "warn")
+		end, { Size = UDim2.new(1 / 3, -4, 1, 0) })
+		X.btn(cr, "Muat", function()
+			local ok = Store.load()
+			X.layout()
+			X.applyAccent()
+			UI.toast(ok and "Config dimuat" or "Belum ada config", ok and "ok" or "warn")
+		end, { Size = UDim2.new(1 / 3, -4, 1, 0) })
+		X.btn(cr, "Bawaan", function()
+			Store.reset()
+			X.layout()
+			X.applyAccent()
+			UI.toast("Dikembalikan ke bawaan", "ok")
+		end, { Size = UDim2.new(1 / 3, -4, 1, 0) })
+		X.btn(cCfg, "Salin config (JSON)", function()
+			local data = {}
+			for _, k in ipairs(SAVE_KEYS) do
+				local v = CFG[k]
+				if typeof(v) == "EnumItem" then
+					data[k] = v.Name
+				elseif k == "PingOverride" then
+					data[k] = v or 0
+				elseif v ~= nil then
+					data[k] = v
+				end
+			end
+			local okJ, raw = pcall(HttpService.JSONEncode, HttpService, data)
+			if okJ then
+				X.copy(raw, "Config disalin")
+			else
+				UI.toast("Gagal encode config", "bad")
+			end
+		end)
+		local pasteBox = make("TextBox", {
+			Size = UDim2.new(1, 0, 0, CTL + 4), PlaceholderText = "tempel JSON config di sini…", Text = "", ClearTextOnFocus = false, Font = FC, TextSize = 11,
+			TextColor3 = T.text, PlaceholderColor3 = T.sub, BackgroundColor3 = T.cardHi, BorderSizePixel = 0, TextXAlignment = AL, ClipsDescendants = true,
+		}, cCfg)
+		corner(pasteBox, 8)
+		pad(pasteBox, 10, 0, 10, 0)
+		X.btn(cCfg, "Terapkan config tempelan", function()
+			local raw = pasteBox.Text
+			if raw == "" then
+				UI.toast("Kotaknya kosong", "warn")
+				return
+			end
+			local okD, data = pcall(HttpService.JSONDecode, HttpService, raw)
+			if not (okD and type(data) == "table") then
+				UI.toast("JSON nggak valid", "bad")
+				return
+			end
+			if type(writefile) ~= "function" then
+				UI.toast("Executor nggak punya writefile", "warn")
+				return
+			end
+			-- dilewatkan ke Store.load (validasi tipe + batas nilai) lewat file config
+			local okW = pcall(writefile, CFG.ConfigFile, raw)
+			if okW and Store.load() then
+				pasteBox.Text = ""
+				Store.save()
+				X.layout()
+				X.applyAccent()
+				UI.toast("Config diterapkan", "ok")
+			else
+				UI.toast("Gagal nerapin config", "bad")
+			end
+		end)
+
+		local cDbg = X.card(sf, "Debug")
+		X.swRow(cDbg, "Catat event (tab Log)", "LogEvents")
+		X.swRow(cDbg, "Debug print", "Debug", "bisa bikin lag, nyalain pas perlu")
+		X.swRow(cDbg, "Trace keputusan", "Trace", "print tiap swing + alasannya")
+		X.swRow(cDbg, "Catat 'kenapa kena'", "WhyHit")
+
+		local cDanger = X.card(sf, "Bahaya")
+		local armed = false
+		local unloadBtn
+		unloadBtn = X.btn(cDanger, "Matikan & copot script", function()
+			if not armed then
+				armed = true
+				unloadBtn.Text = "Yakin? tap sekali lagi"
+				unloadBtn.BackgroundColor3 = T.bad
+				task.delay(2.5, function()
+					armed = false
+					if unloadBtn.Parent then
+						unloadBtn.Text = "Matikan & copot script"
+						unloadBtn.BackgroundColor3 = T.cardHi
+					end
+				end)
+				return
+			end
+			local api = genv.__NyxAutoParry
+			if api and api.Stop then
+				api.Stop()
+			end
+		end)
+		P.refresh = function()
+			paintAll()
+		end
+	end
+
+	------------------------------------------------------------------
+	-- Halaman: Lanjut (cari & ubah semua opsi CFG)
+	------------------------------------------------------------------
+	X.HIDE = { UITab = true, MigratedTo = true, PingOverride = true, Accent = true }
+	X.OPTS = {
+		DodgeDirMode = { "Smart", "Input", "Away", "Game" }, DodgeFrame = { "Camera", "Character" },
+		LateModeM1 = { "skip", "block" }, LateModeM2 = { "skip", "block" }, DodgeDirection = { "Back", "Forward", "Left", "Right" },
+	}
+	X.DESC = {
+		TargetAgeM1 = "umur block saat M1 mendarat (detik)", TargetAgeM2 = "umur block saat M2 mendarat (detik)",
+		HoldAfterHit = "dasar tahan block abis hit", LateTolerance = "paket telat segini masih dikirim",
+		DedupeWindow = "dua hit sedekat ini = satu block", ConflictWindow = "hit lebih dekat dari ini nggak bisa diparry dua-duanya",
+		RangeMargin = "margin hitbox depan (stud)", WidthMargin = "margin hitbox samping (stud)", ConeSlack = "lebar tambahan per stud ke depan",
+		BackMargin = "toleransi di belakang attacker", AttackerLag = "kira-kira server nge-rewind posisi lu segini",
+		PingMargin = "stud tambahan per detik RTT", CloseAlways = "attacker sedeket ini selalu dianggap ancaman",
+		M2CloseAlways = "sama, khusus telegraf M2 yang madep lu", ChainHold = "lama block ditahan nyambung", MaxHold = "batas tahan block nyambung",
+		MaxHoldActive = "batas tahan kalau ada attacker aktif", ResultPad = "hold minimal sampai event hasil hit nyampe",
+		DodgeAgeFrac = "hit mendarat di sekian persen iframe", DodgeMinConf = "peluang minimum biar dodge dipilih duluan",
+		DodgeSwitchGap = "selisih peluang dodge vs parry buat pindah", DodgeTravel = "perkiraan jarak dash (cek tembok)",
+		DodgeSafeDrop = "tanah di ujung dash harus ada dalam segini (anti jurang)", DodgeInputWeight = "kekuatan arah gerak lu vs arah terbaik",
+		DodgeSpoofHold = "detik input arah aktif abis TryDodge", DodgeLateBias = "geser target iframe ke belakang sebanding noise",
+		TuneStep = "langkah belajar timing", TuneMax = "batas geser timing hasil belajar", StunSlackStart = "fraksi rtt pengaman pas unlock stun",
+		ReparryPad = "pengaman jendela re-parry", PostParryTail = "tahan block segini abis perkiraan hit lanjutan",
+		HitGuardHold = "lama block ditahan abis guard", HitGuardRange = "attacker harus sedeket ini buat guard",
+		TeleMinN = "sampel minimal sebelum telegraf dipercaya", TeleMaxStd = "simpangan maksimal telegraf", TeleMinRatio = "rasio minimal event -> hit",
+		TeleActRange = "jarak maks telegraf diproses", TeleMinLead = "lead minimal telegraf yang berguna",
+		LiteFps = "fps di bawah ini = UI mode hemat", LearnSaveEvery = "jeda minimal simpan hasil belajar",
+		UIHud = "pill hitungan di samping orb", UIOrbHold = "tahan orb = ON/OFF", UIFightLite = "orb & pill tetap update pas tarung",
+		UIScale = "skala jendela UI", ButtonSize = "diameter orb (butuh rebuild: toggle UI)",
+	}
+	function X.autoUnit(v)
+		if v == math.floor(v) then
+			return "int"
+		end
+		return math.abs(v) < 0.01 and "n4" or "n3"
+	end
+	function X.autoStep(v)
+		if v == math.floor(v) and math.abs(v) >= 2 then
+			return 1
+		end
+		local a = math.abs(v)
+		if a >= 1 then
+			return 0.1
+		elseif a >= 0.1 then
+			return 0.01
+		elseif a >= 0.02 then
+			return 0.005
+		end
+		return 0.001
+	end
+	function X.valStr(v)
+		if typeof(v) == "EnumItem" then
+			return v.Name
+		end
+		return tostring(v)
+	end
+
+	function X.advItem(parent, k)
+		local def = Store.defaults[k]
+		local t = typeof(def)
+		local item = make("Frame", { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = AY, BackgroundColor3 = T.card, BorderSizePixel = 0 }, parent)
+		corner(item, 10)
+		stroke(item, T.line, 1, 0.65)
+		pad(item, 12, 8, 12, 6)
+		list(item, 2)
+		local hint = X.DESC[k]
+		if t == "boolean" then
+			X.swRow(item, k, k, hint)
+		elseif t == "number" then
+			X.num(item, k, k, { unit = "auto", step = X.autoStep(def), hint = hint })
+		elseif t == "EnumItem" then
+			X.keyRow(item, k, k)
+		elseif t == "string" then
+			if X.OPTS[k] then
+				X.seg(item, k, X.OPTS[k], { key = k, hint = hint })
+			else
+				X.strRow(item, k, k, hint)
+			end
+		end
+		local ft = make("Frame", { Size = UDim2.new(1, 0, 0, 22), BackgroundTransparency = 1 }, item)
+		text(ft, "bawaan: " .. X.valStr(def), 10, T.sub, FR, { Size = UDim2.new(1, -70, 1, 0), TextTruncate = TR })
+		local rb = make("TextButton", {
+			AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, 0, 0.5, 0), Size = UDim2.fromOffset(62, 20), Text = "reset", Font = FM, TextSize = 10,
+			TextColor3 = T.text, BackgroundColor3 = T.cardHi, BorderSizePixel = 0, AutoButtonColor = false,
+		}, ft)
+		corner(rb, 6)
+		hook(rb.Activated, function()
+			CFG[k] = def
+			Store.touch()
+			paintAll()
+			X.afterToggle()
+		end)
+		addPaint(function()
+			rb.Visible = CFG[k] ~= def
+		end)
+	end
+
+	function X.pageAdv()
+		local P, sf = X.newPage("adv")
+		local st = { q = "", mode = "Semua", cap = 30, tok = 0 }
+		local top = X.card(sf, "Semua opsi", nil)
+		local box = make("TextBox", {
+			Size = UDim2.new(1, 0, 0, CTL + 4), PlaceholderText = "cari opsi: dodge, hold, range…", Text = "", ClearTextOnFocus = false, Font = FR, TextSize = 13,
+			TextColor3 = T.text, PlaceholderColor3 = T.sub, BackgroundColor3 = T.cardHi, BorderSizePixel = 0, TextXAlignment = AL, ClipsDescendants = true,
+		}, top)
+		corner(box, 8)
+		pad(box, 10, 0, 10, 0)
+		local lst = make("Frame", { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = AY, BackgroundTransparency = 1 }, nil)
+		local info = text(top, "", 10, T.sub, FR, { Size = UDim2.new(1, 0, 0, 14), TextTruncate = TR })
+		local binC, binP, binB = {}, {}, {}
+		X.advP, X.advB = binP, binB
+		local function clearBin()
+			for _, c in ipairs(binC) do
+				pcall(function()
+					c:Disconnect()
+				end)
+			end
+			table.clear(binC)
+			table.clear(binP)
+			table.clear(binB)
+			for _, ch in ipairs(lst:GetChildren()) do
+				if not ch:IsA("UIListLayout") then
+					ch:Destroy()
+				end
+			end
+			orderN[lst] = 0
+		end
+		local more
+		local function rebuild()
+			clearBin()
+			local pC, pP, pB = X.cc, X.cp, X.bt
+			X.cc, X.cp, X.bt = binC, binP, binB
+			local q = st.q:lower()
+			local shown, total = 0, 0
+			local okB, errB = pcall(function()
+				for _, k in ipairs(SAVE_KEYS) do
+					if not X.HIDE[k] and Store.defaults[k] ~= nil then
+						local cur, def, hint = CFG[k], Store.defaults[k], X.DESC[k]
+						local ok = true
+						if q ~= "" then
+							ok = (k:lower():find(q, 1, true) ~= nil) or (hint ~= nil and hint:lower():find(q, 1, true) ~= nil)
+						end
+						if ok and st.mode == "Diubah" then
+							ok = cur ~= def
+						end
+						if ok and st.mode == "Aktif" then
+							ok = cur == true
+						end
+						if ok then
+							total += 1
+							if shown < st.cap then
+								shown += 1
+								X.advItem(lst, k)
+							end
+						end
+					end
+				end
+			end)
+			X.cc, X.cp, X.bt = pC, pP, pB
+			if not okB then
+				print("[AutoParry] UI Lanjut error:", errB)
+			end
+			setT(info, ("%d opsi cocok · tampil %d"):format(total, shown))
+			more.Visible = total > shown
+			more.Text = ("Tampilkan lebih banyak (+30) · sisa %d"):format(total - shown)
+			paintAll()
+		end
+		X.seg(top, nil, { "Semua", "Diubah", "Aktif" }, {
+			get = function()
+				return st.mode
+			end,
+			set = function(v)
+				st.mode = v
+			end,
+			onChange = function()
+				st.cap = 30
+				rebuild()
+			end,
+		})
+		lst.Parent = sf
+		list(lst, 8)
+		more = X.btn(sf, "", function()
+			st.cap += 30
+			rebuild()
+		end)
+		more.Visible = false
+		hook(box:GetPropertyChangedSignal("Text"), function()
+			st.tok += 1
+			local my = st.tok
+			task.delay(0.3, function()
+				if alive and st.tok == my then
+					st.q = box.Text
+					st.cap = 30
+					rebuild()
+				end
+			end)
+		end)
+		local built = false
+		P.refresh = function()
+			if not built then
+				built = true
+				rebuild()
+			end
+		end
+	end
+
+	------------------------------------------------------------------
+	-- layout adaptif (HP landscape / portrait / PC)
+	------------------------------------------------------------------
+	function X.layout()
+		local V = X.vp()
+		local s = math.clamp(CFG.UIScale or 1, 0.6, 1.6)
+		X.scale = s
+		local land = V.X > V.Y * 1.1
+		local aw, ah = math.floor((V.X - 16) / s), math.floor((V.Y - 16) / s)
+		local W, H = 400, 300
+		if land then
+			W = math.clamp(math.floor(V.X * 0.62 / s), 400, 600)
+			H = math.clamp(ah, 230, 480)
+		else
+			W = math.clamp(aw, 270, 440)
+			H = math.clamp(math.floor(V.Y * 0.7 / s), 330, 620)
+		end
+		W, H = math.min(W, aw), math.min(H, ah)
+		W, H = math.max(W, 240), math.max(H, 200)
+		X.W, X.H = W, H
+		X.rail = land or W >= 460
+		if not X.popping then
+			winScale.Scale = s
+		end
+		win.Size = UDim2.fromOffset(W, X.collapsed and TITLE_H or H)
+		local n = #X.TABS
+		if X.rail then
+			local RW = 66
+			local bh = math.clamp(math.floor((H - TITLE_H - FOOT_H - 8) / n) - 2, 30, 44)
+			nav.Position, nav.Size = UDim2.fromOffset(0, 0), UDim2.new(0, RW, 1, -FOOT_H)
+			navList.FillDirection = Enum.FillDirection.Vertical
+			nav.ScrollingDirection = Enum.ScrollingDirection.Y
+			nav.AutomaticCanvasSize = AY
+			for _, tb in pairs(X.tabs) do
+				tb.btn.Size = UDim2.new(1, 0, 0, bh)
+				tb.ind.Size = UDim2.new(0, 3, 0.6, 0)
+				tb.ind.Position = UDim2.new(0, 0, 0.2, 0)
+			end
+			X.pagesHost.Position = UDim2.fromOffset(RW, 0)
+			X.pagesHost.Size = UDim2.new(1, -RW, 1, -FOOT_H)
+		else
+			local BH = TOUCH and 48 or 42
+			local bw = math.max(50, math.floor((W - 8) / n))
+			nav.Position, nav.Size = UDim2.new(0, 0, 1, -(FOOT_H + BH)), UDim2.new(1, 0, 0, BH)
+			navList.FillDirection = Enum.FillDirection.Horizontal
+			nav.ScrollingDirection = Enum.ScrollingDirection.X
+			nav.AutomaticCanvasSize = Enum.AutomaticSize.X
+			for _, tb in pairs(X.tabs) do
+				tb.btn.Size = UDim2.new(0, bw, 1, 0)
+				tb.ind.Size = UDim2.new(0.5, 0, 0, 3)
+				tb.ind.Position = UDim2.new(0.25, 0, 1, -3)
+			end
+			X.pagesHost.Position = UDim2.fromOffset(0, 0)
+			X.pagesHost.Size = UDim2.new(1, 0, 1, -(FOOT_H + BH))
+		end
+	end
+
+	function X.setCollapsed(v)
+		X.collapsed = v
+		body.Visible = not v
+		tween(win, 0.15, { Size = UDim2.fromOffset(X.W, v and TITLE_H or X.H) })
+		X.minBtn.Text = v and "+" or "-"
+	end
+
+	function X.popIn()
+		X.popping = true
+		winScale.Scale = X.scale * 0.94
+		tween(winScale, 0.14, { Scale = X.scale })
+		task.delay(0.18, function()
+			X.popping = false
+		end)
+	end
+
+	function X.select(id)
+		if not X.pages[id] then
+			id = "home"
+		end
+		UI.tab = id
+		CFG.UITab = id
+		for tid, tb in pairs(X.tabs) do
+			local on = tid == id
+			X.pages[tid].frame.Visible = on
+			tb.btn.TextColor3 = on and T.text or T.sub
+			tb.btn.BackgroundTransparency = on and 0.86 or 1
+			tb.ind.Visible = on
+		end
+		if id == "log" then
+			X.hitSeen = counters.hit
+			X.tabs.log.badge.Visible = false
+		end
+		X.refreshPage()
+	end
+
+	function X.refreshPage()
+		local p = X.pages[UI.tab]
+		if p and p.refresh and win.Visible and not X.collapsed then
+			local ok, err = pcall(p.refresh)
+			if not ok and not UI.errShown then
+				UI.errShown = true
+				print("[AutoParry] UI refresh error:", err)
+			end
+		end
+	end
+
+	function X.footer()
+		local c = counters
+		local landed = c.parried + c.blocked + c.guardbroken + c.hit
+		local all = landed + c.dodged
+		local rate = all > 0 and (c.parried + c.blocked + c.dodged) / all or 1
+		setT(footL, ("%dms ±%d · %dfps · cpu %.2fms%s"):format(ms(net.rtt), ms(net.var), math.floor(frame.fps + 0.5), frame.cpu * 1000, X.lite and " · hemat" or ""))
+		setT(footR, ("%s · aman %d%%"):format(CFG.Enabled and "ON" or "OFF", math.floor(rate * 100 + 0.5)))
+	end
+
+	function X.hudText()
+		local c = counters
+		return ('<font color="%s">P</font> %d  <font color="%s">B</font> %d  <font color="%s">D</font> %d  <font color="%s">K</font> %d'):format(
+			hex(T.good), c.parried, hex(T.info), c.blocked, hex(X.accent), c.dodged, hex(T.bad), c.hit + c.guardbroken)
+	end
+
+	-- ringan: orb + pill + badge tab. Aman dipanggil pas tarung.
+	function X.cheap()
+		local on = CFG.Enabled and true or false
+		local col = (not on) and T.bad or (X.lite and T.warn or T.good)
+		if orb.BackgroundColor3 ~= col then
+			orb.BackgroundColor3 = col
+		end
+		if dot.BackgroundColor3 ~= col then
+			dot.BackgroundColor3 = col
+		end
+		setT(orb, (X.lite and on) and "AP·" or "AP")
+		local showHud = CFG.UIHud and true or false
+		if hud.Visible ~= showHud then
+			hud.Visible = showHud
+		end
+		if showHud then
+			setT(hud, X.hudText())
+		end
+		if counters.hit ~= X.hitSeen and UI.tab ~= "log" then
+			X.tabs.log.badge.Visible = true
+		end
+		if EV.seq ~= X.lastSeq then
+			local e = EV.ring[(EV.head - 1) % EV.cap + 1]
+			X.lastSeq = EV.seq
+			if e and (e.kind == "parry" or e.kind == "block" or e.kind == "dodge" or e.kind == "hit" or e.kind == "gb") then
+				orbRing.Color = X.kindColor(e.kind)
+				orbRing.Transparency = 0.05
+				orbRing.Thickness = 3.5
+				tween(orbRing, 0.5, { Transparency = 0.55, Thickness = 1.5 })
+			end
+		end
+	end
+
+	UI.refresh = function()
+		paintAll()
+		X.afterToggle()
+		X.cheap()
+		if win.Visible then
+			X.footer()
+			X.refreshPage()
+		end
+	end
+	UI.toggleWindow = function()
+		if win.Visible then
+			win.Visible = false
+			return
+		end
+		if not X.placed then
+			X.placed = true
+			X.layout()
+			local V = X.vp()
+			win.Position = UDim2.fromOffset(math.floor((V.X - X.W * X.scale) / 2), math.floor((V.Y - X.H * X.scale) / 2))
+		end
+		win.Visible = true
+		X.popIn()
+		task.defer(X.clamp, win)
+		UI.refresh()
+	end
+	UI.setVisible = function()
+		gui.Enabled = not gui.Enabled
+	end
+
+	------------------------------------------------------------------
+	-- rakit
+	------------------------------------------------------------------
+	X.pageHome()
+	X.pageDef()
+	X.pageTun()
+	X.pageIntel()
+	X.pageLog()
+	X.pageSet()
+	X.pageAdv()
+	X.layout()
+	X.afterToggle()
+
+	X.dragify(orb, dock, UI.toggleWindow, function()
+		if CFG.UIOrbHold then
+			CFG.Enabled = not CFG.Enabled
+			Store.touch()
+			UI.toast(CFG.Enabled and "AutoParry ON" or "AutoParry OFF", CFG.Enabled and "ok" or "bad")
+			UI.refresh()
+		end
+	end)
+	X.dragify(hud, dock, UI.toggleWindow, nil)
+	X.dragify(titleBar, win, nil, nil)
+	hook(gui:GetPropertyChangedSignal("AbsoluteSize"), function()
+		X.layout()
+		task.defer(X.clamp, win)
+		task.defer(X.clamp, dock)
+	end)
+	pcall(function()
+		local cam = workspace.CurrentCamera
+		if cam then
+			hook(cam:GetPropertyChangedSignal("ViewportSize"), function()
+				X.layout()
+			end)
+		end
+	end)
+
+	X.select(CFG.UITab or "home")
+	X.cheap()
+
+	task.spawn(function()
+		local lastLite = -math.huge
+		while alive and gui.Parent do
+			local visible = win.Visible and not X.collapsed
+			local wantLite = CFG.AutoLite and (frame.fps < CFG.LiteFps or frame.cpu > 0.0015)
+			if wantLite then
+				lastLite = os.clock()
+			end
+			X.lite = wantLite or (os.clock() - lastLite < 4)
+			task.wait(visible and (X.lite and 0.6 or 0.25) or (X.lite and 1.5 or 0.6))
+			if not (alive and gui.Parent) then
+				break
+			end
+			-- pas tarung: halaman nggak disentuh (anti hitch). Orb + pill cukup ringan buat tetap hidup.
+			local fighting = CFG.CombatUIPause and SK.hot(os.clock())
+			if not fighting or CFG.UIFightLite then
+				pcall(X.cheap)
+			end
+			if not fighting then
+				if visible then
+					pcall(X.footer)
+					X.refreshPage()
+				end
+				if Store.dirtyAt and os.clock() - Store.dirtyAt > 1.2 then
+					Store.save()
+				end
+			end
+		end
+	end)
+
+	task.delay(1, function()
+		UI.toast("Ketuk orb AP buat buka · tahan = ON/OFF", "info")
+	end)
 end
 
 ----------------------------------------------------------------------
 -- API + START
 ----------------------------------------------------------------------
 genv.__NyxAutoParry = {
-    Version = "13.1",
+    Version = "13.2",
     CFG = CFG,
     Counters = counters,
     Skips = skips,
@@ -6497,5 +7545,5 @@ if CFG.UI then
     end)
 end
 
-notify("v13.1 loaded - tekan " .. CFG.ToggleKey.Name .. " buat toggle")
-log("loaded v13.1. toggle:", CFG.ToggleKey.Name, "| UI:", CFG.UIKey.Name, "| getgenv().__NyxAutoParry.Summary() buat ringkasan")
+notify("v13.2 loaded - tekan " .. CFG.ToggleKey.Name .. " buat toggle")
+log("loaded v13.2. toggle:", CFG.ToggleKey.Name, "| UI:", CFG.UIKey.Name, "| getgenv().__NyxAutoParry.Summary() buat ringkasan")
