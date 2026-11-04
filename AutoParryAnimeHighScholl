@@ -1,6 +1,6 @@
 --!nonstrict
 --[[
-  AUTO PARRY v13.3  |  UI: Skill issue final boss (By Duke)
+  AUTO PARRY v13.5  |  UI: Skill issue final boss (By Duke)
 
   Isi file ini:
     1. Auto parry v13.2 UTUH (logika parry / dodge / learning tidak diubah).
@@ -18,12 +18,32 @@
   Tombol bulat: ketuk = buka/tutup | tahan = mode ringkas | tarik = pindah
   Hotkey default: RightAlt hub | F4 anti-lag | P toggle parry (bisa diubah di Setelan)
   Konfigurasi hub: AP13_hub.json | konfigurasi parry: tetap NyxAutoParry_v9.json
+
+  v13.5 (perbaikan sisi hub / anti-lag, logika parry inti tidak diubah):
+    - FIX autosave: perubahan opsi parry (slider / toggle / preset / reset) sekarang beneran tersimpan
+      (K.ptouch -> K.saveSoon + hub memantau Store.dirtyAt)
+    - FIX Hide Leaves: cocokkan kata utuh (Street / Implant tidak ikut), CanCollide nggak disentuh,
+      part besar (lantai) dilewati -> nggak ada lagi tembus lantai
+    - FIX Nuke Texture: avatar / NPC dilindungi SEBELUM tekstur dihapus (nggak blank sesaat)
+    - FIX Post FX baru (Lighting.ChildAdded) ikut dimatikan setelah Apply
+    - Nono ngekspor API (env.NonoAPI): hub nggak perlu scrape teks GUI / getconnections lagi
+      (slider, toggle, preset, apply / restore jalan walau executor tanpa getconnections)
+    - FPS cap: satu pemilik (hub) kalau "Buka batas FPS" nyala, nggak ada lagi rebutan Nono vs hub
+    - Efek visual hub otomatis hemat pas tarung / fps rendah (Setelan > Hemat efek saat tarung)
+    - Analisis hasil: __NyxAutoParry.Analyze() + tombol "Analisis hasil" di tab Combat
+    - Hook FireServer cuma memproses remote Combat (lebih ringan)
+    - Versi di Summary / dump / notifikasi disamain
+
+  v13.4 (tambahan di sisi parry, logika lama tidak dihapus):
+    - tuneBy pakai hysteresis: 1 hasil berlawanan setelah streak >= 3 dianggap noise (CFG.TuneHysteresis)
+    - hasil belajar tune/stunSlack disimpan PER bucket ping (40ms), dimuat dari bucket terdekat
+    - ring buffer 200 hasil terakhir: __NyxAutoParry.Outcomes() / ExportOutcomes() (bahan replay offline)
 ]]
 
 local function __startParry()
 --!nonstrict
 --[[
-    AutoParry v13.2
+    AutoParry v13.5
     Game    : Roblox fighting game (ReplicatedStorage.Remotes.Combat, M1/M2/Block/Parry/Dodge)
     Runtime : Luau, client-side (jalanin lewat executor lu)
     Toggle  : P (CFG.ToggleKey)  |  UI: CFG.UIKey (orb geser = pindah, tap = buka/tutup, tahan = ON/OFF)
@@ -128,6 +148,9 @@ local CFG = {
 	Adaptive = true,
 	TuneStep = 0.012,
 	TuneMax = 0.09,
+	TuneHysteresis = true, -- v13.4: 1 hasil berlawanan setelah streak >= 3 = noise (langkah dikecilin, streak diturunin), bukan langsung balik arah
+	OutcomeLog = true, -- v13.4: ring buffer 200 hasil terakhir (Outcomes() / ExportOutcomes() = bahan replay offline)
+	OutcomeFile = "NyxAutoParry_outcomes_v13.json",
 	PingOverride = nil, -- RTT dalam detik, mis. 0.12. nil = baca otomatis
 	Debug = false, -- v5: print massal bikin lag. Nyalain cuma pas lagi debug
 	Trace = false, -- print tiap event swing + keputusannya (kenapa block dikirim / kenapa nggak). Nyalain cuma pas debug
@@ -2185,7 +2208,8 @@ function SK.ddInstall()
 				local oldFS
 				oldFS = hookfunction(Combat.FireServer, newcclosure(function(self, ...)
 					local s = H.fsSlot
-					if s then
+					-- v13.5: cuma remote Combat yang diproses (hook ini kena SEMUA RemoteEvent:FireServer di game)
+					if s and typeof(self) == "Instance" and self.Name == "Combat" then
 						pcall(s, self, (...))
 					end
 					return oldFS(self, ...)
@@ -3488,18 +3512,167 @@ local function resyncCombo(attacker, obs)
 	end
 end
 
+-- v13.4: ring buffer hasil (kind / result / kondisi jaringan / tune). Bahan replay offline. Pakai SK biar nggak nambah local (jatah Luau).
+SK.ol = { buf = {}, n = 0, max = 200 }
+
+function SK.logOutcome(kind, res, sent, inParryCd, isSK)
+	if not CFG.OutcomeLog then
+		return
+	end
+	local o = SK.ol
+	o.n += 1
+	o.buf[(o.n - 1) % o.max + 1] = {
+		t = os.clock(), kind = kind, res = res, sent = sent and true or false, pcd = inParryCd and true or false, sk = isSK and true or false,
+		rtt = net.rtt, var = net.var, fps = frame.fps, tM1 = tune.M1, tM2 = tune.M2,
+	}
+end
+
+function SK.outcomes()
+	local o, out = SK.ol, {}
+	for i = math.max(o.n - o.max, 0) + 1, o.n do
+		out[#out + 1] = o.buf[(i - 1) % o.max + 1]
+	end
+	return out
+end
+
+function SK.outcomesExport()
+	if type(writefile) ~= "function" then
+		return false
+	end
+	local okJ, raw = pcall(HttpService.JSONEncode, HttpService, { v = 1, count = SK.ol.n, rows = SK.outcomes() })
+	if not okJ then
+		return false
+	end
+	return (pcall(writefile, CFG.OutcomeFile, raw))
+end
+
+-- v13.5: baca ring buffer hasil (200 terakhir) -> ringkasan per jenis serangan, per ping, plus saran tuning.
+-- Dulu OutcomeLog nyatet tapi nggak ada yang baca. Return teks (juga di-print) biar bisa disalin dari hub.
+function SK.analyze()
+	local rows = SK.outcomes()
+	local out = {}
+	local function say(s)
+		out[#out + 1] = s
+	end
+	if #rows < 8 then
+		say(("[analisis] data belum cukup (%d hasil, minimal 8). Tarung dulu sebentar, lalu panggil lagi."):format(#rows))
+		print(out[1])
+		return table.concat(out, "\n")
+	end
+	local function blank()
+		return { n = 0, Parried = 0, Blocked = 0, Dodged = 0, Hit = 0, GuardBroken = 0, sent = 0, ok = 0, early = 0, late = 0, pcd = 0, noPlan = 0 }
+	end
+	local agg = { M1 = blank(), M2 = blank() }
+	local buckets = {
+		{ lim = 0.06, n = 0, bad = 0, name = "<60ms" },
+		{ lim = 0.12, n = 0, bad = 0, name = "60-120ms" },
+		{ lim = 0.20, n = 0, bad = 0, name = "120-200ms" },
+		{ lim = math.huge, n = 0, bad = 0, name = ">200ms" },
+	}
+	local skN, skBad = 0, 0
+	for _, r in ipairs(rows) do
+		local bad = (r.res == "Hit" or r.res == "GuardBroken")
+		if r.sk then
+			skN += 1
+			if bad then
+				skBad += 1
+			end
+		else
+			local a = agg[r.kind]
+			if a then
+				a.n += 1
+				a[r.res] = (a[r.res] or 0) + 1
+				if r.pcd then
+					a.pcd += 1
+				end
+				if bad and not r.sent then
+					a.noPlan += 1 -- kena padahal nggak ada block parry yang dikirim buat hit ini
+				end
+				if r.sent then
+					a.sent += 1
+					if r.res == "Parried" then
+						a.ok += 1
+					elseif r.res == "Blocked" then
+						a.early += 1 -- block nyala kegedean (umur > window) = cuma ke-Block
+					elseif bad then
+						a.late += 1 -- block kekecilan / telat = kena
+					end
+				end
+			end
+			for _, b in ipairs(buckets) do
+				if (r.rtt or 0) < b.lim then
+					b.n += 1
+					if bad then
+						b.bad += 1
+					end
+					break
+				end
+			end
+		end
+	end
+	say(("[analisis] %d hasil terakhir (tune sekarang M1 %+.3f | M2 %+.3f)"):format(#rows, tune.M1, tune.M2))
+	for _, kind in ipairs({ "M1", "M2" }) do
+		local a = agg[kind]
+		if a.n > 0 then
+			say(
+				("%s: %d hit | parry %.0f%% block %.0f%% dodge %.0f%% KENA %.0f%% | di parry-cd %d"):format(
+					kind, a.n, a.Parried / a.n * 100, a.Blocked / a.n * 100, a.Dodged / a.n * 100,
+					(a.Hit + a.GuardBroken) / a.n * 100, a.pcd
+				)
+			)
+			if a.sent > 0 then
+				say(
+					("   block parry dikirim %d kali: parry %.0f%% | kecepetan %.0f%% | telat %.0f%%"):format(
+						a.sent, a.ok / a.sent * 100, a.early / a.sent * 100, a.late / a.sent * 100
+					)
+				)
+			end
+			local key = "TargetAge" .. kind
+			if a.sent >= 6 then
+				if a.early / a.sent > 0.35 and a.late / a.sent < 0.15 then
+					say(("   saran: block sering kecepetan -> turunin %s ~0.01 (kirim lebih lambat)"):format(key))
+				elseif a.late / a.sent > 0.25 and a.early / a.sent < 0.15 then
+					say(("   saran: block sering telat -> naikin %s ~0.01 (kirim lebih cepat)"):format(key))
+				else
+					say("   timing block parry kelihatan seimbang")
+				end
+			end
+			if a.noPlan > 0 then
+				say(("   %d kena tanpa block parry yang dikirim -> lihat alasan skip lewat Doctor() / Why()"):format(a.noPlan))
+			end
+		end
+	end
+	if skN > 0 then
+		say(("skill lain: %d hit, %d kena (nggak ikut tune)"):format(skN, skBad))
+	end
+	for _, b in ipairs(buckets) do
+		if b.n >= 4 then
+			say(("ping %s: %d hit, %.0f%% kena"):format(b.name, b.n, b.bad / b.n * 100))
+		end
+	end
+	for _, s in ipairs(out) do
+		print("[AutoParry:analyze] " .. s)
+	end
+	return table.concat(out, "\n")
+end
+
 local function tuneBy(kind, dir)
 	if not CFG.Adaptive then
 		return
 	end
 	local s = streak[kind]
+	local scale = 1
 	if s.dir == dir then
 		s.n += 1
+	elseif CFG.TuneHysteresis and s.n >= 3 then
+		-- v13.4: streak panjang lalu 1 hasil berlawanan = kemungkinan noise (spike ping / lag sesaat). Geser kecil aja, jangan balik arah
+		s.n -= 2
+		scale = 0.35
 	else
 		s.dir = dir
 		s.n = 1
 	end
-	local step = CFG.TuneStep * math.min(1 + (s.n - 1) * 0.5, 3)
+	local step = CFG.TuneStep * math.min(1 + (s.n - 1) * 0.5, 3) * scale
 	tune[kind] = math.clamp(tune[kind] + dir * step, -CFG.TuneMax, CFG.TuneMax)
 end
 
@@ -3638,6 +3811,9 @@ local function onHit(data)
 		and (not CFG.TuneByAttacker or blockFor == attacker) and not isSK
 	local res = data.Result
 	local inParryCd = (now - parriedAt) < SR.ParryCooldown
+	if CFG.OutcomeLog then
+		SK.logOutcome(kind, res, sent, inParryCd, isSK)
+	end
 
 	-- v8: lacak combo: attacker yang barusan kena/ke-block M1 ke lu lagi nge-combo, parry/dodge = combo putus
 	if kind == "M1" and not isSK and typeof(attacker) == "Instance" then
@@ -4218,6 +4394,22 @@ function SK.lsSave()
 			d.tele[key] = { n = e.n, mean = e.mean, var = e.var, occ = e.occ, hits = e.hits, dmax = e.dmax, nB = e.nB, nG = e.nG, nP = e.nP, nH = e.nH, nD = e.nD, k2 = e.k2 }
 		end
 	end
+	-- v13.4: simpan tune/stunSlack per bucket ping (40ms) biar ganti jaringan nggak buang hasil belajar
+	local buckets = {}
+	if type(isfile) == "function" and type(readfile) == "function" then
+		local okE, ex = pcall(isfile, CFG.LearnFile)
+		if okE and ex then
+			local okR, rawOld = pcall(readfile, CFG.LearnFile)
+			if okR and type(rawOld) == "string" then
+				local okD, old = pcall(HttpService.JSONDecode, HttpService, rawOld)
+				if okD and type(old) == "table" and old.sig == sig and type(old.buckets) == "table" then
+					buckets = old.buckets
+				end
+			end
+		end
+	end
+	buckets[tostring(math.floor(net.rtt * 1000 / 40))] = { rtt = net.rtt, tune = { M1 = tune.M1, M2 = tune.M2 }, stunSlack = stunSlack }
+	d.buckets = buckets
 	local okJ, raw = pcall(HttpService.JSONEncode, HttpService, d)
 	if not okJ then
 		return false
@@ -4253,19 +4445,35 @@ function SK.lsLoad()
 	end
 	local cur = readPing() or net.rtt
 	local same = SK.fin(d.rtt) and math.abs(d.rtt - cur) <= math.max(0.04, d.rtt * 0.35)
-	if same then
+	-- v13.4: cari bucket ping terdekat (tune / stunSlack per kondisi jaringan); kalau nggak ada, pakai catatan lama kalau ping mirip
+	local src = same and d or nil
+	if type(d.buckets) == "table" then
+		local bestDiff = math.huge
+		for _, b in pairs(d.buckets) do
+			if type(b) == "table" and SK.fin(b.rtt) and type(b.tune) == "table" then
+				local diff = math.abs(b.rtt - cur)
+				if diff <= math.max(0.03, b.rtt * 0.3) and diff < bestDiff then
+					bestDiff = diff
+					src = b
+				end
+			end
+		end
+	end
+	if src then
 		local w = 0.7
-		if type(d.tune) == "table" then
-			if SK.fin(d.tune.M1) then
-				tune.M1 = math.clamp(d.tune.M1 * w, -CFG.TuneMax, CFG.TuneMax)
+		if type(src.tune) == "table" then
+			if SK.fin(src.tune.M1) then
+				tune.M1 = math.clamp(src.tune.M1 * w, -CFG.TuneMax, CFG.TuneMax)
 			end
-			if SK.fin(d.tune.M2) then
-				tune.M2 = math.clamp(d.tune.M2 * w, -CFG.TuneMax, CFG.TuneMax)
+			if SK.fin(src.tune.M2) then
+				tune.M2 = math.clamp(src.tune.M2 * w, -CFG.TuneMax, CFG.TuneMax)
 			end
 		end
-		if SK.fin(d.stunSlack) then
-			stunSlack = math.clamp(CFG.StunSlackStart * (1 - w) + d.stunSlack * w, CFG.StunSlackMin, CFG.StunSlackMax)
+		if SK.fin(src.stunSlack) then
+			stunSlack = math.clamp(CFG.StunSlackStart * (1 - w) + src.stunSlack * w, CFG.StunSlackMin, CFG.StunSlackMax)
 		end
+	end
+	if same then
 		if type(d.m2s) == "table" then
 			for k, s in pairs(d.m2s) do
 				if type(k) == "string" and Specs.styles[k] and type(s) == "table" and SK.fin(s.pOk) and SK.fin(s.pN) and SK.fin(s.dOk) and SK.fin(s.dN) then
@@ -4384,6 +4592,9 @@ function SK.doctor()
 			tip = "block kekunci cooldown 0.75s abis block lepas. Jangan lepas block manual pas ada musuh aktif; naikin MaxHoldActive atau PostParryTail."
 		elseif k == "locked/busy" then
 			tip = "lu lagi nyerang (busy) pas hit dateng. Pastiin GuardPriority = true, dan jangan spam klik pas lawan baru ngayun."
+			if CFG.GuardPriority and (counters.swingheld or 0) == 0 and (v or 0) >= 5 then
+				tip = tip .. " Catatan: swing yang ditahan = 0, hook TrySwing kemungkinan nggak kepasang (game manggil lewat upvalue). Cek Report() baris 'hook swing'."
+			end
 		elseif k == "locked/stun" or k == "locked/ke-parry" then
 			tip = "block kekunci stun. Pastiin HitGuard dan ParriedGuard true; naikin HitGuardRange kalau lawan agak jauh."
 		elseif k == "locked/dodge" then
@@ -5084,7 +5295,7 @@ local function summaryText()
     local rate = all > 0 and (c.parried + c.blocked + c.dodged) / all * 100 or 100
     local parryRate = landed > 0 and c.parried / landed * 100 or 0
     return table.concat({
-        ("AutoParry v13.2 | parry %d  block %d  dodge %d  kena %d  gb %d | aman %.0f%% | parry-rate %.0f%%"):format(
+        ("AutoParry v13.5 | parry %d  block %d  dodge %d  kena %d  gb %d | aman %.0f%% | parry-rate %.0f%%"):format(
             c.parried, c.blocked, c.dodged, c.hit, c.guardbroken, rate, parryRate
         ),
         ("rtt %.0fms (±%.0f) | fps %.0f (p90 %.0fms, spike %d) | cpu %.0fus/frame (max %.0fus)"):format(
@@ -5125,7 +5336,7 @@ function SK.dump()
     local function add(s)
         out[#out + 1] = s
     end
-    add("== AutoParry live dump · v13.2 ==")
+    add("== AutoParry live dump · v13.5 ==")
     add(summaryText())
     local r1, r2 = SK.live(now)
     add(r1)
@@ -5176,7 +5387,7 @@ end
 -- API + START
 ----------------------------------------------------------------------
 genv.__NyxAutoParry = {
-    Version = "13.2",
+    Version = "13.5",
     CFG = CFG,
     Counters = counters,
     Skips = skips,
@@ -5200,6 +5411,9 @@ genv.__NyxAutoParry = {
     TeleLearn = SK.tlReport,
     LearnSave = SK.lsSave,
     LearnLoad = SK.lsLoad,
+    Outcomes = SK.outcomes,
+    ExportOutcomes = SK.outcomesExport,
+    Analyze = SK.analyze,
     Reset = resetStats,
     Save = Store.save,
     Store = Store,
@@ -5269,8 +5483,8 @@ task.spawn(function()
 end)
 
 
-notify("v13.2 loaded - tekan " .. CFG.ToggleKey.Name .. " buat toggle")
-log("loaded v13.2. toggle:", CFG.ToggleKey.Name, "| UI:", CFG.UIKey.Name, "| getgenv().__NyxAutoParry.Summary() buat ringkasan")
+notify("v13.5 loaded - tekan " .. CFG.ToggleKey.Name .. " buat toggle")
+log("loaded v13.5. toggle:", CFG.ToggleKey.Name, "| UI:", CFG.UIKey.Name, "| getgenv().__NyxAutoParry.Summary() buat ringkasan")
 
 end
 
@@ -5431,12 +5645,24 @@ local leafKW = {
     "leaf", "leaves", "daun", "foliage", "tree", "pohon", "bush", "shrub",
     "grass", "rumput", "plant", "tanaman", "bark", "branch", "vine", "fern",
 }
+-- v13.5: cocokkan KATA UTUH (nama dipecah di huruf besar / angka / simbol), bukan substring.
+-- Dulu "tree" kena "Street" dan "plant" kena "Implant" -> lantai ikut disembunyikan + CanCollide dimatiin.
+local leafSet = {}
+for _, k in ipairs(leafKW) do leafSet[k] = true end
+local leafCache = {}
 local function isLeafName(name)
-    local low = name:lower()
-    for _, k in ipairs(leafKW) do
-        if low:find(k, 1, true) then return true end
+    local hit = leafCache[name]
+    if hit ~= nil then return hit end
+    hit = false
+    local spaced = name:gsub("(%l)(%u)", "%1 %2")
+    for word in spaced:lower():gmatch("%a+") do
+        if leafSet[word] or (word:sub(-1) == "s" and leafSet[word:sub(1, -2)]) then
+            hit = true
+            break
+        end
     end
-    return false
+    leafCache[name] = hit
+    return hit
 end
 
 local FX     = {ParticleEmitter = true, Trail = true, Beam = true, Fire = true, Smoke = true, Sparkles = true}
@@ -5474,7 +5700,9 @@ end
 
 local function processPart(p)
     local prot = protection(p)
-    if state.texture then
+    -- v13.5: avatar / NPC dicek DULU. Dulu tekstur + material karakter dihapus lebih dulu lalu "dipulihkan" hub tiap 1 detik
+    -- (avatar sempat blank). Sekarang karakter cuma kena CastShadow, tampilannya nggak disentuh.
+    if state.texture and prot ~= "char" then
         set(p, "Material", Enum.Material.SmoothPlastic)
         set(p, "Reflectance", 0)
         if p:IsA("MeshPart") then
@@ -5484,9 +5712,9 @@ local function processPart(p)
     end
     if state.shadow then set(p, "CastShadow", false) end
     if prot == "char" then return end
-    if state.leaf and isLeafName(p.Name) then
+    -- Hide Leaves: part besar (lantai / tanah / tembok) nggak pernah disentuh, dan collision nggak diubah.
+    if state.leaf and isLeafName(p.Name) and p.Size.Magnitude < 40 then
         set(p, "Transparency", 1)
-        set(p, "CanCollide", false)
         return
     end
     if state.anchor and not prot and not p.Anchored then set(p, "Anchored", true) end
@@ -5505,10 +5733,12 @@ local function processObject(obj)
         end
         return
     end
-    if state.texture then
+    if state.texture and (cls == "SpecialMesh" or cls == "SurfaceAppearance" or DECAL[cls]) then
+        -- v13.5: tekstur / decal / baju milik karakter (wajah, aksesori, SurfaceAppearance) nggak disentuh
+        if protection(obj) == "char" then return end
         if cls == "SpecialMesh" then return pset(obj, "TextureId", "") end
         if cls == "SurfaceAppearance" then return stash(obj) end
-        if DECAL[cls] then return pset(obj, "Transparency", 1) end
+        return pset(obj, "Transparency", 1)
     end
     if state.shadow and LIGHT[cls] then return pset(obj, "Enabled", false) end
     if state.fx then
@@ -5812,9 +6042,10 @@ local function makeSlider(name, init, minV, maxV, color, snap, onChange)
     return s
 end
 
-makeSlider("FPS Cap (bypass)", fpsCapValue, 30, 300, BLUE, 5, function(v)
+local capSlider = makeSlider("FPS Cap (bypass)", fpsCapValue, 30, 300, BLUE, 5, function(v)
     fpsCapValue = v
-    tryFPSCap(v)
+    -- v13.5: kalau hub megang cap (Buka batas FPS nyala), Nono cuma nyatet nilainya, nggak ikut nyetel (anti rebutan)
+    if not env.NonoHubCap then tryFPSCap(v) end
 end)
 
 local distSlider = makeSlider("Render Distance", userDist, 64, 1024, Color3.fromRGB(0, 200, 100), 64,
@@ -5831,17 +6062,19 @@ local PRESETS = {
         anchor = true, sky = true, aggr = true}, 256},
 }
 
+local function applyPreset(p)
+    for k, v in pairs(p[2]) do
+        state[k] = v
+        if toggleRefresh[k] then toggleRefresh[k](true) end
+    end
+    userDist = distSlider.set(p[3])
+    saveConfig()
+    log("preset " .. p[1] .. ", tekan APPLY")
+end
+
 local presetRow = btnRow()
 for _, p in ipairs(PRESETS) do
-    smallBtn(presetRow, p[1], BLUE, 3, function()
-        for k, v in pairs(p[2]) do
-            state[k] = v
-            if toggleRefresh[k] then toggleRefresh[k](true) end
-        end
-        userDist = distSlider.set(p[3])
-        saveConfig()
-        log("preset " .. p[1] .. ", tekan APPLY")
-    end)
+    smallBtn(presetRow, p[1], BLUE, 3, function() applyPreset(p) end)
 end
 
 local function makeToggle(name, key)
@@ -6039,7 +6272,8 @@ applyNuke = function()
     applyBtn.Text = "..."
     applyBtn.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
     applyBtn.TextColor3 = Color3.fromRGB(0, 220, 110)
-    log("fps cap " .. fpsCapValue .. (tryFPSCap(fpsCapValue) and " ✓" or " (no executor)"))
+    local capOk = env.NonoHubCap and true or tryFPSCap(fpsCapValue)
+    log("fps cap " .. fpsCapValue .. (capOk and " ✓" or " (no executor)"))
     applyGlobals()
     local list = workspace:GetDescendants()
     table.move(list, 1, #list, qt + 1, queue)
@@ -6075,7 +6309,7 @@ local function runRestore(sync)
     table.clear(orig); table.clear(stashed); table.clear(hiddenOrig); table.clear(touchedHum)
     table.clear(culled); table.clear(parts); table.clear(partIdx)
     culledN, cursor = 0, 0
-    tryFPSCap(CFG.fpsTarget)
+    if not env.NonoHubCap then tryFPSCap(CFG.fpsTarget) end
 end
 
 restoreAll = function()
@@ -6099,6 +6333,7 @@ unload = function()
     for _, c in ipairs(CONNECTIONS) do pcall(function() c:Disconnect() end) end
     runRestore(true)
     if env.NonoCleanup == unload then env.NonoCleanup = nil end
+    env.NonoAPI = nil
     sg:Destroy()
 end
 
@@ -6199,6 +6434,68 @@ end)
 
 env.NonoCleanup = unload
 
+-- v13.5: Post FX / Atmosphere yang muncul SETELAH Apply (game ganti map / efek) ikut dimatiin
+trackConn(Lighting.ChildAdded:Connect(function(v)
+    if not (applied and state.post) then return end
+    if v:IsA("PostEffect") then
+        pset(v, "Enabled", false)
+    elseif v:IsA("Atmosphere") then
+        for _, pn in ipairs(ATMO_PROPS) do pset(v, pn, 0) end
+    end
+end))
+
+-- v13.5: API buat hub. Hub dulu scrape teks GUI + getconnections (slider mati kalau executor nggak punya getconnections).
+local TOGGLE_KEY = {
+    ["Nuke Texture"] = "texture", ["Kill Shadow"] = "shadow", ["Kill Post FX"] = "post",
+    ["Hide Leaves"] = "leaf", ["Kill FX"] = "fx", ["Anchor Parts"] = "anchor",
+    ["Kill Skybox"] = "sky", ["Aggressive"] = "aggr", ["Adaptive FPS"] = "adaptive", ["Auto Apply"] = "auto",
+}
+env.NonoAPI = {
+    Version = 2,
+    Apply = function() applyNuke() end,
+    Restore = function() restoreAll() end,
+    Unload = function() unload() end,
+    GetToggle = function(name) return state[TOGGLE_KEY[name] or name] end,
+    SetToggle = function(name, v)
+        local k = TOGGLE_KEY[name] or name
+        if state[k] == nil then return false end
+        state[k] = v and true or false
+        if toggleRefresh[k] then toggleRefresh[k](true) end
+        saveConfig()
+        return true
+    end,
+    GetCap = function() return fpsCapValue end,
+    SetCap = function(v, silent)
+        fpsCapValue = capSlider.set(v)
+        if not silent then
+            tryFPSCap(fpsCapValue)
+            saveConfig()
+        end
+        return fpsCapValue
+    end,
+    GetDist = function() return userDist end,
+    SetDist = function(v)
+        userDist = distSlider.set(v)
+        saveConfig()
+        return userDist
+    end,
+    Preset = function(name)
+        for _, pr in ipairs(PRESETS) do
+            if pr[1] == name then
+                applyPreset(pr)
+                return true
+            end
+        end
+        return false
+    end,
+    Status = function()
+        return {
+            applied = applied, running = nukeActive or busy, hidden = culledN, tier = tier, fps = currentFPS,
+            progress = (nukeTotal > 0) and (nukeDone / nukeTotal) or 0,
+        }
+    end,
+}
+
 if state.auto then
     task.delay(1.5, function()
         if alive and not applied then applyNuke() end
@@ -6213,7 +6510,7 @@ print("[NONO v6.0] loaded | setfpscap:", HAS_SETFPSCAP, "| sethiddenproperty:", 
 -- =====================================================================
 --  DASAR
 -- =====================================================================
-local VERSION = "13.3"
+local VERSION = "13.5"
 
 local Players      = game:GetService("Players")
 local RunService   = game:GetService("RunService")
@@ -6227,6 +6524,7 @@ local LP   = Players.LocalPlayer
 local PGui = LP:WaitForChild("PlayerGui")
 local env  = (getgenv and getgenv()) or _G
 if env.__AP13HUB_STOP then pcall(env.__AP13HUB_STOP) end
+env.NonoHubCap = nil
 
 local alive, conns = true, {}
 local function track(c) conns[#conns + 1] = c; return c end
@@ -6290,7 +6588,7 @@ local FD, FB, FS = Enum.Font.GothamBold, Enum.Font.GothamMedium, Enum.Font.Gotha
 local CFGFILE = "AP13_hub.json"
 local S = {
     op = 74, sc = 100, accent = 1, motion = true, mute = true, leafGuard = true, autosave = true,
-    mini = false, fx = true, intro = true,
+    mini = false, fx = true, intro = true, fxFight = true,
     hk = { hub = "RightAlt", lag = "F4" },
     wp = nil, fp = nil, mp = nil,
     bst = { cap = 2, unlock = false, quality = false, light = false, mute = false, far = false, sweep = false, protect = true, lod = 400, dist = 120 },
@@ -6309,7 +6607,7 @@ local function loadSettings()
     local function bool(k) if type(d[k]) == "boolean" then S[k] = d[k] end end
     num("op", 30, 95); num("sc", 70, 130); num("accent", 1, #ACCENTS)
     S.accent = math.floor(S.accent)
-    bool("motion"); bool("mute"); bool("leafGuard"); bool("autosave"); bool("mini"); bool("fx"); bool("intro")
+    bool("motion"); bool("mute"); bool("leafGuard"); bool("autosave"); bool("mini"); bool("fx"); bool("intro"); bool("fxFight")
     if type(d.hk) == "table" then
         for k, v in pairs(d.hk) do
             if S.hk[k] and type(v) == "string" then
@@ -6647,6 +6945,12 @@ function K.pollPar()
     local landed = v.parried + v.blocked + v.gb + v.hit
     local all = landed + v.dodged
     v.rate = all > 0 and math.floor((v.parried + v.blocked + v.dodged) / all * 100 + 0.5) or 100
+    -- v13.5: tanda lagi tarung (hitungan hasil berubah / block nyala) buat mode hemat efek
+    if all ~= v.lastAll or v.block then v.lastAct = os.clock() end
+    v.lastAll = all
+    -- v13.5: perubahan opsi yang cuma lewat Store.touch (preset / reset / hotkey) ikut disimpan
+    local stt = AP.Store
+    if type(stt) == "table" and stt.dirtyAt then K.saveSoon() end
 end
 
 -- =====================================================================
@@ -6724,11 +7028,11 @@ function K.pollLag()
             m.state, m.err = "ready", nil
             K.muteKeys("lag")
             log("Anti-lag terhubung", "ok")
-            if S.leafGuard and K.lagTgGet("Hide Leaves") then
+            if S.leafGuard and not K.nono() and K.lagTgGet("Hide Leaves") then -- v13.5: Nono ber-API = leaf udah aman, nggak perlu dimatiin
                 K.lagTgFlip("Hide Leaves")
                 log("Hide Leaves dimatikan otomatis (risiko tembus lantai)", "warn")
             end
-            if LG.pending then LG.pending = nil; K.fireSig(LG.apply, "MouseButton1Click") end
+            if LG.pending then LG.pending = nil; K.lagApply() end
         elseif m.state == "loading" and os.clock() - m.t0 > m.wait then
             m.state = "missing"
         end
@@ -6799,6 +7103,12 @@ function K.modNote(m)
     if m.state == "gone" then return "Anti-lag dilepas. Hubungkan ulang untuk memuat lagi." end
     return m.err or m.note
 end
+-- v13.5: API resmi Nono (env.NonoAPI). Kalau ada, dipakai duluan; scrape GUI cuma cadangan buat Nono versi lama.
+function K.nono()
+    local a = env.NonoAPI
+    if type(a) == "table" and a.Version and type(a.Apply) == "function" then return a end
+    return nil
+end
 function K.lagApply()
     local m = MOD.lag
     if m.state == "gone" or m.state == "missing" then
@@ -6806,41 +7116,77 @@ function K.lagApply()
     end
     if not K.ready(m) then return end
     if V.lag.running then return end
-    K.fireSig(LG.apply, "MouseButton1Click")
+    local api = K.nono()
+    if api then pcall(api.Apply) else K.fireSig(LG.apply, "MouseButton1Click") end
     log("Anti-lag memproses objek…")
 end
 function K.lagRestore()
     if MOD.lag.state ~= "ready" then return end
-    if LG.restore then K.fireSig(LG.restore, "MouseButton1Click"); log("Anti-lag dipulihkan") end
+    local api = K.nono()
+    if api then pcall(api.Restore); log("Anti-lag dipulihkan")
+    elseif LG.restore then K.fireSig(LG.restore, "MouseButton1Click"); log("Anti-lag dipulihkan") end
 end
 function K.lagUnload()
     if not K.ready(MOD.lag) then return end
-    if LG.unload then K.fireSig(LG.unload, "MouseButton1Click"); say("info", "Anti-lag dilepas") end
+    local api = K.nono()
+    if api then pcall(api.Unload); say("info", "Anti-lag dilepas")
+    elseif LG.unload then K.fireSig(LG.unload, "MouseButton1Click"); say("info", "Anti-lag dilepas") end
 end
 function K.lagPreset(name)
     if not K.ready(MOD.lag) then return end
+    local api = K.nono()
+    if api then
+        if api.Preset(name) then log("Preset " .. name .. " dipilih, tekan Terapkan") end
+        return
+    end
     local b = LG.txt[name]
     if b then K.fireSig(b, "MouseButton1Click"); log("Preset " .. name .. " dipilih, tekan Terapkan") end
 end
 function K.lagTgGet(name)
     if MOD.lag.state ~= "ready" then return nil end
+    local api = K.nono()
+    if api then
+        local v = api.GetToggle(name)
+        if v == nil then return nil end
+        return v and true or false
+    end
     local t = LG.tg[name]
     if not t or not t.pill then return nil end
     return t.pill.BackgroundColor3.G > 0.5
 end
 function K.lagTgFlip(name)
     if not K.ready(MOD.lag) then return end
+    local api = K.nono()
+    if api then
+        local cur = api.GetToggle(name)
+        if cur ~= nil then api.SetToggle(name, not cur) end
+        return
+    end
     local t = LG.tg[name]
     if t and t.btn then K.fireSig(t.btn, "MouseButton1Click") end
 end
 function K.lagSlGet(name)
+    if MOD.lag.state ~= "ready" then return nil end
+    local api = K.nono()
+    if api then
+        if name == "FPS Cap (bypass)" then return api.GetCap() end
+        if name == "Render Distance" then return api.GetDist() end
+        return nil
+    end
     local s = LG.sl and LG.sl[name]
-    if MOD.lag.state ~= "ready" or not s or not s.val then return nil end
+    if not s or not s.val then return nil end
     return tonumber(s.val.Text)
 end
 -- slider anti-lag: input tiruan ke slider aslinya, dilepas lewat handler InputEnded milik Nono
 function K.lagSlSet(name, mn, mx, step, v, final)
     if MOD.lag.state ~= "ready" then return end
+    local api = K.nono()
+    if api then
+        -- cap: kalau hub megang cap (Buka batas FPS nyala) nilai Nono cuma disinkronkan, nggak ikut nyetel
+        if name == "FPS Cap (bypass)" then api.SetCap(v, (not final) or env.NonoHubCap == true)
+        elseif name == "Render Distance" then if final then api.SetDist(v) end end
+        return
+    end
     local s = LG.sl[name]
     if not s or not s.track or not s.hit or not CAP.getconnections or #MOD.lag.ended == 0 then
         if final then toast("Slider anti-lag butuh executor dengan getconnections", "warn") end
@@ -6935,6 +7281,7 @@ function K.pGet(key)
 end
 function K.ptouch()
     if AP and AP.Store and AP.Store.touch then pcall(AP.Store.touch) end
+    K.saveSoon() -- v13.5: dulu cuma Store.touch (penyimpan lamanya ada di UI lama yang udah dicopot) -> perubahan nggak pernah ke-save
 end
 function K.pSet(key, v)
     if MOD.par.state ~= "ready" or not CFG13 then K.ready(MOD.par); return false end
@@ -6977,6 +7324,15 @@ function K.copySummary()
     if not ok or type(t) ~= "string" then toast("Ringkasan gagal dibuat", "err"); return end
     if CAP.clipboard then pcall(setclipboard, t); say("ok", "Ringkasan parry disalin")
     else print(t); say("warn", "Executor tanpa clipboard, ringkasan dicetak ke konsol") end
+end
+
+-- v13.5: analisis 200 hasil terakhir (timing parry per jenis serangan + per ping + saran tuning)
+function K.copyAnalysis()
+    if MOD.par.state ~= "ready" or not (AP and type(AP.Analyze) == "function") then K.ready(MOD.par); return end
+    local ok, t = pcall(AP.Analyze)
+    if not ok or type(t) ~= "string" then toast("Analisis gagal dibuat", "err"); return end
+    if CAP.clipboard then pcall(setclipboard, t); say("ok", "Analisis hasil disalin")
+    else say("warn", "Executor tanpa clipboard, analisis dicetak ke konsol") end
 end
 
 function K.allOn()
@@ -7070,6 +7426,10 @@ end
 function K.setCap()
     local v = CAPS[S.bst.cap] or 120
     local val = (v == 0) and 9999 or v
+    -- v13.5: hub jadi satu-satunya pemilik cap selama "Buka batas FPS" nyala; Nono cuma disinkronkan tampilannya
+    env.NonoHubCap = true
+    local nono = K.nono()
+    if nono then pcall(nono.SetCap, math.min(val, 300), true) end
     local res = {}
     for _, m in ipairs({ "setfpscap", "fflag", "setelan" }) do res[m] = K.capMethod(m, val) end
     BOOST.capRes = { setfpscap = res.setfpscap, fflag = res.fflag, usersettings = res.setelan }
@@ -7157,7 +7517,7 @@ BOOST_FX.unlock = {
         if K.setCap() then return true end
         return false, "Tidak ada jalur cap FPS yang bisa dipakai di executor ini"
     end,
-    off = function() if CAP.setfpscap then pcall(setfpscap, 60) end return true end,
+    off = function() env.NonoHubCap = nil; if CAP.setfpscap then pcall(setfpscap, 60) end return true end,
 }
 BOOST_FX.render3d = {
     on = function() return pcall(function() RunService:Set3dRenderingEnabled(false) end) end,
@@ -7354,6 +7714,8 @@ BOOST_FX.sweep = {
 
 function K.lagPresetQuiet(name)
     if MOD.lag.state ~= "ready" then return end
+    local api = K.nono()
+    if api then pcall(api.Preset, name); return end
     local b = LG.txt and LG.txt[name]
     if b then K.fireSig(b, "MouseButton1Click") end
 end
@@ -8495,7 +8857,10 @@ do
     W.slider(c5, "Tahan block saat telat", 0.1, 1.5, 0.05, " dtk", K.pnum("LateHold"))
 
     W.btnRow(p, {
+        { "Analisis hasil", "norm", K.copyAnalysis },
         { "Salin ringkasan", "norm", K.copySummary },
+    })
+    W.btnRow(p, {
         { "Reset statistik", "norm", function()
             if MOD.par.state ~= "ready" or not (AP and AP.Reset) then K.ready(MOD.par); return end
             pcall(AP.Reset); say("ok", "Statistik parry direset")
@@ -8633,7 +8998,7 @@ do
     local names = { "Hapus tekstur", "Matikan bayangan", "Matikan efek post", "Sembunyikan daun", "Matikan partikel dan FX",
         "Anchor part", "Matikan skybox", "Mode agresif", "FPS adaptif", "Terapkan otomatis" }
     local subs = {
-        ["Hide Leaves"] = "Risiko: part bernama grass, tree, plant bisa jadi tembus",
+        ["Hide Leaves"] = "Sembunyikan part bernama daun, pohon, semak. Part besar dilewati dan collision tidak diubah",
         ["Aggressive"] = "Mematikan constraint dan ClickDetector non-karakter",
         ["Anchor Parts"] = "Part yang tidak terlindungi dikunci di tempat",
     }
@@ -8752,6 +9117,8 @@ do
         function() return S.motion end, function() S.motion = not S.motion; K.saveSoon() end)
     W.toggle(c1, "Efek visual", "Aurora, partikel, kilau judul, scanline, glitch",
         function() return S.fx end, function() S.fx = not S.fx; K.saveSoon() end)
+    W.toggle(c1, "Hemat efek saat tarung", "Animasi dekorasi berhenti kalau lagi tarung atau fps di bawah 40",
+        function() return S.fxFight end, function() S.fxFight = not S.fxFight; K.saveSoon() end)
     W.toggle(c1, "Layar pembuka", "Animasi boot saat hub dijalankan",
         function() return S.intro end, function() S.intro = not S.intro; K.saveSoon() end)
     do
@@ -8835,7 +9202,7 @@ do
             end
             K.saveSoon()
         end)
-    W.toggle(c3, "Matikan Hide Leaves otomatis", "Saat anti-lag terhubung, cegah risiko tembus lantai",
+    W.toggle(c3, "Matikan Hide Leaves otomatis", "Cuma buat Nono versi lama tanpa perbaikan leaf. Nono bawaan hub ini sudah aman",
         function() return S.leafGuard end, function() S.leafGuard = not S.leafGuard; K.saveSoon() end)
     W.toggle(c3, "Simpan otomatis", "Konfigurasi hub ke AP13_hub.json, opsi parry ke file parry",
         function() return S.autosave end, function() S.autosave = not S.autosave; K.saveSoon() end)
@@ -8875,7 +9242,7 @@ do
     W.btnRow(p, { { "Matikan semua dan tutup", "dng", K.shutdownAll, 1, true } })
 
     local c5 = W.card(p)
-    W.row(c5, "Auto parry v" .. VERSION, "UI Skill issue final boss · By Duke · parry v13.2 dan Nono tetap utuh, hub hanya mengendalikannya", false, 0)
+    W.row(c5, "Auto parry v" .. VERSION, "UI Skill issue final boss · By Duke · parry v13.5 dan Nono dikendalikan dari hub ini", false, 0)
 end
 BT = nil
 
@@ -9052,6 +9419,8 @@ end, true)
 local FXT = { glitch = os.clock() + 4 }
 track(RunService.Heartbeat:Connect(function(dt)
     if not S.fx then return end
+    -- v13.5: pas tarung (hasil hit / block baru aja berubah) atau fps < 40, animasi dekorasi dibekukan biar frame time nggak naik
+    if S.fxFight and (V.sys.fps < 40 or (V.par.lastAct and os.clock() - V.par.lastAct < 4)) then return end
     local now = os.clock()
     local t = now - START
     local s = (math.sin(t * 2.4) + 1) / 2
