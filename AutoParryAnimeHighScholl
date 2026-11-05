@@ -1,6 +1,6 @@
 --!nonstrict
 --[[
-  AUTO PARRY v13.7  |  UI: Skill issue final boss (By Duke)
+  AUTO PARRY v13.8  |  UI: Skill issue final boss (By Duke)
 
   Isi file ini:
     1. Auto parry v13.2 UTUH (logika parry / dodge / learning tidak diubah).
@@ -8,7 +8,7 @@
          - UI lama v13.2 (buildUI) dicopot, diganti UI hub di bawah.
          - blok "if CFG.UI then buildUI" dihapus.
          - API ditambah satu field: Store = Store (buat preset / simpan dari UI).
-    2. Anti-lag: Nono Anti-Lag v6.0 (utuh, disisipkan di SRC.lag) + Anti-lag Plus
+    2. Anti-lag: Nono Anti-Lag v6.0 (utuh, sekarang fungsi __startNono) + Anti-lag Plus
        (cap FPS, mode AFK, kualitas minimum, sembunyikan pemain jauh, auto boost,
        turbo, benchmark), semuanya dipindah dari Skill issue final boss v1.5.
     3. UI persis hub Skill issue final boss: tombol bulat, HUD ringkas, tab
@@ -18,6 +18,17 @@
   Tombol bulat: ketuk = buka/tutup | tahan = mode ringkas | tarik = pindah
   Hotkey default: RightAlt hub | F4 anti-lag | P toggle parry (bisa diubah di Setelan)
   Konfigurasi hub: AP13_hub.json | konfigurasi parry: tetap NyxAutoParry_v9.json
+
+  v13.8 (struktur file, logika parry inti TIDAK diubah, cuma cara local disimpan):
+    - Slot local aman dari batas Luau (200 local per fungsi). Sebelumnya __startParry sudah 185 / 200, Nono 165 / 200.
+      Sekarang __startParry 130 dan Nono 142. Yang dipindah ke tabel (PX di parry, NX di Nono) cuma local yang jarang dipakai:
+      alias service, fungsi sekali-pakai / jarang dipanggil, konstanta, dan UI Nono yang sekali dibikin. Local jalur per-frame
+      (frameTick, trackFrame, pushPos, pumpQueue, readPing, sampleNet, runHandle) tetap local biasa. Hub tetap 148 (nggak disentuh).
+      Nambah fitur baru: taruh local baru di PX / NX (atau tabel sendiri), jangan nambah local di level atas fungsi.
+    - Nono bukan string + loadstring lagi, tapi fungsi __startNono: syntax error ketahuan pas file di-load dan executor
+      nggak perlu punya loadstring. Isi Nono tidak diubah.
+    - Chunkname SIFB_lag ikut hilang, jadi hotkey bawaan Nono (yang diredam hub) sekarang dikenali dari snapshot
+      UIS.InputBegan waktu Nono diload (MOD.lag.began), difilter biar cuma handler dari file ini yang diredam.
 
   v13.7 (anti-lag: VFX beneran ilang + frame time lebih rata, logika parry inti TIDAK diubah):
     - FIX VFX / partikel nggak ilang: ParticleEmitter:Emit() tetap jalan walau Enabled = false (itu cara game bikin efek hit / skill).
@@ -61,9 +72,10 @@
 ]]
 
 local function __startParry()
+local PX = {} -- v13.8: namespace buat local yang jarang dipakai (hemat slot local, batas Luau 200)
 --!nonstrict
 --[[
-    AutoParry v13.7
+    AutoParry v13.8
     Game    : Roblox fighting game (ReplicatedStorage.Remotes.Combat, M1/M2/Block/Parry/Dodge)
     Runtime : Luau, client-side (jalanin lewat executor lu)
     Toggle  : P (CFG.ToggleKey)  |  UI: CFG.UIKey (orb geser = pindah, tap = buka/tutup, tahan = ON/OFF)
@@ -90,25 +102,25 @@ if genv.__NyxAutoParry then
 	pcall(genv.__NyxAutoParry.Stop)
 end
 
-local Players = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local UserInputService = game:GetService("UserInputService")
-local RunService = game:GetService("RunService")
-local Stats = game:GetService("Stats")
-local StarterGui = game:GetService("StarterGui")
-local HttpService = game:GetService("HttpService")
+PX.Players = game:GetService("Players")
+PX.ReplicatedStorage = game:GetService("ReplicatedStorage")
+PX.UserInputService = game:GetService("UserInputService")
+PX.RunService = game:GetService("RunService")
+PX.Stats = game:GetService("Stats")
+PX.StarterGui = game:GetService("StarterGui")
+PX.HttpService = game:GetService("HttpService")
 
-local LocalPlayer = Players.LocalPlayer
+local LocalPlayer = PX.Players.LocalPlayer
 local Combat
 do
-	local Remotes = ReplicatedStorage:WaitForChild("Remotes", 15)
+	local Remotes = PX.ReplicatedStorage:WaitForChild("Remotes", 15)
 	Combat = Remotes and Remotes:WaitForChild("Combat", 15)
 end
 if not Combat then
 	local msg = "Remotes.Combat nggak ketemu (15s). Game update / nama remote berubah, script nggak dijalanin."
 	warn("[AutoParry] " .. msg)
 	pcall(function()
-		StarterGui:SetCore("SendNotification", { Title = "AutoParry", Text = msg, Duration = 6 })
+		PX.StarterGui:SetCore("SendNotification", { Title = "AutoParry", Text = msg, Duration = 6 })
 	end)
 	return
 end
@@ -471,7 +483,7 @@ local lastSkip = { reason = "-", at = -math.huge }
 
 -- v9: ring buffer event buat tab Log / ringkasan. head = index entri terbaru.
 local EV = { ring = {}, head = 0, count = 0, cap = 120, seq = 0 }
-local SKIP_LOG = {
+PX.SKIP_LOG = {
 	late = true, locked = true, heldold = true, parrycd = true, unparryable = true,
 	["local-refuse"] = true, ["predict-recheck"] = true, ["attacker-gone"] = true,
 	["dodge-late"] = true, ["dodge-early"] = true, ["dodge-recheck"] = true,
@@ -500,7 +512,7 @@ end
 
 local function notify(text)
 	pcall(function()
-		StarterGui:SetCore("SendNotification", { Title = "AutoParry", Text = text, Duration = 2 })
+		PX.StarterGui:SetCore("SendNotification", { Title = "AutoParry", Text = text, Duration = 2 })
 	end)
 end
 
@@ -529,7 +541,7 @@ local function skip(reason)
 		local k = "locked/" .. SK.lockWhy
 		skips[k] = (skips[k] or 0) + 1
 	end
-	if CFG.LogEvents and SKIP_LOG[reason] then
+	if CFG.LogEvents and PX.SKIP_LOG[reason] then
 		pushEv("skip", "skip: " .. reason)
 	end
 	trace("skip:", reason)
@@ -613,7 +625,7 @@ local function readPing()
 	end
 	if pingItem == nil then
 		local okItem, item = pcall(function()
-			return Stats.Network.ServerStatsItem["Data Ping"]
+			return PX.Stats.Network.ServerStatsItem["Data Ping"]
 		end)
 		pingItem = (okItem and item) or false
 	end
@@ -668,7 +680,7 @@ local function pushPos(t, p)
 end
 
 -- posisi `sec` detik yang lalu (interpolasi), nil kalau belum ada riwayat
-local function posAgo(sec)
+function PX.posAgo(sec)
 	if hCount == 0 then
 		return nil
 	end
@@ -689,17 +701,17 @@ local function posAgo(sec)
 	return prevP
 end
 
-local function predictedPos(hrp, t)
+function PX.predictedPos(hrp, t)
 	local v = hrp.AssemblyLinearVelocity
 	return hrp.Position + Vector3.new(v.X, 0, v.Z) * t
 end
 
 -- h > 0 = prediksi ke depan, h < 0 = posisi di masa lalu
-local function posAtRel(hrp, h)
+function PX.posAtRel(hrp, h)
 	if h >= 0 then
-		return predictedPos(hrp, h)
+		return PX.predictedPos(hrp, h)
 	end
-	return posAgo(-h) or hrp.Position
+	return PX.posAgo(-h) or hrp.Position
 end
 
 ----------------------------------------------------------------------
@@ -713,7 +725,7 @@ local function getHandler()
 		return Game.handler or nil
 	end
 	local ok, mod = pcall(function()
-		local m = ReplicatedStorage:FindFirstChild("Modules")
+		local m = PX.ReplicatedStorage:FindFirstChild("Modules")
 		local sh = m and m:FindFirstChild("Shared")
 		local ch = sh and sh:FindFirstChild("CombatHandler")
 		return ch and require(ch)
@@ -735,7 +747,7 @@ local function lockField(L, key, sn)
 	return nil
 end
 
-local function readLock(L, sn, clk, halfRtt)
+function PX.readLock(L, sn, clk, halfRtt)
 	local latest = -math.huge
 	-- Busy / BlockReady di-set client pas lu mencet; server nerima rtt/2 lebih lambat,
 	-- paket kita juga nyampe rtt/2 lebih lambat -> saling cancel, pakai nilai client langsung.
@@ -769,7 +781,7 @@ local function gameLock()
 	if type(L) ~= "table" then
 		return nil
 	end
-	local ok, res = pcall(readLock, L, workspace:GetServerTimeNow(), os.clock(), stunComp())
+	local ok, res = pcall(PX.readLock, L, workspace:GetServerTimeNow(), os.clock(), stunComp())
 	if ok and res ~= -math.huge and res < os.clock() + 3 then
 		return res -- nilai > 3 detik ke depan dianggap bogus
 	end
@@ -790,9 +802,9 @@ local function tryRequire(inst)
 	return nil
 end
 
-local function loadSpecs()
+function PX.loadSpecs()
 	local ok, gs = pcall(function()
-		local m = ReplicatedStorage:WaitForChild("Modules", 10)
+		local m = PX.ReplicatedStorage:WaitForChild("Modules", 10)
 		local sh = m and m:WaitForChild("Shared", 10)
 		return sh and sh:WaitForChild("GSettings", 10)
 	end)
@@ -941,7 +953,7 @@ function SK.iqRead(char)
 	if sv and sv:IsA("StringValue") and sv.Value ~= "" then
 		return sv.Value
 	end
-	local plr = Players:GetPlayerFromCharacter(char)
+	local plr = PX.Players:GetPlayerFromCharacter(char)
 	if plr then
 		local v = plr:GetAttribute("Style")
 		if type(v) == "string" and v ~= "" then
@@ -1020,7 +1032,7 @@ local function myState()
 end
 
 -- Server NGGAK nolak Block pas stamina abis, jadi StaminaExhausted sengaja nggak dicek.
-local function cannotAct(char, attacker)
+function PX.cannotAct(char, attacker)
 	if char:GetAttribute("InCombat") == false then
 		-- v6: flag InCombat lu bisa telat nyala di awal fight; kalau attacker-nya aktif, tetap proses
 		if not (CFG.IgnoreMyCombatFlag and typeof(attacker) == "Instance" and attacker:GetAttribute("InCombat") == true) then
@@ -1096,7 +1108,7 @@ end
 
 -- target umur block pas hit mendarat. M1: telat = kena damage, kecepetan = cuma Blocked,
 -- jadi geser ke arah "lebih awal" sebanding noise. M2: tengah window (dua-duanya jelek).
-local function targetAgeFor(isM2)
+function PX.targetAgeFor(isM2)
 	local base = isM2 and CFG.TargetAgeM2 or CFG.TargetAgeM1
 	if not CFG.SmartMode or isM2 then
 		return base
@@ -1145,7 +1157,7 @@ local function sendBlock(on)
 	return true
 end
 
-local function scheduleRelease(at)
+function PX.scheduleRelease(at)
 	releaseAt = at
 	cancel(releaseHandle)
 	releaseHandle = schedule(at, function()
@@ -1199,7 +1211,7 @@ local function pressBlock(hold)
 		return false
 	end
 	counters.fired += 1
-	scheduleRelease(now + hold)
+	PX.scheduleRelease(now + hold)
 	return true
 end
 
@@ -1232,7 +1244,7 @@ local function extendHoldTo(untilClock)
 	end
 	local want = math.min(untilClock, blockOnAt + cap)
 	if want > releaseAt then
-		scheduleRelease(want)
+		PX.scheduleRelease(want)
 	end
 	return true
 end
@@ -1241,12 +1253,12 @@ local function releaseBefore(t)
 	if not blockHeld or releaseAt <= t then
 		return
 	end
-	scheduleRelease(math.max(t, os.clock()))
+	PX.scheduleRelease(math.max(t, os.clock()))
 	counters.released += 1
 end
 
 -- server udah nolak / matiin block kita -> batalin rencana release, jangan kirim OFF sia-sia
-local function dropLocalBlock()
+function PX.dropLocalBlock()
 	cancel(releaseHandle)
 	blockHeld = false
 	rawOn = false
@@ -1261,7 +1273,7 @@ end
 
 -- v6: samain status block lokal sama server (atribut Blocking). Server bisa ngelepas block kita (stun dll)
 -- tanpa script tau -> blockHeld nyangkut true -> semua rencana berikutnya dikira "udah nyala" padahal nggak.
-local function syncBlock(now, char)
+function PX.syncBlock(now, char)
 	if not (CFG.BlockResync and blockHeld and char) then
 		return
 	end
@@ -1271,7 +1283,7 @@ local function syncBlock(now, char)
 	end
 	if blockAttrSeen and (now - blockOnAt) > net.rtt * 1.5 + 0.25 then
 		trace("resync: server nggak lagi nge-block, status lokal direset")
-		dropLocalBlock()
+		PX.dropLocalBlock()
 		readyAt = math.max(readyAt, now)
 	end
 end
@@ -1286,7 +1298,7 @@ local swingGuards = {}
 local origTrySwing = nil
 local hookedHandler = nil
 
-local function guardSwing(atk, sendAt, hitAt)
+function PX.guardSwing(atk, sendAt, hitAt)
 	if not CFG.GuardPriority then
 		return
 	end
@@ -1310,7 +1322,7 @@ local function clearGuards(atk)
 	end
 end
 
-local function swingBlocked(now)
+function PX.swingBlocked(now)
 	for i = 1, #swingGuards do
 		local g = swingGuards[i]
 		if now >= g.from and now <= g.to then
@@ -1320,7 +1332,7 @@ local function swingBlocked(now)
 	return false
 end
 
-local function installSwingHook()
+function PX.installSwingHook()
 	if origTrySwing then
 		return true
 	end
@@ -1336,7 +1348,7 @@ local function installSwingHook()
 		h.TrySwing = function(self, ...)
 			if alive and CFG.Enabled and CFG.GuardPriority then
 				local now = os.clock()
-				if swingBlocked(now) then
+				if PX.swingBlocked(now) then
 					counters.swingheld += 1
 					return
 				end
@@ -1355,7 +1367,7 @@ local function installSwingHook()
 	return true
 end
 
-local function uninstallSwingHook()
+function PX.uninstallSwingHook()
 	if origTrySwing and hookedHandler then
 		pcall(function()
 			hookedHandler.TrySwing = origTrySwing
@@ -1385,7 +1397,7 @@ local function reachOf(char, style)
 end
 
 -- tiru NextCombo server: reset ke 1 kalau kelamaan / abis stun, selain itu maju terus
-local function nextCombo(char, style, now)
+function PX.nextCombo(char, style, now)
 	local swings = style.M1.Swings
 	local st = combo[char]
 	local idx
@@ -1596,7 +1608,7 @@ function SK.iqReport()
 	end
 end
 
-local function m1Plan(attacker, now)
+function PX.m1Plan(attacker, now)
 	local style = styleOf(attacker)
 	local m1 = style and style.M1
 	local swings = type(m1) == "table" and m1.Swings
@@ -1607,7 +1619,7 @@ local function m1Plan(attacker, now)
 			reach = numAttr(attacker, "ReachFactor", 1),
 		}
 	end
-	local idx = nextCombo(attacker, style, now)
+	local idx = PX.nextCombo(attacker, style, now)
 	local spec = swings[idx]
 	if type(spec) ~= "table" then
 		spec = swings[1]
@@ -1627,7 +1639,7 @@ local function m1Plan(attacker, now)
 end
 
 -- hold = Hold dari Flash (nil kalau datang dari Sound HeavySwing)
-local function m2Plan(attacker, hold)
+function PX.m2Plan(attacker, hold)
 	local style = styleOf(attacker)
 	local spec = style and style.M2
 	if type(spec) ~= "table" then
@@ -1680,7 +1692,7 @@ local function m2Plan(attacker, hold)
 end
 
 -- sweep / projectile / throw: hit pertama tergantung jarak
-local function refineLead(plan, dist)
+function PX.refineLead(plan, dist)
 	local spec = plan.spec
 	if type(spec) ~= "table" then
 		return plan.lead
@@ -1708,7 +1720,7 @@ local function refineLead(plan, dist)
 	return lead
 end
 
-local function extraReach(spec)
+function PX.extraReach(spec)
 	if type(spec) ~= "table" then
 		return 0
 	end
@@ -1761,7 +1773,7 @@ local function inVolume(ahrp, pos, plan, boost, apos)
 	if math.abs(d.Y) > height then
 		return false
 	end
-	local range = spec.Range * reach + SR.RangeTolerance + SR.TargetRadius + CFG.RangeMargin + boost + extraReach(spec)
+	local range = spec.Range * reach + SR.RangeTolerance + SR.TargetRadius + CFG.RangeMargin + boost + PX.extraReach(spec)
 	if spec.MinRange and mag < spec.MinRange * reach - 1 then
 		return false
 	end
@@ -1790,10 +1802,10 @@ local function inVolume(ahrp, pos, plan, boost, apos)
 	return lat <= half
 end
 
-local OFFS = { 0, -1, 1, -2, 2 }
+PX.OFFS = { 0, -1, 1, -2, 2 }
 
 -- hasil: ancaman?, jarak datar, pasti? (pasti = masuk volume hitbox; false = cuma "deket banget")
-local function threatens(attacker, myHrp, plan, lead)
+function PX.threatens(attacker, myHrp, plan, lead)
 	local ahrp = attacker:FindFirstChild("HumanoidRootPart")
 	if not ahrp then
 		return false, 0, false
@@ -1823,9 +1835,9 @@ local function threatens(attacker, myHrp, plan, lead)
 	-- server ngecek posisi lu yang di-rewind (bisa di masa lalu) + gerak lu selama windup.
 	-- Coba beberapa horizon: kena di salah satu = anggap ancaman.
 	local h = lead - CFG.AttackerLag - net.rtt
-	for _, o in ipairs(OFFS) do
+	for _, o in ipairs(PX.OFFS) do
 		local hh = math.clamp(h + o * CFG.LagSpread, -0.5, 0.45)
-		local p = posAtRel(myHrp, hh)
+		local p = PX.posAtRel(myHrp, hh)
 		if inVolume(ahrp, p, plan, boost) then
 			return true, dist, true
 		end
@@ -1865,7 +1877,7 @@ end
 ----------------------------------------------------------------------
 -- ARBITRASE RENCANA (satu parry per jendela cooldown, M2 menang atas M1)
 ----------------------------------------------------------------------
-local function arbitrate(kind, hitAt, now)
+function PX.arbitrate(kind, hitAt, now)
 	for i = #pending, 1, -1 do
 		local p = pending[i]
 		if p.done or p.hit < now - 0.2 then
@@ -1902,7 +1914,7 @@ end
 -- nggak Busy. Dapat IFrames (0.26s default) mulai dari saat paket NYAMPE di server. Hit yang mendarat
 -- pas IFrames aktif = "Dodged" (nol damage, M2 juga). Cooldown dash 2.25s, Block ON ditolak selama Busy (0.4s).
 ----------------------------------------------------------------------
-local function dashOf()
+function PX.dashOf()
 	local d = { IFrames = SR.Dash.IFrames, Duration = SR.Dash.Duration, Cooldown = SR.Dash.Cooldown }
 	local char = LocalPlayer.Character
 	local style = char and styleOf(char)
@@ -1915,7 +1927,7 @@ local function dashOf()
 	return d
 end
 
-local function dodgeLocal()
+function PX.dodgeLocal()
 	if not CFG.DodgeViaGame then
 		return nil
 	end
@@ -1927,7 +1939,7 @@ local function dodgeLocal()
 	return nil
 end
 
-local DODGE_KEYS = { "DodgeReadyAt", "BusyUntil", "StunnedUntil" } -- v6: nggak alokasi tabel tiap panggil
+PX.DODGE_KEYS = { "DodgeReadyAt", "BusyUntil", "StunnedUntil" } -- v6: nggak alokasi tabel tiap panggil
 
 -- berapa detik lagi dodge baru bisa dikirim (0 = siap). forPlan = ikut hitung dodge yang udah dijadwalin
 local function dodgeWait(now, forPlan)
@@ -1935,12 +1947,12 @@ local function dodgeWait(now, forPlan)
 	if forPlan then
 		w = math.max(w, dodgePlannedUntil - now)
 	end
-	local h, L = dodgeLocal()
+	local h, L = PX.dodgeLocal()
 	if L then
 		local ok, res = pcall(function()
 			local sn = workspace:GetServerTimeNow()
 			local m = 0
-			for _, k in ipairs(DODGE_KEYS) do
+			for _, k in ipairs(PX.DODGE_KEYS) do
 				local v = L[k]
 				if type(v) == "number" and v > sn then
 					m = math.max(m, v - sn)
@@ -2199,7 +2211,7 @@ function SK.ddInstall()
 		if not H.kd then
 			pcall(function()
 				local oldKD
-				oldKD = hookfunction(UserInputService.IsKeyDown, newcclosure(function(self, key)
+				oldKD = hookfunction(PX.UserInputService.IsKeyDown, newcclosure(function(self, key)
 					local s = H.kdSlot
 					if s then
 						local r = s(key)
@@ -2381,7 +2393,7 @@ function SK.ddInfoPrint()
 	end
 end
 
-local function fireDodge(attacker, plan)
+function PX.fireDodge(attacker, plan)
 	local now = os.clock()
 	local char = LocalPlayer.Character
 	if not char then
@@ -2395,7 +2407,7 @@ local function fireDodge(attacker, plan)
 		trace("dodge gagal: lu lagi nahan block manual")
 		return false
 	end
-	local d = dashOf()
+	local d = PX.dashOf()
 
 	-- server nolak Dodge kalau masih Blocking -> lepas block kita dulu (OFF sampai duluan, urutan remote terjaga)
 	if blockHeld then
@@ -2419,7 +2431,7 @@ local function fireDodge(attacker, plan)
 	end
 
 	local fired = false
-	local h, L = dodgeLocal()
+	local h, L = PX.dodgeLocal()
 	if h then
 		-- pakai fungsi dodge asli game: animasi + dorongan + state lokal ikut bener
 		local before = L.DodgeReadyAt
@@ -2455,8 +2467,8 @@ local function fireDodge(attacker, plan)
 end
 
 -- v5: hitung kemungkinan dodge tanpa jadwalin apa-apa. hasil: ok, sendIn, age, wait, dashInfo
-local function dodgeProbe(lead, now, rtt, fl)
-	local d = dashOf()
+function PX.dodgeProbe(lead, now, rtt, fl)
+	local d = PX.dashOf()
 	-- v12: paket telat lebih sering daripada kecepetan -> target umur iframe digeser sedikit ke belakang sebanding noise
 	local target = math.clamp(d.IFrames * CFG.DodgeAgeFrac + CFG.DodgeLateBias * sigmaNow(), 0.04, math.max(d.IFrames - 0.06, 0.05))
 	local wait = dodgeWait(now, true)
@@ -2488,7 +2500,7 @@ local function planDodge(attacker, plan, lead, now, rtt, fl, tag, why)
 		skip("dodge-unsure")
 		return false
 	end
-	local ok, sendIn, age, wait, d = dodgeProbe(lead, now, rtt, fl)
+	local ok, sendIn, age, wait, d = PX.dodgeProbe(lead, now, rtt, fl)
 	if not ok then
 		if CFG.Trace then trace(
 			("%s: dodge nggak mungkin (%s) age %.3f iframe %.2f tunggu %.2fs"):format(
@@ -2500,7 +2512,7 @@ local function planDodge(attacker, plan, lead, now, rtt, fl, tag, why)
 	end
 
 	local hitAt = now + lead
-	local verdict = arbitrate(plan.kind, hitAt, now)
+	local verdict = PX.arbitrate(plan.kind, hitAt, now)
 	if verdict ~= "ok" then
 		skip(verdict)
 		return true -- hit ini udah ditutup rencana lain
@@ -2515,7 +2527,7 @@ local function planDodge(attacker, plan, lead, now, rtt, fl, tag, why)
 	dodgePlannedUntil = now + sendIn + d.Cooldown - 0.05
 	dodgeBlockUntil = math.max(dodgeBlockUntil, now + sendIn + d.Duration)
 	noteExpected(attacker, hitAt, now, "DODGE")
-	guardSwing(attacker, now + sendIn, hitAt)
+	PX.guardSwing(attacker, now + sendIn, hitAt)
 	if CFG.Trace then trace(
 		("%s dari %s: DODGE (%s) lead %.3f rtt %.3f -> kirim %.3fs lagi (umur iframe %.3f)"):format(
 			tag, attacker.Name, tostring(why), lead, rtt, sendIn, age
@@ -2549,7 +2561,7 @@ local function planDodge(attacker, plan, lead, now, rtt, fl, tag, why)
 			if c2 and h2 then
 				-- v11.4: batalin dodge cuma kalau attacker beneran udah jauh. Dulu cek hitbox sempit -> M2 yang tetap mendarat
 				-- (dump: "dodge-recheck" lalu KENA M2 Toji) lolos tanpa dodge DAN tanpa parry.
-				local okT, dT = threatens(attacker, h2, plan, math.max(hitAt - os.clock(), 0))
+				local okT, dT = PX.threatens(attacker, h2, plan, math.max(hitAt - os.clock(), 0))
 				if not okT and dT > CFG.DodgeRecheckDist then
 					counters.cancelled += 1
 					dodgePlannedUntil = 0
@@ -2559,7 +2571,7 @@ local function planDodge(attacker, plan, lead, now, rtt, fl, tag, why)
 				end
 			end
 		end
-		if not fireDodge(attacker, plan) then
+		if not PX.fireDodge(attacker, plan) then
 			dodgePlannedUntil = 0
 			dodgeBlockUntil = 0
 		end
@@ -2570,7 +2582,7 @@ end
 ----------------------------------------------------------------------
 -- REACT
 ----------------------------------------------------------------------
-local function corrFor(attacker, plan)
+function PX.corrFor(attacker, plan)
 	if plan.nocorr then
 		return 0 -- v10: plan skill nggak ikut koreksi lead M1
 	end
@@ -2601,15 +2613,15 @@ local function corrFor(attacker, plan)
 end
 
 -- block yang udah nyala dipertahanin sampai hit ini ketutup (block biasa / chain guard)
-local function guardExtend(attacker, plan, tag, lead, now, rtt, fl, ha, note)
-	local verdict = arbitrate(plan.kind, now + lead, now)
+function PX.guardExtend(attacker, plan, tag, lead, now, rtt, fl, ha, note)
+	local verdict = PX.arbitrate(plan.kind, now + lead, now)
 	if verdict ~= "ok" then
 		return skip(verdict)
 	end
 	pending[#pending + 1] = { kind = plan.kind, hit = now + lead, done = false }
 	noteExpected(attacker, now + lead, now, plan.kind)
 	local rp = CFG.ResultPad + SK.resPad()
-	guardSwing(attacker, now, now + lead + rp)
+	PX.guardSwing(attacker, now, now + lead + rp)
 	local coverTo = math.max(now + lead - rtt - fl + ha, now + lead + rp)
 	if extendHoldTo(coverTo) then
 		counters.chained += 1
@@ -2620,7 +2632,7 @@ local function guardExtend(attacker, plan, tag, lead, now, rtt, fl, ha, note)
 end
 
 -- v7: rencana yang diprediksi (swing berikutnya belum kelihatan) dicek ulang sebelum block dikirim
-local function predictedStillValid(attacker, plan, hitAt)
+function PX.predictedStillValid(attacker, plan, hitAt)
 	if not attacker.Parent then
 		return false
 	end
@@ -2632,7 +2644,7 @@ local function predictedStillValid(attacker, plan, hitAt)
 	if not (c and h) then
 		return false
 	end
-	local ok, dist = threatens(attacker, h, plan, math.max(hitAt - os.clock(), 0))
+	local ok, dist = PX.threatens(attacker, h, plan, math.max(hitAt - os.clock(), 0))
 	if ok then
 		return true
 	end
@@ -2648,7 +2660,7 @@ end
 
 -- v7: Block ON gagal gara-gara kekunci (stun abis kena hit / busy / cooldown) tapi masih sempat nyampe
 -- sebelum hit mendarat -> coba lagi begitu kunci kebuka
-local function retryAfterUnlock(attacker, tok, hitAt, rtt, fl, ha, mode)
+function PX.retryAfterUnlock(attacker, tok, hitAt, rtt, fl, ha, mode)
 	if not CFG.RetryAfterUnlock or blockHeld then
 		return
 	end
@@ -2671,9 +2683,9 @@ local function retryAfterUnlock(attacker, tok, hitAt, rtt, fl, ha, mode)
 end
 
 -- Block ON baru dijadwalin. mode "parry" = ngincer window parry, "plain" = cukup block nyala pas hit
-local function scheduleBlock(attacker, plan, tag, lead, sendIn, age, ha, rtt, fl, now, mode, bound)
+function PX.scheduleBlock(attacker, plan, tag, lead, sendIn, age, ha, rtt, fl, now, mode, bound)
 	local hitAt = now + lead
-	local verdict = arbitrate(plan.kind, hitAt, now)
+	local verdict = PX.arbitrate(plan.kind, hitAt, now)
 	if verdict ~= "ok" then
 		return skip(verdict)
 	end
@@ -2708,7 +2720,7 @@ local function scheduleBlock(attacker, plan, tag, lead, sendIn, age, ha, rtt, fl
 	) end
 	local rec = { kind = plan.kind, hit = hitAt, done = false }
 	pending[#pending + 1] = rec
-	guardSwing(attacker, now + sendIn, hitAt)
+	PX.guardSwing(attacker, now + sendIn, hitAt)
 	-- v6: kalau waktunya ditentuin kunci (cooldown block / busy / stun), jangan kirim lebih awal dari kunci kebuka.
 	-- Dulu FireEarly bikin paket keluar setengah frame sebelum kunci kebuka -> ditolak pengecekan sendiri -> hit lolos.
 	rec.handle = schedule(now + sendIn + (bound and frame.avg * CFG.FireEarly or 0), function()
@@ -2726,7 +2738,7 @@ local function scheduleBlock(attacker, plan, tag, lead, sendIn, age, ha, rtt, fl
 			skip("attacker-gone")
 			return
 		end
-		if plan.predicted and not predictedStillValid(attacker, plan, hitAt) then
+		if plan.predicted and not PX.predictedStillValid(attacker, plan, hitAt) then
 			counters.cancelled += 1
 			skip("predict-recheck")
 			return
@@ -2738,13 +2750,13 @@ local function scheduleBlock(attacker, plan, tag, lead, sendIn, age, ha, rtt, fl
 			-- block udah nyala (rencana sebelumnya / chain): M1 cukup ditutup pakai perpanjangan hold
 			counters.chained += 1
 		else
-			retryAfterUnlock(attacker, tok, hitAt, rtt, fl, ha, mode)
+			PX.retryAfterUnlock(attacker, tok, hitAt, rtt, fl, ha, mode)
 		end
 	end)
 end
 
 -- terlalu mepet / kekunci: jalur lama v3.1 (LateMode)
-local function lateFallback(plan, tag, lead, rtt, fl, bound, wait)
+function PX.lateFallback(plan, tag, lead, rtt, fl, bound, wait)
 	if bound then
 		counters.locked += 1
 		skip("locked")
@@ -2816,7 +2828,7 @@ local function react(attacker, plan, tag)
 	if not char or attacker == char then
 		return
 	end
-	local why = cannotAct(char, attacker)
+	local why = PX.cannotAct(char, attacker)
 	if why then
 		return skip(why)
 	end
@@ -2827,16 +2839,16 @@ local function react(attacker, plan, tag)
 
 	local now = os.clock()
 	sampleNet(now)
-	syncBlock(now, char)
+	PX.syncBlock(now, char)
 	local rtt = net.rtt
 	local fl = frameLag()
 	local sigma = sigmaNow()
-	local corr = corrFor(attacker, plan)
+	local corr = PX.corrFor(attacker, plan)
 	local unparry = (plan.spec and plan.spec.Unparryable) and true or false
 
 	-- v7: plan prediksi leadnya jauh (~0.9s) -> cek ancaman pakai horizon pendek, posisi 0.9s ke depan nggak bisa ditebak
 	local isThreat, dist, sure =
-		threatens(attacker, hrp, plan, plan.predicted and math.min(plan.lead + corr, 0.35) or (plan.lead + corr))
+		PX.threatens(attacker, hrp, plan, plan.predicted and math.min(plan.lead + corr, 0.35) or (plan.lead + corr))
 	-- v8: attacker ini lagi nge-combo lu (hit/block barusan) -> tetap ancaman walau cek hitbox meleset (knockback, ping, lunge)
 	if (not isThreat or not sure) and plan.kind == "M1" and CFG.ComboKeep then
 		local cv = comboVictim[attacker]
@@ -2862,7 +2874,7 @@ local function react(attacker, plan, tag)
 	if plan.kind == "M1" then
 		lead = plan.lead + corr
 	else
-		lead = refineLead(plan, dist) + corr
+		lead = PX.refineLead(plan, dist) + corr
 	end
 
 	-- hit bakal mendarat pas lu masih iframe (abis dash) -> nggak perlu
@@ -2921,7 +2933,7 @@ local function react(attacker, plan, tag)
 			end
 		else
 			-- v11.5: rencana M1r itu tebakan -> target umur block digeser lebih awal (hit yang datang lebih cepat dari tebakan tetap ketutup)
-			local tAge = targetAgeFor(isM2)
+			local tAge = PX.targetAgeFor(isM2)
 			if plan.reflex and plan.idx and not isM2 then
 				tAge = math.clamp(math.max(tAge, CFG.ReflexAge), 0.06, SR.ParryWindow - 0.07)
 			end
@@ -2944,7 +2956,7 @@ local function react(attacker, plan, tag)
 		local dodgeWhy = "M2 dodge duluan"
 		-- v5: bandingin peluang sukses parry vs dodge, ambil yang lebih tinggi
 		if not dodgeFirst and canParry and CFG.SmartMode and CFG.DodgeEnabled and CFG.DodgeForM2 and sure then
-			local dOK, _, dAge, _, dd = dodgeProbe(lead, now, rtt, fl)
+			local dOK, _, dAge, _, dd = PX.dodgeProbe(lead, now, rtt, fl)
 			if dOK then
 				local dc = confWindow(dAge, dd.IFrames, sigma)
 				-- v12: statistik hasil M2 style attacker ini (parry vs dodge) ikut ngebobot peluang
@@ -2971,14 +2983,14 @@ local function react(attacker, plan, tag)
 				releaseBefore(now + lead - rtt - fl - 0.03)
 			end
 			if reason == "late" or reason == "locked" then
-				return lateFallback(plan, tag, lead, rtt, fl, bound, wait)
+				return PX.lateFallback(plan, tag, lead, rtt, fl, bound, wait)
 			end
 			return skip(reason == "heldold" and "heldold" or reason)
 		end
 		if mode == "held" then
-			return guardExtend(attacker, plan, tag, lead, now, rtt, fl, ha, "masih di window parry")
+			return PX.guardExtend(attacker, plan, tag, lead, now, rtt, fl, ha, "masih di window parry")
 		end
-		return scheduleBlock(attacker, plan, tag, lead, sendIn, age, ha, rtt, fl, now, "parry", bound)
+		return PX.scheduleBlock(attacker, plan, tag, lead, sendIn, age, ha, rtt, fl, now, "parry", bound)
 	end
 
 	------------------------------------------------------------------
@@ -2986,20 +2998,20 @@ local function react(attacker, plan, tag)
 	------------------------------------------------------------------
 	if canParry then
 		if mode == "held" then
-			return guardExtend(attacker, plan, tag, lead, now, rtt, fl, ha, "masih di window parry")
+			return PX.guardExtend(attacker, plan, tag, lead, now, rtt, fl, ha, "masih di window parry")
 		end
-		return scheduleBlock(attacker, plan, tag, lead, sendIn, age, ha, rtt, fl, now, "parry", bound)
+		return PX.scheduleBlock(attacker, plan, tag, lead, sendIn, age, ha, rtt, fl, now, "parry", bound)
 	end
 
 	if blockHeld and CFG.ChainGuard then
-		return guardExtend(attacker, plan, tag, lead, now, rtt, fl, ha, "block biasa (" .. tostring(reason) .. ")")
+		return PX.guardExtend(attacker, plan, tag, lead, now, rtt, fl, ha, "block biasa (" .. tostring(reason) .. ")")
 	end
 
 	if CFG.BlockFallback and not blockHeld then
 		local s2, a2, b2 = calc(CFG.BlockOnlyAge, 0)
 		if a2 >= -CFG.LateTolerance then
 			if CFG.Trace then trace(("%s dari %s: parry nggak mungkin (%s) -> block biasa"):format(tag, attacker.Name, tostring(reason))) end
-			return scheduleBlock(attacker, plan, tag, lead, s2, a2, ha, rtt, fl, now, "plain", b2)
+			return PX.scheduleBlock(attacker, plan, tag, lead, s2, a2, ha, rtt, fl, now, "plain", b2)
 		end
 		bound = b2
 	end
@@ -3007,7 +3019,7 @@ local function react(attacker, plan, tag)
 	if planDodge(attacker, plan, lead, now, rtt, fl, tag, "block nggak sempat") then
 		return
 	end
-	return lateFallback(plan, tag, lead, rtt, fl, bound, wait)
+	return PX.lateFallback(plan, tag, lead, rtt, fl, bound, wait)
 end
 
 ----------------------------------------------------------------------
@@ -3017,7 +3029,7 @@ end
 -- (HoldToSwing = persis pas busy abis), hit-nya Windup_(i+1) setelahnya. Jadi hit berikutnya = sekarang +
 -- (W_i + E_i) * k + W_(i+1) * k, dihitung dari Sound swing sekarang -> block bisa dikirim jauh sebelum Sound berikutnya
 -- nyampe (yang lead-nya sering < ping). Dicek ulang pas mau dikirim; kalau swing aslinya nongol, di-dedupe.
-local function predictFollowUp(attacker, plan, now)
+function PX.predictFollowUp(attacker, plan, now)
 	if not (alive and CFG.Enabled and CFG.PredictCombo and CFG.BlockFallback) then
 		return
 	end
@@ -3082,7 +3094,7 @@ function SK.gapLearn(attacker, now, kind)
 		return -- combo putus / hit ini bukan lanjutannya
 	end
 	-- leadCorr (belajar dari Sound->Hit) udah nanggung sebagian error; yang disimpan di sini cuma sisanya
-	local target = errTotal - corrFor(attacker, { key = rf.key, kind = "M1" })
+	local target = errTotal - PX.corrFor(attacker, { key = rf.key, kind = "M1" })
 	local cur = SK.gapCorr[attacker.Name] or 0
 	SK.gapCorr[attacker.Name] = math.clamp(cur + (target - cur) * 0.4, -0.25, 0.25)
 end
@@ -3106,14 +3118,14 @@ function SK.predLead(attacker)
 	local k2 = timeScale(attacker, style, nxt)
 	local base = (spec.Endlag or 0.45) * k1 + (nxt.Windup or CFG.DefaultM1Lead) * k2
 	local key = attacker.Name .. ":" .. (st.idx + 1)
-	return base + (CFG.GapLearn and SK.gapCorr[attacker.Name] or 0) + corrFor(attacker, { key = key, kind = "M1" })
+	return base + (CFG.GapLearn and SK.gapCorr[attacker.Name] or 0) + PX.corrFor(attacker, { key = key, kind = "M1" })
 end
 
 -- v8: M1 dari attacker barusan nyampe ke lu (kena / ke-block) -> hit combo berikutnya mendarat Endlag_i*k + Windup_(i+1)*k setelah
 -- hit itu (swing berikutnya mulai pas busy abis, sama kayak predictFollowUp). Bedanya: dihitung dari event HIT yang beneran nyampe
 -- dan dijalanin SETELAH stun/lock ke-update, jadi react nunda Block ON sampai kunci kebuka lalu kirim tepat waktu (parry kalau
 -- umur block masuk window, kalau nggak block biasa, kalau block nggak sempat dodge). Gating dilonggarin lewat comboVictim.
-local function hitReflex(attacker, now)
+function PX.hitReflex(attacker, now)
 	if not (alive and CFG.Enabled and CFG.HitReflex and CFG.BlockFallback) then
 		return
 	end
@@ -3301,7 +3313,7 @@ function SK.m2Recheck(attacker, plan, tag, now)
 	if typeof(attacker) ~= "Instance" then
 		return
 	end
-	local need = targetAgeFor(true) + net.rtt + frameLag() + CFG.M2RecheckSafety
+	local need = PX.targetAgeFor(true) + net.rtt + frameLag() + CFG.M2RecheckSafety
 	local delay = math.min(plan.lead - need, 0.30)
 	if delay < 0.05 then
 		return
@@ -3498,7 +3510,7 @@ function SK.hitGuard(attacker, now, kind, res)
 end
 
 -- v8: belajar seberapa awal block boleh dikirim pas stun lepas. accepted = block yang dikirim pas unlock diterima server.
-local function stunLearn(accepted)
+function PX.stunLearn(accepted)
 	if not CFG.FastUnlock or os.clock() - stunProbeAt > 1.0 then
 		return
 	end
@@ -3510,7 +3522,7 @@ local function stunLearn(accepted)
 	end
 end
 
-local function resyncCombo(attacker, obs)
+function PX.resyncCombo(attacker, obs)
 	local style = styleOf(attacker)
 	local m1 = style and style.M1
 	local swings = type(m1) == "table" and m1.Swings
@@ -3559,7 +3571,7 @@ function SK.outcomesExport()
 	if type(writefile) ~= "function" then
 		return false
 	end
-	local okJ, raw = pcall(HttpService.JSONEncode, HttpService, { v = 1, count = SK.ol.n, rows = SK.outcomes() })
+	local okJ, raw = pcall(PX.HttpService.JSONEncode, PX.HttpService, { v = 1, count = SK.ol.n, rows = SK.outcomes() })
 	if not okJ then
 		return false
 	end
@@ -3676,7 +3688,7 @@ function SK.analyze()
 	return table.concat(out, "\n")
 end
 
-local function tuneBy(kind, dir)
+function PX.tuneBy(kind, dir)
 	if not CFG.Adaptive then
 		return
 	end
@@ -3698,7 +3710,7 @@ end
 
 -- belajar selisih Sound -> Hit per swing (kedua event kena jalur jaringan yang sama,
 -- jadi selisihnya = lead sebenarnya di server, nggak kena ping)
-local function learnLead(attacker, kind, now)
+function PX.learnLead(attacker, kind, now)
 	local rec = swingAt[attacker]
 	if not rec or rec.kind ~= kind then
 		return
@@ -3713,7 +3725,7 @@ local function learnLead(attacker, kind, now)
 	end
 	local err = obs - rec.lead
 	if kind == "M1" and math.abs(err) > 0.06 then
-		resyncCombo(attacker, obs) -- kemungkinan salah index combo, jangan dipelajari
+		PX.resyncCombo(attacker, obs) -- kemungkinan salah index combo, jangan dipelajari
 		return
 	end
 	if rec.learn and rec.key then
@@ -3779,13 +3791,13 @@ function SK.m2Bias(attacker)
 	return math.clamp(pr / 0.75, 1 - lim, 1 + lim * 0.5), math.clamp(dr / 0.75, 1 - lim, 1 + lim * 0.5)
 end
 
-local function onHit(data)
+function PX.onHit(data)
 	local attacker, victim = data.Attacker, data.Victim
 	local myChar = LocalPlayer.Character
 	local now = os.clock()
 
 	if (data.Kind == "M1" or data.Kind == "M2") and typeof(attacker) == "Instance" then
-		learnLead(attacker, data.Kind, now)
+		PX.learnLead(attacker, data.Kind, now)
 	end
 
 	-- gue yang nyerang dan ke-parry -> gue yang stun
@@ -3875,7 +3887,7 @@ local function onHit(data)
 	if res == "Parried" then
 		counters.parried += 1
 		if stunProbeAt == blockOnAt and lastRefusedAt < blockOnAt then
-			stunLearn(true)
+			PX.stunLearn(true)
 		end
 		evt("parry", "PARRY " .. kind .. " · " .. nameOf(attacker))
 		parriedAt = now
@@ -3944,12 +3956,12 @@ local function onHit(data)
 	elseif res == "Blocked" then
 		counters.blocked += 1
 		if stunProbeAt == blockOnAt and lastRefusedAt < blockOnAt then
-			stunLearn(true)
+			PX.stunLearn(true)
 		end
 		evt("block", "block " .. kind .. " · " .. nameOf(attacker))
 		-- ke-Block doang = umur block kegedean (kecepetan) -> kirim lebih lambat
 		if sent and not inParryCd then
-			tuneBy(kind, 1)
+			PX.tuneBy(kind, 1)
 		end
 		if CFG.ChainGuard and kind == "M1" then
 			extendHoldTo(now + CFG.ChainHold + SK.lagPad())
@@ -3958,10 +3970,10 @@ local function onHit(data)
 	elseif res == "GuardBroken" then
 		counters.guardbroken += 1
 		evt("gb", "GUARD BREAK " .. kind .. " · " .. nameOf(attacker))
-		dropLocalBlock()
+		PX.dropLocalBlock()
 		lockedUntil = math.max(lockedUntil, now + SR.GuardBreak - net.rtt / 2)
 		if sent and not inParryCd then
-			tuneBy(kind, 1)
+			PX.tuneBy(kind, 1)
 		end
 		if CFG.Debug then log(("GUARD BREAK %s (tune M1 %+.3f M2 %+.3f%s)"):format(kind, tune.M1, tune.M2, inParryCd and ", parry cooldown" or "")) end
 	elseif res == "Hit" then
@@ -3981,7 +3993,7 @@ local function onHit(data)
 		end
 		-- kena padahal block udah dikirim = kelambatan -> kirim lebih cepat
 		if sent then
-			tuneBy(kind, -1)
+			PX.tuneBy(kind, -1)
 		end
 		local reason = (now - lastSkip.at) < 1.2 and lastSkip.reason or (sent and "block telat" or "nggak ada rencana")
 		if reason == "locked" and lastSkip.src then
@@ -4031,7 +4043,7 @@ local function onHit(data)
 			end
 		end
 	elseif (res == "Hit" or res == "Blocked") and kind == "M1" and typeof(attacker) == "Instance" then
-		local okR, errR = pcall(hitReflex, attacker, now)
+		local okR, errR = pcall(PX.hitReflex, attacker, now)
 		if not okR then
 			trace("hitReflex error:", tostring(errR))
 		end
@@ -4039,7 +4051,7 @@ local function onHit(data)
 end
 
 -- v5: swing dari attacker yang jauh banget nggak perlu diproses
-local function isFar(a)
+function PX.isFar(a)
 	local ahrp = a:FindFirstChild("HumanoidRootPart")
 	local _, hrp = myState()
 	if not ahrp or not hrp then
@@ -4051,7 +4063,7 @@ end
 -- v5: block ditolak server (lagi busy/cooldown) tapi masih ada M1 yang bakal dateng -> coba lagi begitu kunci kebuka
 local retryHandle = nil
 local lastRetryAt, retryWindowAt, retryCount = -math.huge, -math.huge, 0
-local function retryGuard()
+function PX.retryGuard()
 	if not (alive and CFG.Enabled and CFG.BlockFallback) then
 		return
 	end
@@ -4181,7 +4193,7 @@ function SK.tlEvent(data, info, kind)
 	if (info == "Sound" and (kind == "HeavySwing" or Specs.swingSound[kind])) or (info == "Flash" and kind == "Heavy") then
 		return -- udah ditangani jalur v12
 	end
-	if isFar(a) then
+	if PX.isFar(a) then
 		return
 	end
 	local T = SK.tl
@@ -4421,7 +4433,7 @@ function SK.lsSave()
 		if okE and ex then
 			local okR, rawOld = pcall(readfile, CFG.LearnFile)
 			if okR and type(rawOld) == "string" then
-				local okD, old = pcall(HttpService.JSONDecode, HttpService, rawOld)
+				local okD, old = pcall(PX.HttpService.JSONDecode, PX.HttpService, rawOld)
 				if okD and type(old) == "table" and old.sig == sig and type(old.buckets) == "table" then
 					buckets = old.buckets
 				end
@@ -4430,7 +4442,7 @@ function SK.lsSave()
 	end
 	buckets[tostring(math.floor(net.rtt * 1000 / 40))] = { rtt = net.rtt, tune = { M1 = tune.M1, M2 = tune.M2 }, stunSlack = stunSlack }
 	d.buckets = buckets
-	local okJ, raw = pcall(HttpService.JSONEncode, HttpService, d)
+	local okJ, raw = pcall(PX.HttpService.JSONEncode, PX.HttpService, d)
 	if not okJ then
 		return false
 	end
@@ -4454,7 +4466,7 @@ function SK.lsLoad()
 	if not okR or type(raw) ~= "string" then
 		return false
 	end
-	local okD, d = pcall(HttpService.JSONDecode, HttpService, raw)
+	local okD, d = pcall(PX.HttpService.JSONDecode, PX.HttpService, raw)
 	if not okD or type(d) ~= "table" or d.v ~= 13 then
 		return false
 	end
@@ -4674,7 +4686,7 @@ end
 
 local seenKind = {}
 
-local function onCombat(data)
+function PX.onCombat(data)
 	if type(data) ~= "table" then
 		return
 	end
@@ -4692,7 +4704,7 @@ local function onCombat(data)
 		if typeof(a) ~= "Instance" or a == LocalPlayer.Character then
 			return
 		end
-		if isFar(a) then
+		if PX.isFar(a) then
 			return
 		end
 		if kind == "HeavySwing" then
@@ -4700,7 +4712,7 @@ local function onCombat(data)
 			local now = os.clock()
 			if now - (heavySeen[a] or -math.huge) > 0.25 then
 				heavySeen[a] = now
-				local plan = m2Plan(a, nil)
+				local plan = PX.m2Plan(a, nil)
 				swingAt[a] = { t = now, lead = plan.lead, kind = "M2", key = plan.key, skey = plan.skey, learn = plan.learn }
 				lastSwingSeen[a] = now
 				react(a, plan, "M2")
@@ -4709,23 +4721,23 @@ local function onCombat(data)
 			local now = os.clock()
 			trace("swing M1 kebaca dari", a.Name, "sound:", tostring(kind))
 			pcall(SK.iqSoundObs, a, kind) -- v12: bukti style dari nama Sound
-			local plan = m1Plan(a, now)
+			local plan = PX.m1Plan(a, now)
 			swingAt[a] = { t = now, lead = plan.lead, kind = "M1", key = plan.key, skey = plan.skey, learn = plan.learn }
 			lastSwingSeen[a] = now
 			react(a, plan, "M1")
-			predictFollowUp(a, plan, now)
+			PX.predictFollowUp(a, plan, now)
 		elseif CFG.Trace and not seenKind[tostring(kind)] then
 			seenKind[tostring(kind)] = true
 			trace("sound lain (nggak dianggap swing):", tostring(kind))
 		end
 	elseif info == "Flash" and kind == "Heavy" then
 		local a, hold = data.Character, data.Hold
-		if typeof(a) == "Instance" and a ~= LocalPlayer.Character and type(hold) == "number" and not isFar(a) then
+		if typeof(a) == "Instance" and a ~= LocalPlayer.Character and type(hold) == "number" and not PX.isFar(a) then
 			local now = os.clock()
 			trace("heavy M2 kebaca dari", a.Name, "hold:", hold)
 			heavySeen[a] = now
 			pcall(SK.iqHeavyObs, a, hold) -- v12: bukti style dari Hold Flash Heavy
-			local plan = m2Plan(a, hold)
+			local plan = PX.m2Plan(a, hold)
 			swingAt[a] = { t = now, lead = plan.lead, kind = "M2", key = plan.key, skey = plan.skey, learn = plan.learn }
 			lastSwingSeen[a] = now
 			react(a, plan, "M2")
@@ -4739,21 +4751,21 @@ local function onCombat(data)
 			swingAt[a] = nil
 		end
 	elseif info == "Hit" then
-		onHit(data)
+		PX.onHit(data)
 	elseif info == "BlockRefused" then
 		local untilServer = data.Until
 		if type(untilServer) == "number" then
 			lockedUntil = math.max(lockedUntil, os.clock() + math.max(0, untilServer - workspace:GetServerTimeNow()))
 		end
 		if stunProbeAt == blockOnAt and os.clock() - blockOnAt < net.rtt + 0.4 then
-			stunLearn(false) -- v8: block pas-unlock ditolak -> kita kemaleman? bukan, kecepetan -> pengaman dinaikin
+			PX.stunLearn(false) -- v8: block pas-unlock ditolak -> kita kemaleman? bukan, kecepetan -> pengaman dinaikin
 		end
 		lastRefusedAt = os.clock()
 		counters.refused += 1
-		dropLocalBlock()
+		PX.dropLocalBlock()
 		if CFG.Debug then log(("block ditolak server (sisa %.2fs)"):format(math.max(0, lockedUntil - os.clock()))) end
 		if CFG.GuardRetryOnRefuse then
-			retryGuard()
+			PX.retryGuard()
 		end
 		evt("info", ("block ditolak server (sisa %.2fs)"):format(math.max(lockedUntil - os.clock(), 0)))
 		-- v11.4/v11.5: guard abis ke-parry / abis kena ditolak server (stun hit nambah dll) -> coba lagi begitu kunci beneran kebuka
@@ -4776,7 +4788,7 @@ end
 local Maint = { g = { ping = {}, fps = {}, cpu = {}, head = 0, count = 0 }, nextHeal = 0, nextGraph = 0 }
 local G_N = 60
 
-local function resetCombatState(why)
+function PX.resetCombatState(why)
 	for i = 1, #queue do
 		queue[i].dead = true
 	end
@@ -4819,7 +4831,7 @@ local function resetCombatState(why)
 end
 
 -- timer yang nilainya mustahil (bug / data bogus dari server) dirapihin. Nilai normal nggak disentuh.
-local function selfHeal(now)
+function PX.selfHeal(now)
 	local fixed = false
 	if lockedUntil > now + 3 then
 		lockedUntil, fixed = now + 3, true
@@ -4879,7 +4891,7 @@ end
 function Maint.tick(now)
 	if CFG.SelfHeal and now >= Maint.nextHeal then
 		Maint.nextHeal = now + 0.5
-		selfHeal(now)
+		PX.selfHeal(now)
 	end
 	if now >= Maint.nextGraph then
 		Maint.nextGraph = now + 1
@@ -4898,7 +4910,7 @@ table.insert(
 	LocalPlayer.CharacterAdded:Connect(function()
 		counters.respawns += 1
 		if CFG.RespawnReset then
-			resetCombatState("respawn")
+			PX.resetCombatState("respawn")
 		end
 	end)
 )
@@ -4906,7 +4918,7 @@ table.insert(
 	connections,
 	LocalPlayer.CharacterRemoving:Connect(function()
 		if CFG.RespawnReset then
-			resetCombatState("mati")
+			PX.resetCombatState("mati")
 		end
 	end)
 )
@@ -4914,7 +4926,7 @@ table.insert(
 ----------------------------------------------------------------------
 -- REPORT
 ----------------------------------------------------------------------
-local function report()
+function PX.report()
 	local c, s = {}, {}
 	for k, v in pairs(counters) do
 		table.insert(c, k .. "=" .. v)
@@ -4938,10 +4950,10 @@ local function report()
 			(CFG.UseGameBlock and hh and type(hh.SetLocalBlocking) == "function") and "ya" or "nggak"
 		)
 	)
-	local dd = dashOf()
+	local dd = PX.dashOf()
 	print(
 		("[AutoParry] dodge : siap dalam %.1fs | iframe %.2fs cd %.2fs | lewat %s"):format(
-			dodgeWait(os.clock()), dd.IFrames, dd.Cooldown, dodgeLocal() and "game TryDodge" or "remote langsung"
+			dodgeWait(os.clock()), dd.IFrames, dd.Cooldown, PX.dodgeLocal() and "game TryDodge" or "remote langsung"
 		)
 	)
 	print(
@@ -4958,7 +4970,7 @@ local function report()
 end
 
 -- v8: kenapa kena hit (20 terakhir kecatat, 10 ditampilin). Kirim hasilnya kalau masih sering kena.
-local function whyReport()
+function PX.whyReport()
 	if #whyLog == 0 then
 		print("[AutoParry:why] belum ada hit yang kecatat")
 		return
@@ -5014,7 +5026,7 @@ local function frameTick(dt, now)
 	-- v6: samain status block lokal sama server (10x per detik, cuma kalau block lagi nyala)
 	if blockHeld and now - lastSync >= 0.1 then
 		lastSync = now
-		syncBlock(now, char)
+		PX.syncBlock(now, char)
 	end
 end
 
@@ -5023,7 +5035,7 @@ table.insert(
 	connections,
 	Combat.OnClientEvent:Connect(function(data)
 		local t0 = os.clock()
-		onCombat(data)
+		PX.onCombat(data)
 		cpuAcc += os.clock() - t0
 	end)
 )
@@ -5050,7 +5062,7 @@ end
 
 table.insert(
 	connections,
-	RunService.Heartbeat:Connect(function(dt)
+	PX.RunService.Heartbeat:Connect(function(dt)
 		local t0 = os.clock()
 		local now = t0
 		-- bagian ini nggak boleh sampai ngebunuh pemrosesan antrean
@@ -5081,10 +5093,10 @@ table.insert(
 
 do
 	local okPre, preStep = pcall(function()
-		return RunService.PreRender
+		return PX.RunService.PreRender
 	end)
 	if not okPre or not preStep then
-		preStep = RunService.RenderStepped
+		preStep = PX.RunService.RenderStepped
 	end
 	table.insert(
 		connections,
@@ -5099,7 +5111,7 @@ end
 -- v9: titik cek ke-3 buat antrean (PreSimulation). Tetap dipasang, dinyalain/matiin lewat CFG.FramePump3.
 do
 	local okSim, sim = pcall(function()
-		return RunService.PreSimulation
+		return PX.RunService.PreSimulation
 	end)
 	if okSim and sim then
 		table.insert(
@@ -5117,7 +5129,7 @@ end
 
 table.insert(
 	connections,
-	UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	PX.UserInputService.InputBegan:Connect(function(input, gameProcessed)
 		-- v9: lagi nunggu tombol baru dari tab Setelan
 		if UI.capture and input.UserInputType == Enum.UserInputType.Keyboard then
 			local cb = UI.capture
@@ -5159,7 +5171,7 @@ table.insert(
 	end)
 )
 
-local function resetStats()
+function PX.resetStats()
 	for k in pairs(counters) do
 		counters[k] = 0
 	end
@@ -5220,7 +5232,7 @@ function Store.save()
 			data[k] = v
 		end
 	end
-	local okJ, raw = pcall(HttpService.JSONEncode, HttpService, data)
+	local okJ, raw = pcall(PX.HttpService.JSONEncode, PX.HttpService, data)
 	if not okJ then
 		return false
 	end
@@ -5239,7 +5251,7 @@ function Store.load()
 	if not okR or type(raw) ~= "string" then
 		return false
 	end
-	local okD, data = pcall(HttpService.JSONDecode, HttpService, raw)
+	local okD, data = pcall(PX.HttpService.JSONDecode, PX.HttpService, raw)
 	if not okD or type(data) ~= "table" then
 		return false
 	end
@@ -5308,14 +5320,14 @@ end
 ----------------------------------------------------------------------
 -- RINGKASAN TEKS (tombol "Salin ringkasan" + getgenv().__NyxAutoParry.Summary())
 ----------------------------------------------------------------------
-local function summaryText()
+function PX.summaryText()
     local c = counters
     local landed = c.parried + c.blocked + c.guardbroken + c.hit
     local all = landed + c.dodged
     local rate = all > 0 and (c.parried + c.blocked + c.dodged) / all * 100 or 100
     local parryRate = landed > 0 and c.parried / landed * 100 or 0
     return table.concat({
-        ("AutoParry v13.7 | parry %d  block %d  dodge %d  kena %d  gb %d | aman %.0f%% | parry-rate %.0f%%"):format(
+        ("AutoParry v13.8 | parry %d  block %d  dodge %d  kena %d  gb %d | aman %.0f%% | parry-rate %.0f%%"):format(
             c.parried, c.blocked, c.dodged, c.hit, c.guardbroken, rate, parryRate
         ),
         ("rtt %.0fms (±%.0f) | fps %.0f (p90 %.0fms, spike %d) | cpu %.0fus/frame (max %.0fus)"):format(
@@ -5356,8 +5368,8 @@ function SK.dump()
     local function add(s)
         out[#out + 1] = s
     end
-    add("== AutoParry live dump · v13.7 ==")
-    add(summaryText())
+    add("== AutoParry live dump · v13.8 ==")
+    add(PX.summaryText())
     local r1, r2 = SK.live(now)
     add(r1)
     add(r2)
@@ -5407,15 +5419,15 @@ end
 -- API + START
 ----------------------------------------------------------------------
 genv.__NyxAutoParry = {
-    Version = "13.7",
+    Version = "13.8",
     CFG = CFG,
     Counters = counters,
     Skips = skips,
     Net = net,
     Frame = frame,
     Events = EV,
-    Report = report,
-    Summary = summaryText,
+    Report = PX.report,
+    Summary = PX.summaryText,
     State = function()
         local now = os.clock()
         return {
@@ -5424,7 +5436,7 @@ genv.__NyxAutoParry = {
             stunSlack = stunSlack, tuneM1 = tune.M1, tuneM2 = tune.M2, blockFor = blockFor ~= nil,
         }
     end,
-    Why = whyReport,
+    Why = PX.whyReport,
     StyleIQ = SK.iqReport,
     DodgeInfo = SK.ddInfoPrint,
     Doctor = SK.doctor,
@@ -5434,7 +5446,7 @@ genv.__NyxAutoParry = {
     Outcomes = SK.outcomes,
     ExportOutcomes = SK.outcomesExport,
     Analyze = SK.analyze,
-    Reset = resetStats,
+    Reset = PX.resetStats,
     Save = Store.save,
     Store = Store,
     Load = Store.load,
@@ -5443,7 +5455,7 @@ genv.__NyxAutoParry = {
         alive = false
         pcall(Store.save)
         pcall(SK.lsSave)
-        pcall(uninstallSwingHook)
+        pcall(PX.uninstallSwingHook)
         if blockHeld then
             pcall(sendBlock, false)
             blockHeld = false
@@ -5491,11 +5503,11 @@ if (CFG.MigratedTo or 0) < 5 then
     CFG.MigratedTo = 5
     Store.touch()
 end
-task.spawn(loadSpecs)
+task.spawn(PX.loadSpecs)
 task.spawn(SK.lsStart) -- v13: muat hasil belajar sesi lalu (nunggu spec ke-load), simpan berkala
 task.spawn(function()
     for _ = 1, 60 do
-        if not alive or installSwingHook() then
+        if not alive or PX.installSwingHook() then
             return
         end
         task.wait(0.5)
@@ -5503,13 +5515,16 @@ task.spawn(function()
 end)
 
 
-notify("v13.7 loaded - tekan " .. CFG.ToggleKey.Name .. " buat toggle")
-log("loaded v13.7. toggle:", CFG.ToggleKey.Name, "| UI:", CFG.UIKey.Name, "| getgenv().__NyxAutoParry.Summary() buat ringkasan")
+notify("v13.8 loaded - tekan " .. CFG.ToggleKey.Name .. " buat toggle")
+log("loaded v13.8. toggle:", CFG.ToggleKey.Name, "| UI:", CFG.UIKey.Name, "| getgenv().__NyxAutoParry.Summary() buat ringkasan")
 
 end
 
-local SRC = {}
-SRC.lag = [=====[
+-- =====================================================================
+--  NONO ANTI-LAG v6.0 (v13.8: fungsi biasa, bukan string + loadstring)
+-- =====================================================================
+local function __startNono()
+local NX = {} -- v13.8: namespace buat local yang jarang dipakai (hemat slot local, batas Luau 200)
 -- Nono Anti-Lag v6.0
 
 local Players          = game:GetService("Players")
@@ -5800,7 +5815,7 @@ end
 -- Template efek di ReplicatedStorage dinetralin sekali, jadi hasil Clone() udah mati dari lahir
 -- (Emit() di template yang sudah dinetralin nggak ngeluarin apa-apa).
 local RepStorage = game:GetService("ReplicatedStorage")
-local function killTemplates()
+function NX.killTemplates()
     task.spawn(function()
         local list = RepStorage:GetDescendants()
         local t0 = os.clock()
@@ -6022,9 +6037,9 @@ local nBtn = new("TextButton", {
     Position = UDim2.new(1, -30, 0.5, -12), BorderSizePixel = 0, ZIndex = 5,
 }, header)
 corner(nBtn, FULL)
-local nStroke = new("UIStroke", {Color = Color3.fromRGB(0, 180, 90), Thickness = 1}, nBtn)
+NX.nStroke = new("UIStroke", {Color = Color3.fromRGB(0, 180, 90), Thickness = 1}, nBtn)
 
-local bodyWrap = new("Frame", {
+NX.bodyWrap = new("Frame", {
     Name = "BodyWrapper", Size = UDim2.new(1, 0, 0, 210), BackgroundTransparency = 1,
     BorderSizePixel = 0, LayoutOrder = 1, ClipsDescendants = true,
 }, main)
@@ -6035,7 +6050,7 @@ local scroll = new("ScrollingFrame", {
     ScrollBarImageColor3 = Color3.fromRGB(0, 200, 100), ScrollBarImageTransparency = 0.3,
     CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y,
     ScrollingDirection = Enum.ScrollingDirection.Y, ElasticBehavior = Enum.ElasticBehavior.Never,
-}, bodyWrap)
+}, NX.bodyWrap)
 local body = scroll
 new("UIListLayout", {
     FillDirection = Enum.FillDirection.Vertical, SortOrder = Enum.SortOrder.LayoutOrder,
@@ -6057,7 +6072,7 @@ local fpsRow = new("Frame", {
 }, body)
 corner(fpsRow, 6)
 
-local function fpsCol(x, title, valColor)
+function NX.fpsCol(x, title, valColor)
     local col = new("Frame", {
         Size = UDim2.new(0.5, 0, 1, 0), Position = UDim2.new(x, 0, 0, 0),
         BackgroundTransparency = 1, BorderSizePixel = 0,
@@ -6067,14 +6082,14 @@ local function fpsCol(x, title, valColor)
         Size = UDim2.new(1, 0, 0, 16), Position = UDim2.new(0, 0, 0, 18),
     })
 end
-local fpsBeforeVal = fpsCol(0, "BEFORE", Color3.fromRGB(200, 100, 80))
+local fpsBeforeVal = NX.fpsCol(0, "BEFORE", Color3.fromRGB(200, 100, 80))
 new("Frame", {
     Size = UDim2.new(0, 1, 0.55, 0), Position = UDim2.new(0.5, 0, 0.225, 0),
     BackgroundColor3 = Color3.fromRGB(50, 50, 50), BorderSizePixel = 0,
 }, fpsRow)
-local fpsAfterVal = fpsCol(0.5, "AFTER", DIM)
+local fpsAfterVal = NX.fpsCol(0.5, "AFTER", DIM)
 
-local function infoRow(name, val, color)
+function NX.infoRow(name, val, color)
     local row = new("Frame", {
         Size = UDim2.new(1, 0, 0, 20), BackgroundColor3 = PANEL, BorderSizePixel = 0,
         LayoutOrder = nextOrd(),
@@ -6088,7 +6103,7 @@ local function infoRow(name, val, color)
     })
 end
 
-local statusVal = infoRow("STATUS", "● READY", GREEN)
+local statusVal = NX.infoRow("STATUS", "● READY", GREEN)
 
 local applyBtn = new("TextButton", {
     Text = "⚡ APPLY NUKE", Font = Enum.Font.Code, TextSize = 10,
@@ -6098,7 +6113,7 @@ local applyBtn = new("TextButton", {
 corner(applyBtn, 6)
 applyBtn.MouseButton1Click:Connect(function() applyNuke() end)
 
-local function btnRow()
+function NX.btnRow()
     local r = new("Frame", {
         Size = UDim2.new(1, 0, 0, 24), BackgroundTransparency = 1, LayoutOrder = nextOrd(),
     }, body)
@@ -6108,7 +6123,7 @@ local function btnRow()
     return r
 end
 
-local function smallBtn(parent, txt, color, n, onClick)
+function NX.smallBtn(parent, txt, color, n, onClick)
     local b = new("TextButton", {
         Text = txt, Font = Enum.Font.Code, TextSize = 9, TextColor3 = color,
         BackgroundColor3 = Color3.fromRGB(30, 30, 30), BorderSizePixel = 0,
@@ -6119,9 +6134,9 @@ local function smallBtn(parent, txt, color, n, onClick)
     return b
 end
 
-local actionRow = btnRow()
-smallBtn(actionRow, "↺ RESTORE", Color3.fromRGB(200, 200, 200), 2, function() restoreAll() end)
-smallBtn(actionRow, "✕ UNLOAD", Color3.fromRGB(220, 90, 80), 2, function() unload() end)
+NX.actionRow = NX.btnRow()
+NX.smallBtn(NX.actionRow, "↺ RESTORE", Color3.fromRGB(200, 200, 200), 2, function() restoreAll() end)
+NX.smallBtn(NX.actionRow, "✕ UNLOAD", Color3.fromRGB(220, 90, 80), 2, function() unload() end)
 
 local logBox = new("TextLabel", {
     Text = "ready.", Font = Enum.Font.Code, TextSize = 8, TextColor3 = Color3.fromRGB(80, 80, 80),
@@ -6136,13 +6151,13 @@ new("UIPadding", {
 local function log(msg) logBox.Text = "> " .. msg end
 local function setStatus(t, c) statusVal.Text = t; statusVal.TextColor3 = c end
 
-local plrVal    = infoRow("Players", "1 online", BLUE)
-local netVal    = infoRow("Ping / Mem", "-- / --", BLUE)
-local hiddenVal = infoRow("Hidden", "0 parts", BLUE)
+NX.plrVal    = NX.infoRow("Players", "1 online", BLUE)
+NX.netVal    = NX.infoRow("Ping / Mem", "-- / --", BLUE)
+NX.hiddenVal = NX.infoRow("Hidden", "0 parts", BLUE)
 
 local activeSlider
 
-local function makeSlider(name, init, minV, maxV, color, snap, onChange)
+function NX.makeSlider(name, init, minV, maxV, color, snap, onChange)
     local frame = new("Frame", {
         Size = UDim2.new(1, 0, 0, 44), BackgroundColor3 = ROW, BorderSizePixel = 0,
         LayoutOrder = nextOrd(),
@@ -6209,18 +6224,18 @@ local function makeSlider(name, init, minV, maxV, color, snap, onChange)
     return s
 end
 
-local capSlider = makeSlider("FPS Cap (bypass)", fpsCapValue, 30, 300, BLUE, 5, function(v)
+NX.capSlider = NX.makeSlider("FPS Cap (bypass)", fpsCapValue, 30, 300, BLUE, 5, function(v)
     fpsCapValue = v
     -- v13.5: kalau hub megang cap (Buka batas FPS nyala), Nono cuma nyatet nilainya, nggak ikut nyetel (anti rebutan)
     if not env.NonoHubCap then tryFPSCap(v) end
 end)
 
-local distSlider = makeSlider("Render Distance", userDist, 64, 1024, Color3.fromRGB(0, 200, 100), 64,
+NX.distSlider = NX.makeSlider("Render Distance", userDist, 64, 1024, Color3.fromRGB(0, 200, 100), 64,
     function(v) userDist = v end)
 
 local toggleRefresh = {}
 
-local PRESETS = {
+NX.PRESETS = {
     {"SAFE", {texture = true, shadow = true, post = true, leaf = false, fx = false,
         anchor = false, sky = false, aggr = false}, 768},
     {"BALANCED", {texture = true, shadow = true, post = true, leaf = true, fx = true,
@@ -6229,22 +6244,22 @@ local PRESETS = {
         anchor = true, sky = true, aggr = true}, 256},
 }
 
-local function applyPreset(p)
+function NX.applyPreset(p)
     for k, v in pairs(p[2]) do
         state[k] = v
         if toggleRefresh[k] then toggleRefresh[k](true) end
     end
-    userDist = distSlider.set(p[3])
+    userDist = NX.distSlider.set(p[3])
     saveConfig()
     log("preset " .. p[1] .. ", tekan APPLY")
 end
 
-local presetRow = btnRow()
-for _, p in ipairs(PRESETS) do
-    smallBtn(presetRow, p[1], BLUE, 3, function() applyPreset(p) end)
+NX.presetRow = NX.btnRow()
+for _, p in ipairs(NX.PRESETS) do
+    NX.smallBtn(NX.presetRow, p[1], BLUE, 3, function() NX.applyPreset(p) end)
 end
 
-local function makeToggle(name, key)
+function NX.makeToggle(name, key)
     local row = new("Frame", {
         Size = UDim2.new(1, 0, 0, 26), BackgroundColor3 = ROW, BorderSizePixel = 0,
         LayoutOrder = nextOrd(),
@@ -6293,18 +6308,18 @@ for _, t in ipairs({
     {"Kill Skybox", "sky"}, {"Aggressive", "aggr"}, {"Adaptive FPS", "adaptive"},
     {"Auto Apply", "auto"},
 }) do
-    makeToggle(t[1], t[2])
+    NX.makeToggle(t[1], t[2])
 end
 
 local bodyVisible = true
 nBtn.MouseButton1Click:Connect(function()
     bodyVisible = not bodyVisible
-    bodyWrap.Visible = bodyVisible
+    NX.bodyWrap.Visible = bodyVisible
     local c = bodyVisible and GREEN or Color3.fromRGB(120, 120, 120)
     local info = TweenInfo.new(0.15)
     TweenService:Create(dot, info, {BackgroundColor3 = c}):Play()
     TweenService:Create(nBtn, info, {TextColor3 = c}):Play()
-    TweenService:Create(nStroke, info, {
+    TweenService:Create(NX.nStroke, info, {
         Color = bodyVisible and Color3.fromRGB(0, 180, 90) or Color3.fromRGB(80, 80, 80),
     }):Play()
 end)
@@ -6364,7 +6379,7 @@ trackConn(UserInputService.InputBegan:Connect(function(input, gp)
 end))
 
 local okStreak = 0
-local function adaptiveStep()
+function NX.adaptiveStep()
     if not state.adaptive then tier = 0; return end
     -- Ambang turun 60% dari cap supaya cap rendah tidak memicu adaptive terus.
     local low  = math.min(CFG.fpsLowThreshold, fpsCapValue * 0.75)
@@ -6389,7 +6404,7 @@ local function adaptiveStep()
     end
 end
 
-local function applyGlobals()
+function NX.applyGlobals()
     pset(rs, "QualityLevel", Enum.QualityLevel.Level01)
     pset(rs, "MeshPartDetailLevel", Enum.MeshPartDetailLevel.Level04)
     if state.shadow then
@@ -6415,13 +6430,13 @@ local function applyGlobals()
     end
 end
 
-local function setApplyIdle()
+function NX.setApplyIdle()
     applyBtn.Text = "⚡ APPLY NUKE"
     applyBtn.BackgroundColor3 = Color3.fromRGB(0, 220, 110)
     applyBtn.TextColor3 = Color3.new(0, 0, 0)
 end
 
-local function onNukeDone()
+function NX.onNukeDone()
     nukeActive = false
     log(nukeTotal .. " obj | " .. culledN .. " hidden ✓")
     setStatus(tier > 0 and "● ADAPTIVE T" .. tier or "● ACTIVE", tier > 0 and AMBER or GREEN)
@@ -6443,8 +6458,8 @@ applyNuke = function()
     applyBtn.TextColor3 = Color3.fromRGB(0, 220, 110)
     local capOk = env.NonoHubCap and true or tryFPSCap(fpsCapValue)
     log("fps cap " .. fpsCapValue .. (capOk and " ✓" or " (no executor)"))
-    applyGlobals()
-    if state.fx then killTemplates() end
+    NX.applyGlobals()
+    if state.fx then NX.killTemplates() end
     local list = workspace:GetDescendants()
     table.move(list, 1, #list, qt + 1, queue)
     qt += #list
@@ -6452,7 +6467,7 @@ applyNuke = function()
 end
 
 -- Sinkron saat unload supaya state sudah bersih sebelum skrip berikutnya berjalan.
-local function runRestore(sync)
+function NX.runRestore(sync)
     applied, nukeActive, tier = false, false, 0
     queue, qh, qt = {}, 1, 0
     local t0 = os.clock()
@@ -6487,8 +6502,8 @@ restoreAll = function()
     busy = true
     setStatus("● RESTORING", AMBER)
     task.spawn(function()
-        runRestore(false)
-        setApplyIdle()
+        NX.runRestore(false)
+        NX.setApplyIdle()
         fpsAfterVal.Text = "-- fps"
         fpsAfterVal.TextColor3 = DIM
         setStatus("● READY", GREEN)
@@ -6502,7 +6517,7 @@ unload = function()
     alive = false
     for _, c in ipairs(CONNECTIONS) do pcall(function() c:Disconnect() end) end
     for _, c in pairs(guardConn) do pcall(function() c:Disconnect() end) end
-    runRestore(true)
+    NX.runRestore(true)
     if env.NonoCleanup == unload then env.NonoCleanup = nil end
     env.NonoAPI = nil
     sg:Destroy()
@@ -6596,14 +6611,14 @@ trackConn(RunService.Heartbeat:Connect(function(dt)
             logTimer = 0
             log("nuking " .. math.min(nukeDone, nukeTotal) .. "/" .. nukeTotal)
         end
-        if qh > qt then onNukeDone() end
+        if qh > qt then NX.onNukeDone() end
         return
     end
 
     lodTimer += dt
     if lodTimer >= 1 then lodTimer = 0; updatePlayerLOD() end
     adaptTimer += dt
-    if adaptTimer >= 3 then adaptTimer = 0; adaptiveStep() end
+    if adaptTimer >= 3 then adaptTimer = 0; NX.adaptiveStep() end
 end))
 
 task.spawn(function()
@@ -6618,14 +6633,14 @@ task.spawn(function()
         if n % 2 == 0 then
             pcall(function()
                 local c = #Players:GetPlayers()
-                plrVal.Text = c .. " online"
-                plrVal.TextColor3 = c > 10 and Color3.fromRGB(220, 130, 60)
+                NX.plrVal.Text = c .. " online"
+                NX.plrVal.TextColor3 = c > 10 and Color3.fromRGB(220, 130, 60)
                     or c > 5 and Color3.fromRGB(220, 200, 60) or BLUE
-                hiddenVal.Text = culledN .. " parts"
+                NX.hiddenVal.Text = culledN .. " parts"
                 local okP, ping = pcall(function()
                     return Stats.Network.ServerStatsItem["Data Ping"]:GetValue()
                 end)
-                netVal.Text = (okP and math.floor(ping) or "--") .. "ms / "
+                NX.netVal.Text = (okP and math.floor(ping) or "--") .. "ms / "
                     .. math.floor(Stats:GetTotalMemoryUsageMb()) .. "MB"
             end)
         end
@@ -6646,7 +6661,7 @@ trackConn(Lighting.ChildAdded:Connect(function(v)
 end))
 
 -- v13.5: API buat hub. Hub dulu scrape teks GUI + getconnections (slider mati kalau executor nggak punya getconnections).
-local TOGGLE_KEY = {
+NX.TOGGLE_KEY = {
     ["Nuke Texture"] = "texture", ["Kill Shadow"] = "shadow", ["Kill Post FX"] = "post",
     ["Hide Leaves"] = "leaf", ["Kill FX"] = "fx", ["Anchor Parts"] = "anchor",
     ["Kill Skybox"] = "sky", ["Aggressive"] = "aggr", ["Adaptive FPS"] = "adaptive", ["Auto Apply"] = "auto",
@@ -6656,9 +6671,9 @@ env.NonoAPI = {
     Apply = function() applyNuke() end,
     Restore = function() restoreAll() end,
     Unload = function() unload() end,
-    GetToggle = function(name) return state[TOGGLE_KEY[name] or name] end,
+    GetToggle = function(name) return state[NX.TOGGLE_KEY[name] or name] end,
     SetToggle = function(name, v)
-        local k = TOGGLE_KEY[name] or name
+        local k = NX.TOGGLE_KEY[name] or name
         if state[k] == nil then return false end
         state[k] = v and true or false
         if toggleRefresh[k] then toggleRefresh[k](true) end
@@ -6667,7 +6682,7 @@ env.NonoAPI = {
     end,
     GetCap = function() return fpsCapValue end,
     SetCap = function(v, silent)
-        fpsCapValue = capSlider.set(v)
+        fpsCapValue = NX.capSlider.set(v)
         if not silent then
             tryFPSCap(fpsCapValue)
             saveConfig()
@@ -6676,14 +6691,14 @@ env.NonoAPI = {
     end,
     GetDist = function() return userDist end,
     SetDist = function(v)
-        userDist = distSlider.set(v)
+        userDist = NX.distSlider.set(v)
         saveConfig()
         return userDist
     end,
     Preset = function(name)
-        for _, pr in ipairs(PRESETS) do
+        for _, pr in ipairs(NX.PRESETS) do
             if pr[1] == name then
-                applyPreset(pr)
+                NX.applyPreset(pr)
                 return true
             end
         end
@@ -6706,12 +6721,12 @@ end
 print("[NONO v6.0] loaded | setfpscap:", HAS_SETFPSCAP, "| sethiddenproperty:", HAS_SETHIDDEN,
     "| file:", HAS_FILE)
 
-]=====]
+end
 
 -- =====================================================================
 --  DASAR
 -- =====================================================================
-local VERSION = "13.7"
+local VERSION = "13.8"
 
 local Players      = game:GetService("Players")
 local RunService   = game:GetService("RunService")
@@ -7006,14 +7021,18 @@ function K.srcOf(f)
     if ok and type(s) == "string" then return s end
     return nil
 end
--- redam handler UIS.InputBegan milik modul tertentu (dikenali dari chunkname SIFB_<key>)
+-- redam handler UIS.InputBegan bawaan modul (v13.8: dikenali dari snapshot waktu modul diload = m.began;
+-- chunkname SIFB_<key> sudah nggak ada karena Nono bukan loadstring lagi)
 function K.muteKeys(key)
     if not S.mute or not CAP.getconnections then return 0 end
     local n = 0
-    for _, it in ipairs(K.conList(UIS.InputBegan)) do
-        local s = K.srcOf(it.f)
-        if s and s:find("SIFB_" .. key, 1, true) then
-            local c = it.c
+    local m = MOD[key]
+    local mySrc = K.srcOf(__startNono)
+    for _, c in ipairs((m and m.began) or {}) do
+        -- sumber handler harus file ini sendiri (LocalScript game punya sumber lain dan nggak boleh ikut diredam)
+        local okF, f = pcall(function() return c.Function end)
+        local s = (okF and f) and K.srcOf(f) or nil
+        if not (mySrc and s) or s == mySrc then
             if pcall(function() c:Disable() end) then MUTED[#MUTED + 1] = c; n = n + 1 end
         end
     end
@@ -7084,14 +7103,15 @@ function K.loadMod(key)
         end)
         return
     end
-    local ld = loadstring or load
-    if not ld then m.state, m.err = "missing", "executor tidak punya loadstring"; return end
-    local fn, err = ld(SRC[key], "=SIFB_" .. key)
-    if not fn then m.state, m.err = "missing", tostring(err); return end
+    -- v13.8: Nono = fungsi biasa (__startNono), bukan string + loadstring. Syntax-nya kecek pas file di-load.
+    local fn = (key == "lag") and __startNono or nil
+    if not fn then m.state, m.err = "missing", "modul tidak dikenal: " .. tostring(key); return end
     local before = K.snap(UIS.InputEnded)
+    local beforeB = K.snap(UIS.InputBegan)
     local ok, e = pcall(fn)
     if not ok then m.state, m.err = "missing", tostring(e); return end
     m.ended = K.diff(UIS.InputEnded, before)
+    m.began = K.diff(UIS.InputBegan, beforeB)
 end
 
 function K.reattach(key)
@@ -9448,7 +9468,7 @@ do
     W.btnRow(p, { { "Matikan semua dan tutup", "dng", K.shutdownAll, 1, true } })
 
     local c5 = W.card(p)
-    W.row(c5, "Auto parry v" .. VERSION, "UI Skill issue final boss · By Duke · parry v13.7 dan Nono dikendalikan dari hub ini", false, 0)
+    W.row(c5, "Auto parry v" .. VERSION, "UI Skill issue final boss · By Duke · parry v13.8 dan Nono dikendalikan dari hub ini", false, 0)
 end
 BT = nil
 
