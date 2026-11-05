@@ -1,6 +1,6 @@
 --!nonstrict
 --[[
-  AUTO PARRY v13.6  |  UI: Skill issue final boss (By Duke)
+  AUTO PARRY v13.7  |  UI: Skill issue final boss (By Duke)
 
   Isi file ini:
     1. Auto parry v13.2 UTUH (logika parry / dodge / learning tidak diubah).
@@ -18,6 +18,19 @@
   Tombol bulat: ketuk = buka/tutup | tahan = mode ringkas | tarik = pindah
   Hotkey default: RightAlt hub | F4 anti-lag | P toggle parry (bisa diubah di Setelan)
   Konfigurasi hub: AP13_hub.json | konfigurasi parry: tetap NyxAutoParry_v9.json
+
+  v13.7 (anti-lag: VFX beneran ilang + frame time lebih rata, logika parry inti TIDAK diubah):
+    - FIX VFX / partikel nggak ilang: ParticleEmitter:Emit() tetap jalan walau Enabled = false (itu cara game bikin efek hit / skill).
+      Sekarang emitter dimatiin lewat Lifetime 0 + Size 0 + transparan penuh; beam / trail / highlight dibuat transparan juga.
+    - Efek baru dimatiin SAAT ITU JUGA di DescendantAdded (dulu lewat antrian, VFX sempat tampil beberapa frame).
+    - Template efek di ReplicatedStorage dinetralin sekali pas Apply, jadi hasil Clone() udah mati dari lahir.
+    - Kill FX nyapu juga: part efek (VFX mesh / neon, folder bernama VFX / FX / Effects / Debris, part baru yang non-interaktif)
+      lewat LocalTransparencyModifier (tahan tween Transparency), BillboardGui gambar tanpa teks, Highlight, Explosion, ForceField.
+      Mau matiin bagian sapuan ini: CFG.fxHard = false di blok Nono.
+    - Post FX di kamera ikut dimatiin dan dikunci biar nggak dinyalain lagi sama game (blur / flash pas kena).
+    - Frame drop: cek karakter (protection) di-cache, radius part di-cache + pass culling dibatasi ~0.8 ms / frame,
+      budget nuke ngikut frame time, FPS counter pindah ke Heartbeat, hook "Lindungi tampilan" nggak ngecek SEMUA descendant baru lagi.
+    - Adaptive FPS lebih peka (ambang 50, bukan 35) dan MeshPartDetailLevel diturunin.
 
   v13.6 (ringan + bersih, logika parry inti TIDAK diubah):
     - Efek visual hub (aurora / partikel / scanline / glitch) default MATI. Nyalain lagi di Setelan > Efek visual.
@@ -50,7 +63,7 @@
 local function __startParry()
 --!nonstrict
 --[[
-    AutoParry v13.6
+    AutoParry v13.7
     Game    : Roblox fighting game (ReplicatedStorage.Remotes.Combat, M1/M2/Block/Parry/Dodge)
     Runtime : Luau, client-side (jalanin lewat executor lu)
     Toggle  : P (CFG.ToggleKey)  |  UI: CFG.UIKey (orb geser = pindah, tap = buka/tutup, tahan = ON/OFF)
@@ -5302,7 +5315,7 @@ local function summaryText()
     local rate = all > 0 and (c.parried + c.blocked + c.dodged) / all * 100 or 100
     local parryRate = landed > 0 and c.parried / landed * 100 or 0
     return table.concat({
-        ("AutoParry v13.6 | parry %d  block %d  dodge %d  kena %d  gb %d | aman %.0f%% | parry-rate %.0f%%"):format(
+        ("AutoParry v13.7 | parry %d  block %d  dodge %d  kena %d  gb %d | aman %.0f%% | parry-rate %.0f%%"):format(
             c.parried, c.blocked, c.dodged, c.hit, c.guardbroken, rate, parryRate
         ),
         ("rtt %.0fms (±%.0f) | fps %.0f (p90 %.0fms, spike %d) | cpu %.0fus/frame (max %.0fus)"):format(
@@ -5343,7 +5356,7 @@ function SK.dump()
     local function add(s)
         out[#out + 1] = s
     end
-    add("== AutoParry live dump · v13.6 ==")
+    add("== AutoParry live dump · v13.7 ==")
     add(summaryText())
     local r1, r2 = SK.live(now)
     add(r1)
@@ -5394,7 +5407,7 @@ end
 -- API + START
 ----------------------------------------------------------------------
 genv.__NyxAutoParry = {
-    Version = "13.6",
+    Version = "13.7",
     CFG = CFG,
     Counters = counters,
     Skips = skips,
@@ -5490,8 +5503,8 @@ task.spawn(function()
 end)
 
 
-notify("v13.6 loaded - tekan " .. CFG.ToggleKey.Name .. " buat toggle")
-log("loaded v13.6. toggle:", CFG.ToggleKey.Name, "| UI:", CFG.UIKey.Name, "| getgenv().__NyxAutoParry.Summary() buat ringkasan")
+notify("v13.7 loaded - tekan " .. CFG.ToggleKey.Name .. " buat toggle")
+log("loaded v13.7. toggle:", CFG.ToggleKey.Name, "| UI:", CFG.UIKey.Name, "| getgenv().__NyxAutoParry.Summary() buat ringkasan")
 
 end
 
@@ -5520,9 +5533,10 @@ local alive = true
 
 local CFG = {
     fpsTarget       = 60,
-    fpsLowThreshold = 35,
+    fpsLowThreshold = 50,
     renderDist      = 512,
     playerLODDist   = 80,
+    fxHard          = true, -- v13.7: Kill FX juga nyapu part efek + billboard gambar. false = cuma emitter / beam / trail dkk
     saveFile        = "NonoAntiLag.json",
 }
 local TIER_DIST = {1, 0.75, 0.5}
@@ -5571,7 +5585,8 @@ if HAS_FILE then
 end
 
 local currentFPS, fpsAcc, fpsFrames = 60, 0, 0
-trackConn(RunService.RenderStepped:Connect(function(dt)
+-- v13.7: Heartbeat (bukan RenderStepped) biar callback ini nggak nempel di jalur render
+trackConn(RunService.Heartbeat:Connect(function(dt)
     fpsAcc += dt
     fpsFrames += 1
     if fpsAcc >= 0.5 then
@@ -5593,6 +5608,7 @@ local culled    = setmetatable({}, weak)
 local touchedHum = setmetatable({}, weak)
 local humCache  = setmetatable({}, weak)
 local seatCache = setmetatable({}, weak)
+local plrCache  = setmetatable({}, weak) -- v13.7: hasil GetPlayerFromCharacter per model
 local stashed, hiddenOrig = {}, {}
 local rs = settings().Rendering
 
@@ -5626,7 +5642,12 @@ local function protection(obj)
     local node, depth, seat = obj.Parent, 0, false
     while node and node ~= workspace do
         if node:IsA("Model") then
-            if Players:GetPlayerFromCharacter(node) then return "char" end
+            local pc = plrCache[node]
+            if pc == nil then
+                pc = Players:GetPlayerFromCharacter(node) ~= nil
+                plrCache[node] = pc
+            end
+            if pc then return "char" end
             local h = humCache[node]
             if h == nil then
                 h = node:FindFirstChildOfClass("Humanoid") ~= nil
@@ -5672,7 +5693,125 @@ local function isLeafName(name)
     return hit
 end
 
-local FX     = {ParticleEmitter = true, Trail = true, Beam = true, Fire = true, Smoke = true, Sparkles = true}
+local FX     = {ParticleEmitter = true, Trail = true, Beam = true, Fire = true, Smoke = true, Sparkles = true,
+    Highlight = true, Explosion = true, ForceField = true}
+local POSTFX = {BlurEffect = true, BloomEffect = true, ColorCorrectionEffect = true, SunRaysEffect = true,
+    DepthOfFieldEffect = true}
+
+-- v13.7: ParticleEmitter:Emit() tetap jalan walau Enabled = false, dan itu cara game bikin VFX hit / skill.
+-- Jadi Enabled = false saja nggak cukup. Emitter dimatiin lewat lifetime 0 + ukuran 0 + transparan penuh
+-- (nilai-nilai ini juga kena ke partikel yang sudah terlanjur keluar), beam / trail / highlight dibuat transparan
+-- karena game sering cuma nge-toggle Enabled. Nilai asli disimpan sekali buat Restore.
+-- NumberSequence / NumberRange nggak dibandingin pakai ==, makanya nggak lewat set().
+local ZERO_SEQ, ONE_SEQ, ZERO_RANGE = NumberSequence.new(0), NumberSequence.new(1), NumberRange.new(0)
+
+local function fset(obj, prop, val)
+    local o = orig[obj]
+    if not o then o = {}; orig[obj] = o end
+    if o[prop] == nil then o[prop] = obj[prop] end
+    obj[prop] = val
+end
+
+local function killFx(obj, cls)
+    if cls == "ParticleEmitter" then
+        fset(obj, "Enabled", false)
+        fset(obj, "Lifetime", ZERO_RANGE)
+        fset(obj, "Rate", 0)
+        fset(obj, "Size", ZERO_SEQ)
+        fset(obj, "Transparency", ONE_SEQ)
+    elseif cls == "Beam" then
+        fset(obj, "Enabled", false)
+        fset(obj, "Transparency", ONE_SEQ)
+        fset(obj, "Width0", 0)
+        fset(obj, "Width1", 0)
+    elseif cls == "Trail" then
+        fset(obj, "Enabled", false)
+        fset(obj, "Transparency", ONE_SEQ)
+        fset(obj, "Lifetime", 0)
+    elseif cls == "Highlight" then
+        fset(obj, "Enabled", false)
+        fset(obj, "FillTransparency", 1)
+        fset(obj, "OutlineTransparency", 1)
+    elseif cls == "Explosion" or cls == "ForceField" then
+        fset(obj, "Visible", false)
+    else -- Fire / Smoke / Sparkles
+        fset(obj, "Enabled", false)
+    end
+end
+
+-- Post FX dikunci: kalau game nyalain lagi (blur / flash pas kena), langsung dimatiin lagi.
+local guardConn = setmetatable({}, weak)
+local function guardOff(obj)
+    if guardConn[obj] then return end
+    guardConn[obj] = obj:GetPropertyChangedSignal("Enabled"):Connect(function()
+        if applied and state.post and obj.Enabled then pset(obj, "Enabled", false) end
+    end)
+end
+
+-- Deteksi part efek lewat nama (kata utuh, cache dibatasi biar nama unik nggak numpuk selamanya)
+local function toSet(list)
+    local s = {}
+    for _, k in ipairs(list) do s[k] = true end
+    return s
+end
+local VFX_CONT = toSet({"vfx", "fx", "effect", "effects", "particle", "particles", "debris"})
+local VFX_PART = toSet({"vfx", "fx", "effect", "particle", "shockwave", "slash", "impact", "aura", "spark",
+    "explosion", "ripple", "swirl", "burst", "afterimage", "trail", "flash"})
+local partNames, contNames = {t = {}, n = 0}, {t = {}, n = 0}
+
+local function wordHit(name, set, cache)
+    local hit = cache.t[name]
+    if hit ~= nil then return hit end
+    hit = false
+    for word in name:gsub("(%l)(%u)", "%1 %2"):lower():gmatch("%a+") do
+        if set[word] or (word:sub(-1) == "s" and set[word:sub(1, -2)]) then
+            hit = true
+            break
+        end
+    end
+    if cache.n > 2000 then cache.t, cache.n = {}, 0 end
+    cache.t[name] = hit
+    cache.n += 1
+    return hit
+end
+
+local vfxCache = setmetatable({}, weak)
+local function inVfxContainer(p)
+    local node, depth = p.Parent, 0
+    while node and node ~= workspace and depth < 5 do
+        local v = vfxCache[node]
+        if v == nil then
+            v = wordHit(node.Name, VFX_CONT, contNames)
+            vfxCache[node] = v
+        end
+        if v then return true end
+        node, depth = node.Parent, depth + 1
+    end
+    return false
+end
+
+-- fresh = part muncul SETELAH Apply (efek skill / hit). Part baru yang nggak nabrak, nggak bisa di-query dan
+-- nggak kena touch hampir pasti efek. Part map yang udah ada sebelum Apply nggak kena aturan ini.
+local function isVfxPart(p, fresh)
+    if wordHit(p.Name, VFX_PART, partNames) or inVfxContainer(p) then return true end
+    return fresh == true and not p.CanCollide and not p.CanQuery and not p.CanTouch and p.Size.Magnitude < 80
+end
+
+-- Template efek di ReplicatedStorage dinetralin sekali, jadi hasil Clone() udah mati dari lahir
+-- (Emit() di template yang sudah dinetralin nggak ngeluarin apa-apa).
+local RepStorage = game:GetService("ReplicatedStorage")
+local function killTemplates()
+    task.spawn(function()
+        local list = RepStorage:GetDescendants()
+        local t0 = os.clock()
+        for i = 1, #list do
+            local o = list[i]
+            local c = o.ClassName
+            if FX[c] and applied and state.fx then pcall(killFx, o, c) end
+            if os.clock() - t0 > 0.002 then task.wait(); t0 = os.clock() end
+        end
+    end)
+end
 local LIGHT  = {PointLight = true, SpotLight = true, SurfaceLight = true}
 local DECAL  = {Decal = true, Texture = true}
 local CONSTR = {SpringConstraint = true, RopeConstraint = true, RodConstraint = true,
@@ -5688,10 +5827,13 @@ local ATMO_PROPS  = {"Density", "Glare", "Haze", "Offset"}
 local WATER_PROPS = {"WaterWaveSize", "WaterWaveSpeed", "WaterReflectance", "WaterTransparency"}
 
 local parts, partIdx, cursor, culledN = {}, {}, 0, 0
+local radius   = setmetatable({}, weak) -- v13.7: setengah diagonal part, dihitung sekali (bukan baca Size tiap frame)
+local freshSet = setmetatable({}, weak) -- part yang muncul setelah Apply
 
 local function addPart(p)
     parts[#parts + 1] = p
     partIdx[p] = #parts
+    radius[p] = p.Size.Magnitude * 0.5
 end
 
 local function removePart(p)
@@ -5705,8 +5847,17 @@ local function removePart(p)
     if culled[p] then culled[p] = nil; culledN -= 1 end
 end
 
-local function processPart(p)
+local function processPart(p, fresh)
     local prot = protection(p)
+    -- v13.7: part efek (VFX mesh / neon / part non-interaktif yang baru muncul) disembunyiin total.
+    -- LocalTransparencyModifier ikut diset karena game biasanya nge-tween Transparency (fade in / out)
+    -- dan tween itu nimpa Transparency = 1. Collision / touch / query nggak disentuh.
+    if state.fx and CFG.fxHard and prot ~= "char" and isVfxPart(p, fresh) then
+        set(p, "Transparency", 1)
+        set(p, "LocalTransparencyModifier", 1)
+        set(p, "CastShadow", false)
+        return
+    end
     -- v13.5: avatar / NPC dicek DULU. Dulu tekstur + material karakter dihapus lebih dulu lalu "dipulihkan" hub tiap 1 detik
     -- (avatar sempat blank). Sekarang karakter cuma kena CastShadow, tampilannya nggak disentuh.
     if state.texture and prot ~= "char" then
@@ -5729,10 +5880,14 @@ local function processPart(p)
 end
 
 -- BillboardGui dan Sound sengaja tidak disentuh.
-local function processObject(obj)
+local function processObject(obj, fresh)
     local cls = obj.ClassName
     if cls == "Terrain" then return end
-    if obj:IsA("BasePart") then return processPart(obj) end
+    if POSTFX[cls] then
+        if state.post then pset(obj, "Enabled", false); guardOff(obj) end
+        return
+    end
+    if obj:IsA("BasePart") then return processPart(obj, fresh) end
     if cls == "Humanoid" then
         if obj.Parent ~= lp.Character and not touchedHum[obj] then
             touchedHum[obj] = true
@@ -5749,8 +5904,13 @@ local function processObject(obj)
     end
     if state.shadow and LIGHT[cls] then return pset(obj, "Enabled", false) end
     if state.fx then
-        if FX[cls] then return pset(obj, "Enabled", false) end
+        if FX[cls] then return pcall(killFx, obj, cls) end
         if cls == "SurfaceGui" and protection(obj) ~= "char" then
+            return pset(obj, "Enabled", false)
+        end
+        -- v13.7: billboard gambar (hit flash / ikon efek) ikut mati; yang ada teksnya (nameplate, angka damage) tetap
+        if cls == "BillboardGui" and CFG.fxHard and protection(obj) ~= "char"
+            and not obj:FindFirstChildWhichIsA("TextLabel", true) then
             return pset(obj, "Enabled", false)
         end
     end
@@ -6207,8 +6367,8 @@ local okStreak = 0
 local function adaptiveStep()
     if not state.adaptive then tier = 0; return end
     -- Ambang turun 60% dari cap supaya cap rendah tidak memicu adaptive terus.
-    local low  = math.min(CFG.fpsLowThreshold, fpsCapValue * 0.6)
-    local good = math.min(50, fpsCapValue * 0.9)
+    local low  = math.min(CFG.fpsLowThreshold, fpsCapValue * 0.75)
+    local good = math.min(CFG.fpsLowThreshold + 12, fpsCapValue * 0.9)
     if currentFPS < low then
         okStreak = 0
         if tier < 2 then
@@ -6231,6 +6391,7 @@ end
 
 local function applyGlobals()
     pset(rs, "QualityLevel", Enum.QualityLevel.Level01)
+    pset(rs, "MeshPartDetailLevel", Enum.MeshPartDetailLevel.Level04)
     if state.shadow then
         pset(Lighting, "GlobalShadows", false)
         pset(Lighting, "ShadowSoftness", 0)
@@ -6240,6 +6401,7 @@ local function applyGlobals()
     for _, v in ipairs(Lighting:GetChildren()) do
         if state.post and v:IsA("PostEffect") then
             pset(v, "Enabled", false)
+            guardOff(v)
         elseif state.post and v:IsA("Atmosphere") then
             for _, p in ipairs(ATMO_PROPS) do pset(v, p, 0) end
         elseif state.sky and v:IsA("Sky") then
@@ -6282,6 +6444,7 @@ applyNuke = function()
     local capOk = env.NonoHubCap and true or tryFPSCap(fpsCapValue)
     log("fps cap " .. fpsCapValue .. (capOk and " ✓" or " (no executor)"))
     applyGlobals()
+    if state.fx then killTemplates() end
     local list = workspace:GetDescendants()
     table.move(list, 1, #list, qt + 1, queue)
     qt += #list
@@ -6338,6 +6501,7 @@ unload = function()
     if not alive then return end
     alive = false
     for _, c in ipairs(CONNECTIONS) do pcall(function() c:Disconnect() end) end
+    for _, c in pairs(guardConn) do pcall(function() c:Disconnect() end) end
     runRestore(true)
     if env.NonoCleanup == unload then env.NonoCleanup = nil end
     env.NonoAPI = nil
@@ -6346,8 +6510,32 @@ end
 
 trackConn(workspace.DescendantAdded:Connect(function(obj)
     if not applied then return end
-    if obj.ClassName == "Humanoid" and obj.Parent then humCache[obj.Parent] = true end
+    local cls = obj.ClassName
+    if cls == "Humanoid" then
+        if obj.Parent then humCache[obj.Parent] = true end
+    elseif state.fx and FX[cls] then
+        -- v13.7: efek baru dimatiin SAAT ITU JUGA, nggak lewat antrian (dulu VFX hit sempat tampil beberapa frame)
+        pcall(killFx, obj, cls)
+        return
+    elseif state.post and POSTFX[cls] then
+        pset(obj, "Enabled", false)
+        guardOff(obj)
+        return
+    elseif obj:IsA("BasePart") then
+        freshSet[obj] = true
+        -- part yang jelas efek (nama / folder VFX) langsung disembunyiin; sisanya lewat antrian biasa
+        if state.fx and CFG.fxHard and (wordHit(obj.Name, VFX_PART, partNames) or inVfxContainer(obj)) then
+            pcall(processPart, obj, true)
+            return
+        end
+    end
     enqueue(obj)
+end))
+
+trackConn(RepStorage.DescendantAdded:Connect(function(obj)
+    if not applied or not state.fx then return end
+    local cls = obj.ClassName
+    if FX[cls] then pcall(killFx, obj, cls) end
 end))
 
 trackConn(workspace.DescendantRemoving:Connect(function(obj)
@@ -6358,13 +6546,15 @@ local lodTimer, adaptTimer, logTimer = 0, 0, 0
 trackConn(RunService.Heartbeat:Connect(function(dt)
     if not applied then return end
     local t0 = os.clock()
-    local budget = nukeActive and 0.006 or 0.0015
+    -- v13.7: budget nuke ngikut frame time (2.5 ms di 144 fps, maks 4 ms) supaya Apply nggak bikin frame time melonjak
+    local budget = nukeActive and math.clamp(dt * 0.25, 0.0015, 0.004) or 0.001
 
     while qh <= qt and os.clock() - t0 < budget do
         local obj = queue[qh]
         queue[qh] = nil
         qh += 1
-        if obj.Parent then pcall(processObject, obj) end
+        if obj.Parent then pcall(processObject, obj, freshSet[obj]) end
+        freshSet[obj] = nil
         nukeDone += 1
     end
     if qh > qt and qt > 0 then queue, qh, qt = {}, 1, 0 end
@@ -6376,11 +6566,14 @@ trackConn(RunService.Heartbeat:Connect(function(dt)
         local far = userDist * TIER_DIST[tier + 1]
         local near = far * 0.85
         local i = cursor
-        for _ = 1, math.min(n, math.max(400, math.floor(n / 30))) do
+        local tc = os.clock()
+        for k = 1, math.min(n, math.max(400, math.floor(n / 30))) do
+            -- v13.7: satu pass culling dibatasi ~0.8 ms per frame supaya nggak ngegedein frame time di map besar
+            if k % 64 == 0 and os.clock() - tc > 0.0008 then break end
             i = i % n + 1
             local p = parts[i]
-            -- Ukuran part dikurangi dari jarak supaya lantai besar tidak ikut hilang.
-            local d = (p.Position - cp).Magnitude - p.Size.Magnitude * 0.5
+            -- Ukuran part dikurangi dari jarak supaya lantai besar tidak ikut hilang (radius di-cache).
+            local d = (p.Position - cp).Magnitude - (radius[p] or 0)
             if d > far then
                 if not culled[p] then
                     culled[p] = true
@@ -6446,6 +6639,7 @@ trackConn(Lighting.ChildAdded:Connect(function(v)
     if not (applied and state.post) then return end
     if v:IsA("PostEffect") then
         pset(v, "Enabled", false)
+        guardOff(v)
     elseif v:IsA("Atmosphere") then
         for _, pn in ipairs(ATMO_PROPS) do pset(v, pn, 0) end
     end
@@ -6517,7 +6711,7 @@ print("[NONO v6.0] loaded | setfpscap:", HAS_SETFPSCAP, "| sethiddenproperty:", 
 -- =====================================================================
 --  DASAR
 -- =====================================================================
-local VERSION = "13.6"
+local VERSION = "13.7"
 
 local Players      = game:GetService("Players")
 local RunService   = game:GetService("RunService")
@@ -7825,11 +8019,14 @@ local function cpSnap(obj)
         elseif c == "SurfaceAppearance" then CP.par[obj] = obj.Parent end
     end)
 end
+-- v13.7: cuma kelas yang memang disnapshot cpSnap yang dicek (dulu SEMUA descendant baru, termasuk tiap partikel / part efek,
+-- ikut jalanin FindFirstAncestorOfClass bertingkat)
+local CPC = { MeshPart = true, Decal = true, Texture = true, SpecialMesh = true, SurfaceAppearance = true }
 function K.cpStart()
     if CP.running then return true end
     CP.running = true
     CP.conn = track(workspace.DescendantAdded:Connect(function(o)
-        if CP.running and cpIsChar(o) then cpSnap(o) end
+        if CP.running and CPC[o.ClassName] and cpIsChar(o) then cpSnap(o) end
     end))
     task.spawn(function()
         for _, pl in ipairs(Players:GetPlayers()) do
@@ -9251,7 +9448,7 @@ do
     W.btnRow(p, { { "Matikan semua dan tutup", "dng", K.shutdownAll, 1, true } })
 
     local c5 = W.card(p)
-    W.row(c5, "Auto parry v" .. VERSION, "UI Skill issue final boss · By Duke · parry v13.6 dan Nono dikendalikan dari hub ini", false, 0)
+    W.row(c5, "Auto parry v" .. VERSION, "UI Skill issue final boss · By Duke · parry v13.7 dan Nono dikendalikan dari hub ini", false, 0)
 end
 BT = nil
 
