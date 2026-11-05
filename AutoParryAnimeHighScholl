@@ -19,6 +19,16 @@
   Hotkey default: RightAlt hub | F4 anti-lag | P toggle parry (bisa diubah di Setelan)
   Konfigurasi hub: AP13_hub.json | konfigurasi parry: tetap NyxAutoParry_v9.json
 
+  v13.9 (stabilitas FPS, logika parry inti TIDAK diubah, cuma sisi hub / anti-lag):
+    - K.fpsStats di-cache 0.4 dtk + array kerja dipakai ulang (dulu tiap panggilan alokasi + sort 600 data, dipanggil capWatch / abTick / UI).
+    - K.cpGuard (tiap 1 dtk) nggak bikin closure per entri lagi (dulu ribuan closure per detik -> GC spike).
+    - K.farStep: refresh daftar part pemain cuma 1 pemain per panggilan (dulu semua pemain serentak tiap 6 dtk = spike),
+      dan toggle LocalTransparencyModifier tanpa closure per part.
+    - Cap FPS nggak ditulis ulang tiap detik (FramerateCap / setfflag berulang bisa bikin micro-stutter): cuma pas nilai berubah + tiap 30 dtk.
+    - Poll berat (farStep / cpGuard) ditunda kalau frame barusan hitch (> 34 ms), biar nggak numpuk di frame yang udah berat.
+    - Anti-lag Apply nggak lagi workspace:GetDescendants() sekali jalan (spike alokasi di map besar), tapi dijalanin bertahap per frame (NX.stepWalk).
+    - Efek dekorasi hub (kalau dinyalain) dibatasi 30 Hz.
+
   v13.8 (struktur file, logika parry inti TIDAK diubah, cuma cara local disimpan):
     - Slot local aman dari batas Luau (200 local per fungsi). Sebelumnya __startParry sudah 185 / 200, Nono 165 / 200.
       Sekarang __startParry 130 dan Nono 142. Yang dipindah ke tabel (PX di parry, NX di Nono) cuma local yang jarang dipakai:
@@ -6460,16 +6470,16 @@ applyNuke = function()
     log("fps cap " .. fpsCapValue .. (capOk and " ✓" or " (no executor)"))
     NX.applyGlobals()
     if state.fx then NX.killTemplates() end
-    local list = workspace:GetDescendants()
-    table.move(list, 1, #list, qt + 1, queue)
-    qt += #list
-    nukeTotal, nukeDone = #list, 0
+    -- v13.9: nggak workspace:GetDescendants() sekali jalan (spike alokasi di map besar); workspace dijalanin bertahap lewat NX.stepWalk
+    NX.walk = { stack = { workspace }, sp = 1 }
+    nukeTotal, nukeDone = 0, 0
 end
 
 -- Sinkron saat unload supaya state sudah bersih sebelum skrip berikutnya berjalan.
 function NX.runRestore(sync)
     applied, nukeActive, tier = false, false, 0
     queue, qh, qt = {}, 1, 0
+    NX.walk = nil
     local t0 = os.clock()
     local function pace()
         if not sync and os.clock() - t0 > 0.008 then task.wait(); t0 = os.clock() end
@@ -6557,6 +6567,33 @@ trackConn(workspace.DescendantRemoving:Connect(function(obj)
     if partIdx[obj] then removePart(obj) end
 end))
 
+-- v13.9: penjelajah workspace bertahap (DFS pakai GetChildren, dibatasi waktu per frame); isi antrean sama dengan GetDescendants dulu
+function NX.stepWalk(t0, lim)
+    local w = NX.walk
+    if not w then return end
+    local stack, sp = w.stack, w.sp
+    while sp > 0 do
+        local node = stack[sp]
+        stack[sp] = nil
+        sp -= 1
+        local ok, kids = pcall(node.GetChildren, node)
+        if ok then
+            local n = #kids
+            for i = 1, n do
+                local c = kids[i]
+                qt += 1
+                queue[qt] = c
+                sp += 1
+                stack[sp] = c
+            end
+            nukeTotal += n
+        end
+        if os.clock() - t0 > lim then break end
+    end
+    w.sp = sp
+    if sp == 0 then NX.walk = nil end
+end
+
 local lodTimer, adaptTimer, logTimer = 0, 0, 0
 trackConn(RunService.Heartbeat:Connect(function(dt)
     if not applied then return end
@@ -6564,6 +6601,7 @@ trackConn(RunService.Heartbeat:Connect(function(dt)
     -- v13.7: budget nuke ngikut frame time (2.5 ms di 144 fps, maks 4 ms) supaya Apply nggak bikin frame time melonjak
     local budget = nukeActive and math.clamp(dt * 0.25, 0.0015, 0.004) or 0.001
 
+    if NX.walk then NX.stepWalk(t0, budget * 0.4) end
     while qh <= qt and os.clock() - t0 < budget do
         local obj = queue[qh]
         queue[qh] = nil
@@ -6611,7 +6649,7 @@ trackConn(RunService.Heartbeat:Connect(function(dt)
             logTimer = 0
             log("nuking " .. math.min(nukeDone, nukeTotal) .. "/" .. nukeTotal)
         end
-        if qh > qt then NX.onNukeDone() end
+        if qh > qt and not NX.walk then NX.onNukeDone() end
         return
     end
 
@@ -6726,7 +6764,7 @@ end
 -- =====================================================================
 --  DASAR
 -- =====================================================================
-local VERSION = "13.8"
+local VERSION = "13.9"
 
 local Players      = game:GetService("Players")
 local RunService   = game:GetService("RunService")
@@ -7609,7 +7647,7 @@ end
 -- =====================================================================
 local CAPS = { 60, 120, 165, 240, 0 } -- 0 = tanpa batas
 local BOOST = { render3d = false, orig = {}, far = setmetatable({}, { __mode = "k" }) }
-local FT = { buf = {}, n = 0 }
+local FT = { buf = {}, n = 0, work = nil, cache = nil, cacheBuf = nil, cacheAt = 0 }
 track(RunService.RenderStepped:Connect(function(dt)
     FT.n = FT.n % 600 + 1
     FT.buf[FT.n] = dt
@@ -7617,16 +7655,31 @@ end))
 
 -- statistik frame time: rata-rata, 1% low, terendah, tertinggi
 function K.fpsStats()
-    local c = #FT.buf
+    local buf = FT.buf
+    local now = os.clock()
+    -- v13.9: hasil di-cache 0.4 dtk (capWatch / abTick / UI manggil bareng) dan array kerja dipakai ulang (nol alokasi array)
+    if FT.cache and FT.cacheBuf == buf and now - FT.cacheAt < 0.4 then return FT.cache end
+    local c = #buf
     if c < 30 then return nil end
-    local arr, sum = {}, 0
-    for i = 1, c do local d = FT.buf[i]; arr[i] = d; sum = sum + d end
+    local arr = FT.work
+    if not arr then arr = {}; FT.work = arr end
+    local sum = 0
+    for i = 1, c do local d = buf[i]; arr[i] = d; sum = sum + d end
+    for i = #arr, c + 1, -1 do arr[i] = nil end
     table.sort(arr)
     local lowN = math.max(1, math.floor(c * 0.01))
     local ls = 0
     for i = c - lowN + 1, c do ls = ls + arr[i] end
     local k10 = math.max(1, math.ceil(c * 0.1))
-    return { avg = c / sum, min = 1 / math.max(arr[c], 1e-4), max = 1 / math.max(arr[1], 1e-4), low1 = lowN / math.max(ls, 1e-4), hi = 1 / math.max(arr[k10], 1e-4) }
+    local res = { avg = c / sum, min = 1 / math.max(arr[c], 1e-4), max = 1 / math.max(arr[1], 1e-4), low1 = lowN / math.max(ls, 1e-4), hi = 1 / math.max(arr[k10], 1e-4) }
+    FT.cache, FT.cacheBuf, FT.cacheAt = res, buf, now
+    return res
+end
+
+-- v13.9: true kalau frame terakhir nggak hitch; poll berat ditunda pas frame lagi berat
+function K.calm()
+    local dt = FT.buf[FT.n]
+    return dt == nil or dt < 0.034
 end
 
 -- buka batas FPS lewat semua jalur yang mungkin; hasil tiap jalur dicatat buat diagnostik
@@ -7824,10 +7877,12 @@ end
 function K.boostFlip(k) K.boostSet(k, not K.boostGet(k)) end
 
 -- sembunyikan pemain jauh: hanya tampilan (LocalTransparencyModifier), animasi dan posisi tetap jalan
+function K.setLTM(part, v) part.LocalTransparencyModifier = v end
 function K.farStep()
     local cam = workspace.CurrentCamera
     if not cam then return end
     local cp, D = cam.CFrame.Position, S.bst.dist
+    local refreshed = false -- v13.9: maksimal satu pemain per panggilan yang di-scan ulang (dulu semua serentak = spike)
     for _, pl in ipairs(Players:GetPlayers()) do
         local ch = pl ~= LP and pl.Character
         local root = ch and ch:FindFirstChild("HumanoidRootPart")
@@ -7835,7 +7890,8 @@ function K.farStep()
             local far = (root.Position - cp).Magnitude > D
             local st = BOOST.far[ch]
             if not st then st = { parts = {}, hidden = false, t = 0 }; BOOST.far[ch] = st end
-            if os.clock() - st.t > 6 then
+            if not refreshed and os.clock() - st.t > 6 then
+                refreshed = true
                 st.t, st.parts = os.clock(), {}
                 for _, d in ipairs(ch:GetDescendants()) do
                     if d:IsA("BasePart") then st.parts[#st.parts + 1] = d end
@@ -7844,7 +7900,9 @@ function K.farStep()
             end
             if far ~= st.hidden then
                 st.hidden = far
-                for _, part in ipairs(st.parts) do pcall(function() part.LocalTransparencyModifier = far and 1 or 0 end) end
+                local v = far and 1 or 0
+                local ps = st.parts
+                for i = 1, #ps do pcall(K.setLTM, ps[i], v) end
             end
         end
     end
@@ -8064,23 +8122,24 @@ function K.cpStop()
     return true
 end
 -- kembalikan hanya yang DIHAPUS pembersih (tekstur kosong, decal transparan, SurfaceAppearance terlepas)
+-- v13.9: fungsi statis (bukan closure baru per entri) biar jalur 1 dtk ini nggak numpuk sampah buat GC
+function K.cpFixOne(obj, s)
+    if s.TextureID ~= nil then
+        if obj.TextureID == "" and s.TextureID ~= "" then obj.TextureID = s.TextureID end
+    elseif s.Transparency ~= nil then
+        if obj.Transparency >= 1 and s.Transparency < 1 then obj.Transparency = s.Transparency end
+    elseif s.TextureId ~= nil then
+        if obj.TextureId == "" and s.TextureId ~= "" then obj.TextureId = s.TextureId end
+    end
+end
+function K.cpFixParent(obj, par) obj.Parent = par end
 function K.cpGuard()
     if not CP.running then return end
     for obj, s in pairs(CP.orig) do
-        if obj.Parent then
-            pcall(function()
-                if s.TextureID ~= nil then
-                    if obj.TextureID == "" and s.TextureID ~= "" then obj.TextureID = s.TextureID end
-                elseif s.Transparency ~= nil then
-                    if obj.Transparency >= 1 and s.Transparency < 1 then obj.Transparency = s.Transparency end
-                elseif s.TextureId ~= nil then
-                    if obj.TextureId == "" and s.TextureId ~= "" then obj.TextureId = s.TextureId end
-                end
-            end)
-        end
+        if obj.Parent then pcall(K.cpFixOne, obj, s) end
     end
     for obj, par in pairs(CP.par) do
-        if obj.Parent == nil and par and par.Parent then pcall(function() obj.Parent = par end) end
+        if obj.Parent == nil and par and par.Parent then pcall(K.cpFixParent, obj, par) end
     end
 end
 BOOST_FX.protect = {
@@ -9647,6 +9706,10 @@ track(RunService.Heartbeat:Connect(function(dt)
     if not S.fx then return end
     -- v13.5: pas tarung (hasil hit / block baru aja berubah) atau fps < 40, animasi dekorasi dibekukan biar frame time nggak naik
     if S.fxFight and (V.sys.fps < 40 or (V.par.lastAct and os.clock() - V.par.lastAct < 4)) then return end
+    -- v13.9: dekorasi cukup 30 Hz (dt dikumpulin biar kecepatan animasi tetap sama)
+    FXT.acc = (FXT.acc or 0) + dt
+    if FXT.acc < 0.033 then return end
+    dt, FXT.acc = FXT.acc, 0
     local now = os.clock()
     local t = now - START
     local s = (math.sin(t * 2.4) + 1) / 2
@@ -9708,13 +9771,17 @@ task.spawn(function()
             if not ok and not warned then warned = true; log("Poll: " .. tostring(e), "err") end
         end
         if tick % 4 == 0 then pcall(K.pollSys) end
-        if tick % 2 == 0 and S.bst.far then pcall(K.farStep) end
+        local calm = K.calm() -- v13.9: poll berat ditunda kalau frame barusan hitch (maks ditunda beberapa tick)
+        if tick % 2 == 0 and S.bst.far and (calm or tick % 8 == 0) then pcall(K.farStep) end
         if tick % 4 == 0 then
-            if S.bst.unlock and not BOOST.probing then pcall(K.setCap) end
+            if S.bst.unlock and not BOOST.probing then
+                -- v13.9: cap nggak ditulis ulang tiap detik, cuma pas nilainya berubah + penegasan tiap 30 dtk
+                if BOOST.capKey ~= S.bst.cap or tick % 120 == 0 then BOOST.capKey = S.bst.cap; pcall(K.setCap) end
+            end
             pcall(K.capWatch)
             pcall(K.abTick)
             pcall(K.lodTick)
-            pcall(K.cpGuard)
+            if calm or tick % 16 == 0 then pcall(K.cpGuard) end
         end
         for _, r in ipairs((OPEN) and REF or REFC) do runR(r) end
         if tick % 8 == 0 and DIRTY and S.autosave then K.saveNow() end
